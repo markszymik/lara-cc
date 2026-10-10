@@ -1,11 +1,13 @@
 import { expect, test } from 'claude-code/testing'
 
 import {
+  artisanCommandName,
   durationMs,
   exceptionHeadline,
   feedLog,
   formatEntry,
   headline,
+  helpName,
   isError,
   newLogState,
   origin,
@@ -13,6 +15,7 @@ import {
   parseWorkerLine,
   projectPath,
   queuesOf,
+  refusedOptions,
   shortClass,
 } from '../hooks/parse'
 import { LOG } from './fixtures'
@@ -67,4 +70,25 @@ test('small helpers', () => {
   )
   expect(parseSnapshot('PHP Warning: x\n{"connection":"redis","sizes":{"default":3},"failedTotal":0,"failed":[]}')?.sizes).toEqual({ default: 3 })
   expect(parseSnapshot('Fatal error')).toBe(undefined)
+})
+
+test('artisanCommandName skips options to find the command, as artisan does', () => {
+  expect(artisanCommandName(['migrate:fresh', '--seed'])).toBe('migrate:fresh')
+  expect(artisanCommandName(['-q', '--ansi', 'migrate:fresh'])).toBe('migrate:fresh')
+  expect(artisanCommandName(['--', 'db:wipe'])).toBe('db:wipe')
+  expect(artisanCommandName(['--version'])).toBe(undefined)
+})
+
+test('refusedOptions finds long options with or without a value, and short ones in a group', () => {
+  const refused = ['--force', '-f', '--env']
+  expect(refusedOptions(['migrate', '--force'], refused)).toEqual(['--force'])
+  expect(refusedOptions(['migrate', '--env=production'], refused)).toEqual(['--env=production'])
+  expect(refusedOptions(['make:model', 'Post', '-mf'], refused)).toEqual(['-mf'])
+  expect(refusedOptions(['make:model', 'Post', '-m', '--forced-thing'], refused)).toEqual([])
+})
+
+test('helpName reads the resolved name from artisan help JSON, after any PHP warnings', () => {
+  expect(helpName('{"name":"migrate:fresh","description":"Drop all tables"}')).toBe('migrate:fresh')
+  expect(helpName('PHP Deprecated: x\n{"name":"down"}')).toBe('down')
+  expect(helpName('ERROR  Command "mi" is ambiguous.')).toBe(undefined)
 })

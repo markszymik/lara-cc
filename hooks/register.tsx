@@ -1,12 +1,14 @@
 import type { EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnResult, Register } from 'claude-code'
 
 import {
+  artisanCommandName,
   clock,
   durationMs,
   exceptionHeadline,
   feedLog,
   formatEntry,
   headline,
+  helpName,
   isError,
   isWarning,
   newLogState,
@@ -14,6 +16,7 @@ import {
   parseSnapshot,
   parseWorkerLine,
   queuesOf,
+  refusedOptions,
   shortClass,
   snapshotPhp,
   splitArgs,
@@ -60,8 +63,22 @@ const QUICK: { key: string; label: string; argv: string[] }[] = [
   { key: '7', label: 'composer install', argv: ['composer', 'install', '--no-interaction'] },
 ]
 
-/** Artisan commands Claude's tool refuses. You can still run them yourself with /laravel-artisan. */
-const DESTRUCTIVE = /^(migrate:(fresh|reset|refresh|rollback)|db:wipe|db:seed|key:generate|down|queue:(flush|clear))\b/
+/**
+ * Artisan commands Claude's tool refuses, however they're spelled: artisan itself resolves the name first,
+ * so `migr:fr` or `MIGRATE:FRESH` count as migrate:fresh. `tinker` is here because it runs any PHP.
+ * You can still run them yourself with /laravel-artisan.
+ */
+const DESTRUCTIVE = [
+  'migrate:fresh', 'migrate:reset', 'migrate:refresh', 'migrate:rollback', 'db:wipe', 'db:seed', 'key:generate', 'down',
+  'queue:flush', 'queue:clear', 'queue:forget', 'queue:prune-failed', 'queue:prune-batches', 'model:prune',
+  'horizon:clear', 'horizon:forget', 'telescope:clear', 'telescope:prune', 'pulse:clear', 'tinker',
+]
+
+/**
+ * Options the tool refuses on any command: `--force` skips the production prompt and overwrites files (`-f` on make:*),
+ * `--env` points artisan at another environment's database, `--prune` deletes migration files, `--seed` runs seeders.
+ */
+const DESTRUCTIVE_OPTIONS = ['--force', '-f', '--env', '--prune', '--seed', '--seeder']
 
 const PANE = 'laravel'
 const MAX_SERVICE_LINES = 400
@@ -205,6 +222,32 @@ async function runCommand($: Api, label: string, argv: string[], timeoutMs = 600
 function formatRun(run: LastRun): string {
   const head = run.exitCode === 0 ? `✓ ${run.label}` : `✗ ${run.label} (exit ${run.exitCode})`
   return run.output ? `${head}\n${run.output}` : head
+}
+
+/**
+ * Whether artisan `argv` is safe to run for Claude. Artisan resolves the name itself (`help <name>`), so
+ * abbreviations and odd casing can't slip past DESTRUCTIVE; a name it can't resolve comes back as `error`.
+ */
+async function checkArtisan($: Api, argv: string[]): Promise<{ refused?: string; error?: string }> {
+  const options = refusedOptions(argv, DESTRUCTIVE_OPTIONS)
+  if (options.length) return { refused: `${options.join(' ')} can destroy data or point at another environment` }
+  const name = artisanCommandName(argv)
+  if (name === undefined) return {}
+  const r = await $.process.run(['php', 'artisan', 'help', name, '--format=json', '--no-interaction'], { timeoutMs: 60_000 })
+  const resolved = r.exitCode === 0 ? helpName(r.stdout) : undefined
+  if (!resolved) {
+    const output = stripAnsi([r.stdout, r.stderr].filter(Boolean).join('\n')).trim()
+    return { error: `✗ artisan could not resolve "${name}"\n${tail(output, 2000)}` }
+  }
+  if (DESTRUCTIVE.includes(resolved)) {
+    return { refused: resolved === 'tinker' ? 'tinker runs arbitrary PHP' : `${resolved} can destroy data` }
+  }
+  return {}
+}
+
+/** Typed by the person (at the terminal or through Remote Control), not relayed from another session, channel or plugin. */
+function fromUser(origin: { kind: string } | undefined): boolean {
+  return origin?.kind === 'composer' || origin?.kind === 'bridge'
 }
 
 // ─── Long-running services ─────────────────────────────────────────────────
@@ -626,7 +669,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'artisan',
       description:
-        'Run a Laravel artisan command in the project and return its output, e.g. "route:list --path=api", "make:model Post -m", "tinker --execute=\'dump(App\\\\Models\\\\User::count())\'". Destructive database commands are refused.',
+        'Run a Laravel artisan command in the project and return its output, e.g. "route:list --path=api", "make:model Post -m", "db:show", "model:show User". Refuses commands that can destroy data or run arbitrary code (migrate:fresh/rollback, db:wipe, db:seed, tinker, --force, --env…); ask the user to run those.',
       inputSchema: {
         type: 'object',
         properties: { command: { type: 'string', description: 'Everything after `php artisan`' } },
@@ -709,6 +752,12 @@ export const register: Register = on => {
   on('command.run', { command: 'laravel-artisan' }, async ($, e) => {
     if (!isLaravel) return { text: notLaravel() }
     if (!e.args.trim()) return { text: 'Usage: /laravel-artisan <command> [args], e.g. /laravel-artisan make:model Post -m' }
+    // Unguarded only when the person typed it; a relayed message gets the same check as Claude's tool
+    if (!fromUser(e.origin)) {
+      const check = await checkArtisan($, splitArgs(e.args))
+      if (check.refused) return { text: `Refused: ${check.refused}. Only commands you type yourself skip this check.` }
+      if (check.error) return { text: check.error }
+    }
     const run = await runCommand($, 'artisan ' + e.args, ['php', 'artisan', ...splitArgs(e.args), '--no-interaction'])
     return { text: formatRun(run) }
   }).catch(commandFailed)
@@ -771,9 +820,11 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__laravel__artisan' }, async ($, e) => {
     if (!isLaravel) return { result: notLaravel() }
     const command = String((e as unknown as { command?: string }).command ?? '').trim()
-    if (DESTRUCTIVE.test(command)) {
-      return { result: `Refused: "${command}" can destroy data. Ask the user to run it themselves with /laravel-artisan ${command}` }
+    const check = await checkArtisan($, splitArgs(command))
+    if (check.refused) {
+      return { result: `Refused: ${check.refused}. Ask the user to run it themselves with /laravel-artisan ${command}` }
     }
+    if (check.error) return { result: check.error }
     const run = await runCommand($, 'artisan ' + command, ['php', 'artisan', ...splitArgs(command), '--no-interaction'], 300_000)
     return { result: formatRun(run) }
   }).catch(toolFailed)

@@ -22,6 +22,36 @@ export function splitArgs(input: string): string[] {
   return out
 }
 
+/**
+ * The token artisan treats as the command name: the first one that isn't an option, as Symfony's
+ * `getFirstArgument` picks it (`-q migrate:fresh` runs migrate:fresh). Undefined when there is none.
+ */
+export function artisanCommandName(argv: string[]): string | undefined {
+  return argv.find(token => !token.startsWith('-'))
+}
+
+/**
+ * The tokens in `argv` that set one of `refused` (`--force`, `-f`): long options alone or as
+ * `--force=…`, short ones alone or inside a group like `-mf`.
+ */
+export function refusedOptions(argv: string[], refused: string[]): string[] {
+  return argv.filter(token => {
+    if (token.startsWith('--')) return refused.includes(token.split('=')[0]!)
+    if (token.startsWith('-')) return [...token.slice(1)].some(c => refused.includes('-' + c))
+    return false
+  })
+}
+
+/** The command name in `artisan help <name> --format=json` output, which may follow PHP warnings. */
+export function helpName(stdout: string): string | undefined {
+  try {
+    const name = (JSON.parse(stdout.slice(stdout.indexOf('{'))) as { name?: unknown }).name
+    return typeof name === 'string' ? name : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export function tail(text: string, max = 8000): string {
   return text.length > max ? '…' + text.slice(-max) : text
 }

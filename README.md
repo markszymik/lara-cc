@@ -53,7 +53,7 @@ Type `/lar` to see them all. Processes run for the life of the session and stop 
 
 - **`logs` tool**: recent log entries with where they happened and the stack, so Claude can check for errors after running code or tests.
 - **`queue` tool**: pending jobs, jobs run this session, failed jobs with their exceptions, and retrying them.
-- **`artisan` tool**: runs artisan commands. Refuses `migrate:fresh/reset/refresh/rollback`, `db:wipe`, `db:seed`, `key:generate`, `down` and `queue:flush/clear`; run those yourself with `/laravel-artisan`.
+- **`artisan` tool**: runs artisan commands. Refuses anything that can destroy data or run arbitrary code: `migrate:fresh/reset/refresh/rollback`, `db:wipe`, `db:seed`, `key:generate`, `down`, `queue:flush/clear/forget`, the `prune`/`clear` commands of the queue, models, Horizon, Telescope and Pulse, `tinker`, and the `--force`, `--env`, `--prune` and `--seed` options. Artisan resolves the command name first, so abbreviations like `migr:fr` are caught too. Run those yourself with `/laravel-artisan`, which skips the check only when you type it (not when it's relayed from another session, a channel or a plugin).
 - **`service` tool**: start, stop, restart or read the output of the queue worker, Vite and the scheduler.
 - **`routes` tool**: filtered route list.
 
@@ -67,7 +67,7 @@ macOS or Linux (log following uses `tail -F`), PHP on your `PATH`, and a Laravel
 
 ## Customise
 
-Everything lives in `hooks/register.tsx`. Edit `SERVICES` (add Reverb, Pail, `php artisan serve`…), `QUICK` (the numbered buttons on the Commands tab) and `DESTRUCTIVE` at the top of the file.
+Everything lives in `hooks/register.tsx`. Edit `SERVICES` (add Reverb, Pail, `php artisan serve`…), `QUICK` (the numbered buttons on the Commands tab), and `DESTRUCTIVE` / `DESTRUCTIVE_OPTIONS` (what Claude's `artisan` tool refuses) at the top of the file.
 
 ## Develop
 

@@ -7,6 +7,19 @@ import { LOG } from './fixtures'
  * Background work at start (log tail, migrate:status, queue snapshot) also lands in `ran`. */
 type Fake = { history?: string; live?: string; snapshot?: unknown }
 
+/** What the fake `php artisan help <name>` resolves each (lower-cased) name to. */
+const HELP: Record<string, string> = {
+  'make:model': 'make:model',
+  migrate: 'migrate',
+  test: 'test',
+  'migrate:fresh': 'migrate:fresh',
+  'migr:fr': 'migrate:fresh',
+  'd:w': 'db:wipe',
+  dow: 'down',
+  tin: 'tinker',
+  tinker: 'tinker',
+}
+
 function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
   mock.store(on)
   const clock = mock.clock(on)
@@ -29,6 +42,12 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
     const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (argv[0] === 'tail') return ok(fake.history ?? '')
     if (argv[0] === 'php' && argv[1] === '-r') return ok(fake.snapshot ? JSON.stringify(fake.snapshot) : 'no snapshot')
+    // `artisan help <name>` resolves abbreviations and case the way Symfony does
+    if (argv[2] === 'help') {
+      const name = HELP[argv[3]!.toLowerCase()]
+      if (!name) return { value: { exitCode: 1, stdout: `ERROR  Command "${argv[3]}" is not defined.`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      return ok(JSON.stringify({ name, description: '' }))
+    }
     if (argv.join(' ') === 'php artisan route:list --json') {
       const routes = [
         { method: 'GET|HEAD', uri: '/', name: null, action: 'Closure' },
@@ -78,9 +97,58 @@ test('the artisan tool refuses destructive commands', async ($, on) => {
   fakeProject(on, ran)
   await $.session.start({ cwd: '/app' })
 
-  const answer = await $.tool.call({ tool: 'mcp__laravel__artisan', command: 'migrate:fresh --seed' })
-  expect(JSON.stringify(answer)).toContain('Refused')
-  expect(ran.some(argv => argv.includes('migrate:fresh'))).toBe(false)
+  const attempts = [
+    'migrate:fresh',
+    '-q migrate:fresh',
+    'migr:fr',
+    'MIGRATE:FRESH',
+    'd:w',
+    'dow',
+    'tin --execute="App\\Models\\User::truncate()"',
+    'migrate --force',
+    'make:model Post -mf',
+    'migrate --env=production',
+    'test --env testing',
+    'migrate --seed',
+  ]
+  for (const command of attempts) {
+    const before = ran.length
+    const answer = await $.tool.call({ tool: 'mcp__laravel__artisan', command })
+    expect(JSON.stringify(answer)).toContain('Refused')
+    // at most the `help` lookup ran, never the command itself
+    expect(ran.slice(before).filter(argv => argv[2] !== 'help')).toEqual([])
+  }
+})
+
+test('the artisan tool runs safe commands once artisan has resolved the name', async ($, on) => {
+  const ran: string[][] = []
+  fakeProject(on, ran)
+  await $.session.start({ cwd: '/app' })
+
+  const answer = await $.tool.call({ tool: 'mcp__laravel__artisan', command: 'make:model Post -m' })
+  expect(JSON.stringify(answer)).toContain('✓ artisan make:model Post -m')
+  expect(ran).toContainEqual(['php', 'artisan', 'help', 'make:model', '--format=json', '--no-interaction'])
+  expect(ran).toContainEqual(['php', 'artisan', 'make:model', 'Post', '-m', '--no-interaction'])
+})
+
+test('the artisan tool does not run a name artisan cannot resolve', async ($, on) => {
+  const ran: string[][] = []
+  fakeProject(on, ran)
+  await $.session.start({ cwd: '/app' })
+
+  const answer = await $.tool.call({ tool: 'mcp__laravel__artisan', command: 'nope:thing' })
+  expect(JSON.stringify(answer)).toContain('could not resolve')
+  expect(ran.some(argv => argv[2] === 'nope:thing')).toBe(false)
+})
+
+test('/laravel-artisan from a plugin or relayed message gets the same check', async ($, on) => {
+  const ran: string[][] = []
+  fakeProject(on, ran)
+  await $.session.start({ cwd: '/app' })
+
+  const answer = await $.command.run({ command: 'laravel-artisan', args: 'migr:fr' })
+  expect(answer.text).toContain('Refused: migrate:fresh can destroy data')
+  expect(ran.some(argv => argv[2] === 'migr:fr')).toBe(false)
 })
 
 test('/laravel-schedule reports the scheduler', async ($, on) => {
