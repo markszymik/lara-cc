@@ -438,3 +438,99 @@ export function redact(text: string): string {
     .replace(/(?<![\w\/\\.-])(?=[\w+=-]*[A-Z])(?=[\w+=-]*[a-z])(?=[\w+=-]*\d)[\w+=-]{32,}/g, '[redacted]')
     .replace(/\b[a-f0-9]{40,}\b/g, '[redacted]')
 }
+
+// ─── Test runs ─────────────────────────────────────────────────────────────
+
+export type TestFailure = { name: string; detail: string[] }
+export type TestRun = { passed: number; failed: number; skipped: number; failures: TestFailure[] }
+
+/**
+ * A command that runs the test suite: `php artisan test`, `pest` or `phpunit` (bare or in vendor/bin), or
+ * `composer test`. Not `phpunit.xml` or a package named `pestphp/pest`.
+ */
+export function isTestCommand(command: string): boolean {
+  return /\bartisan\s+test(\s|$)|(^|[\s;&|(]|vendor\/bin\/)(pest|phpunit)(\s|$)|\bcomposer\s+(run(-script)?\s+)?test(\s|$)/.test(command)
+}
+
+/**
+ * The result of a test run from its output: `artisan test` and Pest (`Tests: 2 failed, 30 passed`), or
+ * PHPUnit (`OK (32 tests…)`, `Tests: 32, Assertions: 80, Failures: 2.`), with each failure's name and its
+ * message. Undefined when the output has no summary (the run didn't finish, or isn't a test run).
+ */
+export function parseTestRun(output: string): TestRun | undefined {
+  const lines = output.split('\n').map(l => l.replace(/\s+$/, ''))
+  const count = (text: string, word: RegExp) => Number(text.match(new RegExp(String.raw`(\d+)\s+${word.source}`, 'i'))?.[1] ?? 0)
+  let run: TestRun | undefined
+  const collision = [...lines].reverse().find(l => /^\s*Tests:\s+\d+\s+\w/.test(l))
+  const phpunit = [...lines].reverse().find(l => /^\s*Tests:\s+\d+,/.test(l))
+  const ok = [...lines].reverse().find(l => /^OK \(\d+ tests?/.test(l))
+  if (collision) {
+    const skipped = ['skipped', 'incomplete', 'todos?', 'risky'].reduce((n, w) => n + count(collision, new RegExp(w)), 0)
+    run = { passed: count(collision, /passed/), failed: count(collision, /failed/) + count(collision, /errors?/), skipped, failures: [] }
+  } else if (phpunit) {
+    const field = (name: string) => Number(phpunit.match(new RegExp(`${name}: (\\d+)`))?.[1] ?? 0)
+    const failed = field('Failures') + field('Errors')
+    const skipped = field('Skipped') + field('Incomplete')
+    run = { passed: Math.max(0, field('Tests') - failed - skipped), failed, skipped, failures: [] }
+  } else if (ok) {
+    run = { passed: Number(ok.match(/\((\d+)/)![1]), failed: 0, skipped: 0, failures: [] }
+  }
+  if (!run) return undefined
+
+  // Collision/Pest: `FAILED  Tests\Feature\OrderTest > it creates an order`. PHPUnit: `1) Tests\…::test_x`, but
+  // only in its failure and error lists, not the numbered lists of skipped, risky or deprecated tests
+  let listing = false
+  const header = (l: string) => l.match(/^\s*(?:FAILED|ERROR)\s+(\S.*)$/)?.[1] ?? (listing ? l.match(/^\d+\) (\S.*)$/)?.[1] : undefined)
+  const end = (l: string) => /^\s*Tests:\s+\d/.test(l) || /^(FAILURES!|ERRORS!|OK\b|There (was|were) \d+)/.test(l)
+  let current: TestFailure | undefined
+  for (const l of lines) {
+    if (/^There (was|were) \d+ /.test(l)) listing = /^There (was|were) \d+ (failure|error)s?:/.test(l)
+    const name = header(l)
+    if (name) {
+      current = { name: name.trim(), detail: [] }
+      run.failures.push(current)
+    } else if (current && end(l)) current = undefined
+    else if (current && current.detail.length < 30 && (l.trim() || current.detail.length)) current.detail.push(l.trim() ? l.replace(/^ {2}/, '') : '')
+  }
+  for (const f of run.failures) while (f.detail.length && !f.detail.at(-1)!.trim()) f.detail.pop()
+  return run
+}
+
+// ─── Herd debug session ────────────────────────────────────────────────────
+
+/**
+ * What Herd's `dumps stop debug` returned, and a count per kind for the Services tab: `12 queries, 3 logs`
+ * for an object of lists, or by each entry's `type` for a list. Text that isn't JSON is kept as text.
+ */
+export function parseDebugCapture(stdout: string): { data: unknown; summary: string } {
+  const text = stdout.trim()
+  let data: unknown
+  try {
+    data = JSON.parse(text)
+  } catch {
+    return { data: text, summary: text ? `${text.length} characters captured` : 'nothing captured' }
+  }
+  const counts = new Map<string, number>()
+  if (Array.isArray(data)) {
+    for (const entry of data) {
+      const kind = entry && typeof entry === 'object' && typeof (entry as { type?: unknown }).type === 'string' ? (entry as { type: string }).type : 'entries'
+      counts.set(kind, (counts.get(kind) ?? 0) + 1)
+    }
+  } else if (data && typeof data === 'object') {
+    for (const [kind, value] of Object.entries(data)) if (Array.isArray(value) && value.length) counts.set(kind, value.length)
+  }
+  return { data, summary: [...counts].map(([kind, n]) => `${n} ${kind}`).join(', ') || 'nothing captured' }
+}
+
+/** Keys whose whole value is withheld from Claude in captured data: bound values, headers, cookies, bodies. */
+const WITHHELD_KEY = new RegExp(String.raw`^(bindings|headers|cookies?|session|payload|body|request_?body|response_?body|${SECRET_KEY})$`, 'i')
+
+/** Captured data for Claude: values under WITHHELD_KEY replaced, and every string passed through redact(). */
+export function redactData(value: unknown, depth = 0): unknown {
+  if (typeof value === 'string') return redact(value)
+  if (value === null || typeof value !== 'object') return value
+  // Too deep to walk: withheld rather than sent as is
+  if (depth > 20) return '[redacted]'
+  if (Array.isArray(value)) return value.map(v => redactData(v, depth + 1))
+  return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, WITHHELD_KEY.test(k) ? '[redacted]' : redactData(v, depth + 1)]))
+}

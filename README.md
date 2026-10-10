@@ -28,18 +28,28 @@ Start Claude Code from your Laravel project's root (the folder with `artisan`).
 
 **Queue monitoring.** While the mod runs your queue worker, the **Queue** tab shows each job as it runs, finishes or fails, with timings and session totals. It also shows pending jobs per queue and your stored failed jobs (read from the app itself, so any failed-job driver works), each with **retry**, **forget** and **ask Claude**. A failing job raises a toast. If `QUEUE_CONNECTION=sync`, it tells you a worker isn't needed.
 
-**Status band.** One line above the prompt, shown only when there's something to know: running processes, queue totals, new errors, failed jobs, pending migrations. Press **open** to jump to the right tab.
+**Status band.** One line above the prompt, shown only when there's something to know: running processes, queue totals, new errors, failed jobs, failing tests, pending migrations. Press **open** to jump to the right tab.
 
-It also flags the things that make a change "not work" without an error, and the Services tab explains each one and how to fix it:
+It also flags the things that make a change "not work" without an error, and the Services tab explains each one. Most come with a one-press fix next to them, in the band and on the Services tab. A fix runs only when you press it, never from Claude, and its output lands on the Commands tab:
 
-- **A process that crashed**, e.g. `✗ vite exited (1)`, until you open the Services tab.
-- **`public/hot` with no Vite behind it**: pages load without CSS and JS. Vite running in another terminal counts; only dev servers on this machine (`localhost`, `*.test`) are ever checked.
-- **Cached config, routes or events**: edits to them don't take effect until the cache is cleared.
-- **Maintenance mode**, and **APP_ENV=production** on your machine (read from `artisan about`, not from `.env`).
+- **A process that crashed**, e.g. `✗ vite exited (1)`, until you open the Services tab. Fix: **restart**.
+- **Jobs waiting with no worker**, e.g. `3 jobs waiting, no worker`, when this session runs no worker and the queue isn't draining (a worker elsewhere would drain it). Fix: **start worker**. The queue is checked every minute while no worker runs.
+- **Pending migrations.** Fix: **migrate**.
+- **`public/hot` with no Vite behind it**: pages load without CSS and JS. Vite running in another terminal counts; only dev servers on this machine (`localhost`, `*.test`) are ever checked. Fix: **start vite**.
+- **Cached config, routes or events**: edits to them don't take effect until the cache is cleared. Fix: **clear** runs `config:clear`, `route:clear` or `event:clear` for the caches that exist; not `optimize:clear`, which would also empty your application cache.
+- **Maintenance mode** (fix: **up**), and **APP_ENV=production** on your machine (read from `artisan about`, not from `.env`).
 - **A stopped Herd service the app connects to**, e.g. `Herd MySQL stopped` while the database connection points at its port (also Redis, PostgreSQL, MariaDB, MongoDB, Reverb, Meilisearch, Typesense). The Services tab lists every Herd service and whether it's running, with a **start** button for a stopped one. It uses Herd's own AppleScript command, the same one Herd's MCP server uses; macOS asks once whether your terminal may control Herd. Only your press starts a service: Claude has no tool for it. The mod reads Herd's `services.plist` (type, port and version, no credentials) and asks the app's config for the driver and port of each server on this machine it uses (database, cache, queue, session, broadcasting, Scout). Only those two values come back: passwords, usernames, URLs and remote hosts stay inside PHP and never reach the mod or Claude. A server on a port no Herd service has (Docker, DBngin) is left alone, and Herd is never asked for its site list.
-- **`composer install needed`** when `vendor/` differs from `composer.lock`, and **`npm install needed`** when `node_modules` differs from `package-lock.json` (for pnpm, Yarn and Bun, when `node_modules` is missing), e.g. after a `git pull`.
+- **`composer install needed`** when `vendor/` differs from `composer.lock`, and **`npm install needed`** when `node_modules` differs from `package-lock.json` (for pnpm, Yarn and Bun, when `node_modules` is missing), e.g. after a `git pull`. Fix: **composer install** / **npm install**.
+
+When the band is too narrow, the fix buttons go first, then the warnings fold into a count.
 
 The checks run at start-up, after each of Claude's turns, after commands and every minute. They read lockfiles, Laravel's marker files and Herd's service list, never `.env`.
+
+**Test results.** Every test run in the session counts: `/lara-test`, the Tests tab, the Commands tab, Claude's `artisan` tool, and the `php artisan test`, Pest or PHPUnit runs Claude does through Bash. The band shows `✗ 2 tests failing` until a run passes (and `✓ 32 tests` next to anything else it shows). The **Tests** tab shows the last run, each failure with its message and where it failed, **run tests**, and **ask Claude** for one failure or all of them, redacted like everything sent.
+
+**Herd debug session.** With Herd Pro, **start Herd debug session** on the Services tab makes Herd record the queries, logs, dumps and HTTP calls the app makes; **stop** hands them to the mod, which shows a count of each. They stay in the mod: **ask Claude** asks you first, withholds query bindings, headers, cookies and request bodies, and redacts the rest. (Herd's Xdebug isn't something a mod can switch: Herd turns it on by itself when a request asks for a debug session.)
+
+**Laravel Boost.** When the app has [Laravel Boost](https://github.com/laravel/boost), its `read-log-entries`, `last-error` and `browser-logs` tools ask you and are redacted exactly like lara-cc's `logs` tool. Its `get-config` refuses keys that can hold a secret (`app.key`, `*.password`, `*.secret`, tokens, URLs), and the output of every other Boost tool (`tinker`, `database-query`, schema, app info) is redacted. Boost's two log tools step behind lara-cc's `logs` tool (they load on request) and say to prefer it, so Claude doesn't have two tools for the same thing.
 
 **Dev processes.** Queue worker (or Horizon), Vite and the scheduler, started and stopped from the **Services** tab or commands, with their output. Tick **autostart** to start them whenever you open Claude Code in this project.
 
@@ -53,7 +63,7 @@ The checks run at start-up, after each of Claude's turns, after commands and eve
 
 | Command | What it does |
 | --- | --- |
-| `/lara [tab]` | Opens the pane: Services, Queue, Log, Routes, Commands, About (hotkeys `s q l r c a`) |
+| `/lara [tab]` | Opens the pane: Services, Queue, Log, Tests, Routes, Commands, About (hotkeys `s q l t r c a`) |
 | `/lara-logs [errors\|warnings\|all] [count]` | Recent log entries in the transcript, so Claude sees them too (default: last 5 errors) |
 | `/lara-queue [start\|stop\|restart\|logs\|status\|failed\|retry <id\|all>]` | Queue worker (`queue:work`, or `horizon` if installed) and failed jobs |
 | `/lara-vite [start\|stop\|restart\|logs]` | `npm run dev` (pnpm/yarn/bun detected from the lockfile) |
@@ -78,7 +88,7 @@ Type `/lar` to see them all. Processes run for the life of the session and stop 
 
 Laravel logs and failed-job exceptions can contain confidential data: email addresses, SQL values, tokens, request data. The mod reads them to show you the Log and Queue tabs, toasts and the band, and none of that goes to Claude.
 
-They reach Claude only through the `logs` and `queue` tools, `/lara-logs`, `/lara-queue failed`, and the **ask Claude** buttons. Each time, the mod first asks you in a dialog that explains this: **Send redacted**, **Allow this session**, or **Don't send**. If you dismiss the dialog, or nobody is there to answer (`claude -p`), nothing is sent.
+They reach Claude only through the `logs` and `queue` tools, `/lara-logs`, `/lara-queue failed`, Laravel Boost's log tools, a Herd debug session's **ask Claude**, and the other **ask Claude** buttons. Each time, the mod first asks you in a dialog that explains this: **Send redacted**, **Allow this session**, or **Don't send**. If you dismiss the dialog, or nobody is there to answer (`claude -p`), nothing is sent.
 
 Before anything is sent, and in every command output that goes into the conversation (artisan, tests, npm, Composer, process output), the mod hides what looks confidential: passwords, tokens and keys by name, credentials in URLs, bearer tokens, email addresses, SQL values (the statement is kept up to `where`/`values`/`set`), stack frame arguments, and long random strings. This is best effort: it can't recognise every secret, which is why it still asks.
 

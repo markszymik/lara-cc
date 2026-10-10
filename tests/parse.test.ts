@@ -12,14 +12,18 @@ import {
   herdNeeds,
   herdServices,
   isError,
+  isTestCommand,
   localHotUrl,
   newLogState,
   npmDrift,
   origin,
   parseConnections,
+  parseDebugCapture,
   parseSnapshot,
+  parseTestRun,
   parseWorkerLine,
   redact,
+  redactData,
   projectPath,
   queuesOf,
   refusedOptions,
@@ -223,4 +227,85 @@ test('redact cuts SQL values and stack frame arguments', () => {
   )
   expect(redact('#4 /app/vendor/x.php(9): Foo->bar()')).toBe('#4 /app/vendor/x.php(9): Foo->bar()')
   expect(redact('#5 {main}')).toBe('#5 {main}')
+})
+
+const ARTISAN_TEST = String.raw`
+   PASS  Tests\Unit\ExampleTest
+  ✓ that true is true                                                    0.01s
+
+   FAIL  Tests\Feature\OrderTest
+  ⨯ it creates an order                                                  0.05s
+  ✓ it lists orders                                                      0.02s
+  ─────────────────────────────────────────────────────────────────────────────
+   FAILED  Tests\Feature\OrderTest > it creates an order
+  Expected response status code [201] but received 500.
+Failed asserting that 500 is identical to 201.
+
+  at tests/Feature/OrderTest.php:19
+     18▕     $response = $this->post('/orders', ['total' => 10]);
+  ➜  19▕     $response->assertCreated();
+
+
+  Tests:    1 failed, 2 passed, 1 skipped (5 assertions)
+  Duration: 0.21s
+`
+
+test('parseTestRun reads artisan test / Pest output with each failure', () => {
+  const run = parseTestRun(ARTISAN_TEST)!
+  expect([run.passed, run.failed, run.skipped]).toEqual([2, 1, 1])
+  expect(run.failures.map(f => f.name)).toEqual(['Tests\\Feature\\OrderTest > it creates an order'])
+  expect(run.failures[0]!.detail[0]).toBe('Expected response status code [201] but received 500.')
+  expect(run.failures[0]!.detail.join('\n')).toContain('at tests/Feature/OrderTest.php:19')
+  expect(run.failures[0]!.detail.join('\n')).not.toContain('Tests:')
+})
+
+test('parseTestRun reads PHPUnit output, and nothing without a summary', () => {
+  const phpunit = `There was 1 failure:
+
+1) Tests\\Feature\\OrderTest::test_it_creates_an_order
+Failed asserting that 500 is identical to 201.
+
+/app/tests/Feature/OrderTest.php:19
+
+FAILURES!
+Tests: 12, Assertions: 30, Failures: 1, Skipped: 2.`
+  const run = parseTestRun(phpunit)!
+  expect([run.passed, run.failed, run.skipped]).toEqual([9, 1, 2])
+  expect(run.failures[0]).toEqual({ name: 'Tests\\Feature\\OrderTest::test_it_creates_an_order', detail: ['Failed asserting that 500 is identical to 201.', '', '/app/tests/Feature/OrderTest.php:19'] })
+  expect(parseTestRun('OK (12 tests, 30 assertions)')).toEqual({ passed: 12, failed: 0, skipped: 0, failures: [] })
+  // Skipped and risky tests are numbered too, but aren't failures
+  const skipped = `There were 2 skipped tests:
+
+1) Tests\\Unit\\A::test_a
+2) Tests\\Unit\\B::test_b
+
+OK, but some tests were skipped!
+Tests: 10, Assertions: 20, Skipped: 2.`
+  expect(parseTestRun(skipped)!.failures).toEqual([])
+  expect(parseTestRun('Running tests...')).toBe(undefined)
+})
+
+test('isTestCommand spots test runs', () => {
+  for (const c of ['php artisan test --filter=Order', 'vendor/bin/pest', './vendor/bin/phpunit tests/Unit', 'composer test', 'herd php artisan test']) expect(isTestCommand(c)).toBe(true)
+  for (const c of ['php artisan migrate', 'npm run build', 'git status', 'php artisan make:test OrderTest', 'cat phpunit.xml', 'composer require pestphp/pest-plugin-laravel', 'composer require pestphp/pest']) {
+    expect(isTestCommand(c)).toBe(false)
+  }
+})
+
+test('parseDebugCapture counts what Herd recorded, and keeps text that is not JSON', () => {
+  expect(parseDebugCapture('{"queries":[{},{}],"logs":[{}],"dumps":[]}').summary).toBe('2 queries, 1 logs')
+  expect(parseDebugCapture('[{"type":"query"},{"type":"query"},{"type":"http"}]').summary).toBe('2 query, 1 http')
+  expect(parseDebugCapture('')).toEqual({ data: '', summary: 'nothing captured' })
+})
+
+test('redactData withholds bindings, headers and secrets, and redacts every string', () => {
+  const data = { queries: [{ sql: 'select * from users where email = ?', bindings: ['jane@x.io'], time: 1.2 }], http: [{ url: 'https://api.test', headers: { Authorization: 'Bearer abc' }, api_key: 'k' }], note: 'mail jane@x.io' }
+  let deep: unknown = { cookie: 'c', note: 'jane@x.io' }
+  for (let i = 0; i < 30; i++) deep = { child: deep }
+  expect(JSON.stringify(redactData(deep))).not.toContain('jane@x.io')
+  expect(redactData(data)).toEqual({
+    queries: [{ sql: 'select * from users where email = ?', bindings: '[redacted]', time: 1.2 }],
+    http: [{ url: 'https://api.test', headers: '[redacted]', api_key: '[redacted]' }],
+    note: 'mail [email]',
+  })
 })

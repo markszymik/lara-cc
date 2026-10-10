@@ -13,7 +13,8 @@ import { LOG } from './fixtures'
  * reports; `exits`: exit code of spawned processes by command (`pnpm`); `curl`: curl's exit code; `connections`: the
  * local servers the app's config names (connectionsPhp); `herdServices`: Herd's services.plist as plutil turns it into JSON; `closed`: ports
  * nothing listens on; `share`: the answer to the "send to Claude?" question (default Send redacted), whose
- * questions land in `asked`.
+ * questions land in `asked`; `tests`: what `php artisan test` prints; `debug`: what Herd's debug session hands back;
+ * `pending`: migrations migrate:status lists as pending, until `migrate` runs.
  */
 type Fake = {
   history?: string
@@ -33,6 +34,9 @@ type Fake = {
   closed?: number[]
   share?: string
   asked?: string[]
+  tests?: string
+  debug?: string
+  pending?: number
 }
 
 const COMPOSER = '/opt/bin/composer'
@@ -106,6 +110,10 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
     if (argv.join(' ') === 'php artisan about --json') return ok(JSON.stringify({ environment: { environment: fake.env ?? 'local' } }))
     if (argv[0] === 'plutil') return argv.at(-1) === HERD_PLIST && fake.herdServices ? ok(JSON.stringify(fake.herdServices)) : missing
     // Herd starts the service: its port answers from then on
+    if (argv.includes('migrate:status')) return ok(Array.from({ length: fake.pending ?? 0 }, (_, i) => `2026_01_0${i + 1}_000000_x ..... Pending`).join('\n'))
+    if (argv[0] === 'php' && argv[2] === 'migrate') fake.pending = 0
+    if (argv[0] === 'osascript' && argv.join(' ').includes('dumps')) return ok(argv.join(' ').includes('dumps stop debug') ? (fake.debug ?? '{}') : '')
+    if (argv[0] === 'php' && argv[1] === 'artisan' && argv[2] === 'test' && fake.tests !== undefined) return { value: { exitCode: 1, stdout: fake.tests, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv[0] === 'osascript') {
       fake.closed = fake.closed?.filter(port => port !== Number(argv.at(-2)))
       return ok('')
@@ -571,4 +579,216 @@ test('a stopped Herd service starts from its button on the Services tab, with va
   // The script text is fixed: nothing from the plist is written into it
   expect(osascript.filter((_, i) => osascript[i - 1] === '-e').join('\n')).not.toContain('mysql')
   expect(await drawBand($)).not.toContain('stopped')
+})
+
+async function mountPane($: Engine) {
+  return $.ui.mount({
+    plugin: 'lara-cc',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'lara',
+    props: { title: 'lara-cc', isFocused: true, bodyColumns: 120, placement: 'dock' } as never,
+  })
+}
+
+async function mountBand($: Engine, bodyColumns = 200) {
+  return $.ui.mount({
+    plugin: 'lara-cc',
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: { hasSurvey: false, isWorking: false, maxRows: 4, bodyColumns } as never,
+  })
+}
+
+test('band fixes run on a press: up for maintenance, only the caches that exist, never optimize:clear', async ($, on) => {
+  const ran: string[][] = []
+  const files = { 'storage/framework/down': '{}', 'bootstrap/cache/config.php': '<?php', 'bootstrap/cache/routes-v7.php': '<?php' }
+  const clock = fakeProject(on, ran, { files })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  const band = await mountBand($)
+  expect(ran.some(argv => argv.includes('up') || argv.includes('config:clear'))).toBe(false)
+  await band.press({ key: 'fix-up' })
+  await band.press({ key: 'fix-clear' })
+  await clock.settle()
+  expect(ran).toContainEqual(['php', 'artisan', 'up', '--no-interaction'])
+  expect(ran).toContainEqual(['php', 'artisan', 'config:clear', '--no-interaction'])
+  expect(ran).toContainEqual(['php', 'artisan', 'route:clear', '--no-interaction'])
+  expect(ran.some(argv => argv.includes('event:clear') || argv.includes('optimize:clear') || argv.includes('cache:clear'))).toBe(false)
+})
+
+test('a narrow band drops the fix buttons before folding the warnings', async ($, on) => {
+  const ran: string[][] = []
+  const clock = fakeProject(on, ran, { files: { 'storage/framework/down': '{}' } })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  const narrow = JSON.stringify(await (await mountBand($, 34)).drawn())
+  expect(narrow).toContain('maintenance mode')
+  expect(narrow).not.toContain('fix-up')
+})
+
+test('jobs waiting with no worker show in the band with a start button; a draining queue does not', async ($, on) => {
+  const ran: string[][] = []
+  const spawned: string[][] = []
+  const snapshot = { connection: 'database', sizes: { default: 3, emails: 0 }, failedTotal: 0, failed: [] }
+  const fake = { snapshot, spawned }
+  const clock = fakeProject(on, ran, fake)
+  on('ui.open', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  const band = await mountBand($)
+  expect(JSON.stringify(await band.drawn())).toContain('3 jobs waiting, no worker')
+  await band.press({ key: 'fix-start worker' })
+  await clock.settle()
+  expect(spawned.some(argv => argv.includes('queue:work'))).toBe(true)
+  await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'stop' })
+
+  // A worker elsewhere drains it: fewer than last time
+  fake.snapshot = { ...snapshot, sizes: { default: 1, emails: 0 } }
+  await $.command.run({ command: 'lara-queue', args: 'status' })
+  await clock.settle()
+  expect(JSON.stringify(await band.drawn())).not.toContain('waiting, no worker')
+})
+
+const FAILING = String.raw`
+   FAILED  Tests\Feature\OrderTest > it creates an order
+  Expected response status code [201] but received 500 for jane@example.com.
+
+  at tests/Feature/OrderTest.php:19
+
+  Tests:    1 failed, 4 passed (9 assertions)
+`
+
+test('a failing test run shows in the band and the Tests tab, and goes to Claude redacted', async ($, on) => {
+  const ran: string[][] = []
+  const clock = fakeProject(on, ran, { tests: FAILING })
+  on('ui.open', () => ({ value: undefined }))
+  const sent: string[] = []
+  on('prompt.submit', ($, e) => {
+    sent.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/app' })
+  await $.command.run({ command: 'lara-test', args: '' })
+  await clock.settle()
+
+  expect(JSON.stringify(await (await mountBand($)).drawn())).toContain('✗ 1 test failing')
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-tests' })
+  const drawn = JSON.stringify(await pane.drawn())
+  expect(drawn).toContain('✗ 1 failed, 4 passed')
+  expect(drawn).toContain('it creates an order')
+  await pane.press({ key: 'ask-test-0' })
+  expect(sent[0]).toContain('Tests\\Feature\\OrderTest > it creates an order')
+  expect(sent[0]).toContain('[email]')
+  expect(sent[0]).not.toContain('jane@example.com')
+})
+
+test('tests Claude runs through Bash show too', async ($, on) => {
+  const ran: string[][] = []
+  const clock = fakeProject(on, ran)
+  let bashRuns = 0
+  on('tool.call', { tool: 'Bash' }, () => {
+    bashRuns++
+    return { result: { stdout: 'OK (12 tests, 30 assertions)', stderr: '', interrupted: false } } as never
+  })
+  on('ui.open', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+  await $.tool.call({ tool: 'Bash', command: 'vendor/bin/phpunit' } as never)
+  // The band shows a passing run only next to something else; the Tests tab always does
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-tests' })
+  expect(JSON.stringify(await pane.drawn())).toContain('✓ 12 passed')
+  expect(bashRuns).toBe(1)
+})
+
+test("Boost's log tools ask first and are redacted; its tinker output is redacted", async ($, on) => {
+  const ran: string[][] = []
+  const asked: string[] = []
+  const fake: Parameters<typeof fakeProject>[2] = { asked, share: "Don't send" }
+  const clock = fakeProject(on, ran, fake)
+  let boostRan = 0
+  on('tool.call', { tool: ['mcp__laravel-boost__read-log-entries', 'mcp__laravel-boost__tinker'] }, () => {
+    boostRan++
+    return { result: 'login failed password=hunter2 for jane@example.com' } as never
+  })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  const declined = JSON.stringify(await $.tool.call({ tool: 'mcp__laravel-boost__read-log-entries', entries: 5 } as never))
+  expect(declined).toContain('chose not to send')
+  expect(boostRan).toBe(0)
+  fake.share = 'Send redacted'
+  const sent = JSON.stringify(await $.tool.call({ tool: 'mcp__laravel-boost__read-log-entries', entries: 5 } as never))
+  expect(sent).toContain('password=[redacted] for [email]')
+  const tinker = JSON.stringify(await $.tool.call({ tool: 'mcp__laravel-boost__tinker', code: 'User::first()' } as never))
+  expect(tinker).not.toContain('hunter2')
+})
+
+test("Herd's debug session starts and stops on a press, and goes to Claude only when asked, withheld and redacted", async ($, on) => {
+  const ran: string[][] = []
+  const asked: string[] = []
+  const debug = JSON.stringify({ queries: [{ sql: 'select * from users where email = ?', bindings: ['jane@example.com'] }], logs: [{ message: 'hi' }] })
+  const clock = fakeProject(on, ran, { herdServices: [MYSQL], asked, debug })
+  on('ui.open', () => ({ value: undefined }))
+  const sent: string[] = []
+  on('prompt.submit', ($, e) => {
+    sent.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-services' })
+  await pane.press({ key: 'herd-debug' })
+  await clock.settle()
+  expect(ran).toContainEqual(['osascript', '-e', 'tell application "Herd" to dumps start debug'])
+  await pane.press({ key: 'herd-debug' })
+  await clock.settle()
+  expect(JSON.stringify(await pane.drawn())).toContain('1 queries, 1 logs')
+  expect(sent.length).toBe(0)
+
+  await pane.press({ key: 'debug-ask' })
+  expect(asked.at(-1)).toContain('debug session')
+  expect(sent[0]).toContain('"bindings": "[redacted]"')
+  expect(sent[0]).not.toContain('jane@example.com')
+})
+
+test("Boost's get-config refuses keys that can hold secrets and redacts the rest", async ($, on) => {
+  const ran: string[][] = []
+  const clock = fakeProject(on, ran)
+  const read: string[] = []
+  on('tool.call', { tool: 'mcp__laravel-boost__get-config' }, ($, e) => {
+    read.push(String((e as unknown as { key: string }).key))
+    return { result: '{"key":"mail.from.address","value":"jane@example.com"}' } as never
+  })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  for (const key of ['app.key', 'database.connections.mysql.password', 'services.stripe.secret', 'database.redis.default.url']) {
+    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__laravel-boost__get-config', key } as never))).toContain('refused')
+  }
+  expect(read).toEqual([])
+  const fine = JSON.stringify(await $.tool.call({ tool: 'mcp__laravel-boost__get-config', key: 'mail.from.address' } as never))
+  expect(fine).toContain('[email]')
+  expect(read).toEqual(['mail.from.address'])
+})
+
+test('the band migrate fix runs migrate and counts the pending migrations again', async ($, on) => {
+  const ran: string[][] = []
+  const clock = fakeProject(on, ran, { pending: 2 })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  const band = await mountBand($)
+  expect(JSON.stringify(await band.drawn())).toContain('2 pending migrations')
+  await band.press({ key: 'fix-migrate' })
+  await clock.settle()
+  expect(ran).toContainEqual(['php', 'artisan', 'migrate', '--no-interaction'])
+  expect(JSON.stringify(await band.drawn())).not.toContain('pending migration')
 })

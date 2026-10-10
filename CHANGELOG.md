@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-10
+
+### Added
+
+- One-press fixes in the status band and on the Services tab: restart a crashed process, start the worker, migrate, start Vite, clear the config/route/event caches that exist (never `optimize:clear`), `artisan up`, Composer/npm install, start a Herd service. Only the person's press runs them; the band drops them before folding warnings when it's narrow.
+- The band flags jobs waiting with no worker in this session, unless the queue is draining; the queue is checked every minute while no worker runs.
+- Test results from every run in the session (`/lara-test`, the Tests tab, the artisan tool, and the Pest/PHPUnit runs Claude does through Bash): failing tests show in the band until a run passes, a passing run shows next to anything else the band shows, and a new **Tests** tab (hotkey `t`) lists the failures with **run tests** and **ask Claude**.
+- Start and stop Herd's debug session (Herd Pro) from the Services tab; what it records stays in the mod until you send it, asked first, with bindings, headers and bodies withheld and the rest redacted.
+- With Laravel Boost installed, its log tools ask first and are redacted like lara-cc's `logs` tool, its `get-config` refuses keys that can hold secrets (`app.key`, passwords, tokens, URLs), every other Boost tool's output (`tinker`, `database-query`…) is redacted, and its two log tools step behind lara-cc's so Claude doesn't have both.
+
 ## [0.7.0] - 2026-10-10
 
 ### Added

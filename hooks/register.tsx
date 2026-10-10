@@ -14,16 +14,20 @@ import {
   herdNeeds,
   herdServices,
   isError,
+  isTestCommand,
   isWarning,
   localHotUrl,
   newLogState,
   npmDrift,
   origin,
   parseConnections,
+  parseDebugCapture,
   parseSnapshot,
+  parseTestRun,
   parseWorkerLine,
   queuesOf,
   redact,
+  redactData,
   refusedOptions,
   shortClass,
   snapshotPhp,
@@ -31,7 +35,7 @@ import {
   stripAnsi,
   tail,
 } from './parse'
-import type { AppConnection, FailedJob, HerdService, LogEntry, QueueSnapshot } from './parse'
+import type { AppConnection, FailedJob, HerdService, LogEntry, QueueSnapshot, TestFailure, TestRun } from './parse'
 
 /**
  * lara-cc: an unofficial Claude Code mod for Laravel apps. Not affiliated with or endorsed by Laravel LLC or Anthropic.
@@ -91,13 +95,22 @@ const DESTRUCTIVE_OPTIONS = ['--force', '-f', '--env', '--prune', '--seed', '--s
 /** Artisan commands Claude's tool refuses because they print secrets: config values (passwords, APP_KEY) or the .env encryption key. */
 const CONFIDENTIAL = ['config:show', 'env:encrypt', 'env:decrypt']
 
+/** Laravel Boost's MCP tools that read logs: asked for and redacted like lara-cc's logs tool. */
+const BOOST_LOG_TOOLS = /^mcp__laravel-boost__(read-log-entries|last-error|browser-logs)$/
+
+/** Every other Boost tool, in any version (tinker, database-query, schema, app info…): its output is redacted. get-config has its own guard. */
+const BOOST_OTHER_TOOLS = /^mcp__laravel-boost__(?!(read-log-entries|last-error|browser-logs|get-config)$)/
+
+/** Config keys whose value can be a secret: refused for Boost's get-config (`app.key`, `*.password`, `services.*.secret`…). */
+const SECRET_CONFIG = /(^|[._-])(key|keys|pass(word)?|pwd|secret|token|auth|credentials?|dsn|url|cookie|signature|salt|private)([._-]|$)/i
+
 const PANE = 'lara'
 const MAX_SERVICE_LINES = 400
 const TOAST_GAP_MS = 5000
 
 // ─── State (module variables reset when the mod reloads; child processes die with it) ──
 
-type Tab = 'services' | 'queue' | 'log' | 'routes' | 'commands' | 'about'
+type Tab = 'services' | 'queue' | 'log' | 'tests' | 'routes' | 'commands' | 'about'
 type Run = { stream: HookStream<ProcessSpawnChunk, ProcessSpawnResult>; done: Promise<void> }
 /** `crashed`: the exit code of a run that ended on its own with an error; `seen` once the Services tab showed it. */
 type Service = { name: string; label: string; argv: string[]; run?: Run; lines: string[]; startedAt?: number; partial: string; crashed?: { code: number; seen: boolean } }
@@ -141,6 +154,18 @@ let about: Record<string, Record<string, unknown>> | undefined
 let routes: Route[] | undefined
 let routeFilter = ''
 let pendingMigrations = 0
+// Fixes running from a band or Services tab button, by label, so the button reads "running…"
+const fixing = new Set<string>()
+// A test run started by runCommand is in progress (the Tests tab's button waits for it)
+let testsRunning = false
+// The last test run this session: /lara-test, the Tests tab, the artisan tool or Claude's Bash (see noteTestRun)
+let lastTest: (TestRun & { label: string; at: number }) | undefined
+// Herd's debug session (queries, logs, dumps, HTTP calls the app made), started from the Services tab
+type DebugState = 'off' | 'starting' | 'on' | 'stopping'
+let debugState: DebugState = 'off'
+let debugCapture: { data: unknown; summary: string; at: number } | undefined
+// Laravel Boost's MCP server is installed: its log tools get the same ask and redaction as lara-cc's
+let hasBoost = false
 // The person let log entries and failed-job exceptions go to Claude for the rest of this session (see mayShare)
 let shareAllowed = false
 const editedPhp = new Set<string>()
@@ -154,7 +179,9 @@ let unseenErrors = 0
 let logReady: Promise<void> = Promise.resolve()
 
 // Health checks: things that quietly break the app (see checkHealth)
-type Check = { band: string; color: 'red' | 'yellow'; detail: string }
+/** `fix`: what the check's button runs, only ever on the person's press; it may return a line to show. */
+type Fix = { label: string; run: () => Promise<string | void> }
+type Check = { band: string; color: 'red' | 'yellow'; detail: string; fix?: Fix; backlog?: true }
 let checks: Check[] = []
 let checking = false
 let checkAgain = false
@@ -176,6 +203,8 @@ let snapshot: QueueSnapshot | undefined
 let snapshotAt = 0
 let snapshotError = ''
 let snapshotLoading = false
+// The jobs waiting at the snapshot before this one, to tell a backlog from a queue a worker elsewhere drains
+let waitingBefore: number | undefined
 
 // ─── Small helpers ─────────────────────────────────────────────────────────
 
@@ -310,19 +339,72 @@ async function runPhp($: Api, argv: string[], init: { timeoutMs: number }) {
 
 /** Run a command, keep its output for the Commands tab, and return it. */
 async function runCommand($: Api, label: string, argv: string[], timeoutMs = 600_000): Promise<LastRun> {
+  const isTests = isTestCommand(argv.join(' '))
   lastRun = { label, isRunning: true, output: '' }
+  if (isTests) testsRunning = true
   redraw($)
   try {
     const r = await runPhp($, argv, { timeoutMs })
     const output = stripAnsi([r.stdout, r.stderr].filter(Boolean).join('\n')).trim()
     lastRun = { label, isRunning: false, exitCode: r.exitCode, output: tail(output) }
+    if (isTests) noteTestRun($, label, output)
   } catch (err) {
     lastRun = { label, isRunning: false, exitCode: -1, output: 'Could not run `' + argv.join(' ') + '`: ' + String(err) }
   }
+  if (isTests) testsRunning = false
   redraw($)
   // optimize:clear, composer install, artisan up… change what the checks see
   void checkHealth($)
   return lastRun
+}
+
+/** Send `text` to Claude as the person's message: the ask Claude buttons. */
+function sendToClaude($: Api, text: string) {
+  $.prompt.submit({ text, asUser: true }).catch(err => $.ui.toast('Could not send to Claude: ' + String(err)))
+}
+
+/** A tool result for Claude with its text redacted; an error stays one (as a deny, which Claude reads as an error). */
+function redactedResult(result: { text?: string; result?: unknown; isError?: true; deny?: string }) {
+  if (result.deny) return { deny: result.deny }
+  return result.isError ? { deny: redact(resultText(result)) } : { result: redact(resultText(result)) }
+}
+
+/**
+ * What a tool call returned as text: what the model reads (`text`, set by core), else the record itself when a
+ * hook answered: a string, MCP text blocks, or Bash's stdout and stderr.
+ */
+function resultText(result: { text?: string; result?: unknown }): string {
+  if (result.text !== undefined) return result.text
+  const record = result.result
+  if (typeof record === 'string') return record
+  if (Array.isArray(record)) return record.map(b => (b && typeof b === 'object' && typeof (b as { text?: unknown }).text === 'string' ? (b as { text: string }).text : '')).join('\n')
+  if (record && typeof record === 'object') {
+    const { stdout, stderr } = record as { stdout?: unknown; stderr?: unknown }
+    if (typeof stdout === 'string' || typeof stderr === 'string') return [stdout, stderr].filter(t => typeof t === 'string').join('\n')
+    return JSON.stringify(record)
+  }
+  return ''
+}
+
+/** Remember a test run's result for the band and the Tests tab; output with no test summary is ignored. */
+function noteTestRun($: Api, label: string, output: string) {
+  const run = parseTestRun(stripAnsi(output))
+  if (!run) return
+  lastTest = { ...run, label, at: Date.now() }
+  redraw($)
+}
+
+/** Send one failing test to Claude to fix: the Tests tab's button. Redacted, like everything sent. */
+function askAboutTest($: Api, f: TestFailure) {
+  const text = ['This test fails in my Laravel app. Find the cause and fix it, then run it again.', '', `Test: ${f.name}`, '', '```', redact(f.detail.join('\n')), '```'].join('\n')
+  sendToClaude($, text)
+}
+
+/** Send every failing test of the last run to Claude. */
+function askAboutTests($: Api, failures: TestFailure[]) {
+  const blocks = failures.slice(0, 10).map(f => `Test: ${f.name}\n\`\`\`\n${redact(f.detail.slice(0, 15).join('\n'))}\n\`\`\``)
+  const text = [`${plural(failures.length, 'test')} fail in my Laravel app. Find the causes and fix them, then run the tests again.`, '', ...blocks].join('\n\n')
+  sendToClaude($, text)
 }
 
 /** A run's result for Claude (tool results and command output in the transcript), with secrets redacted. */
@@ -502,6 +584,7 @@ async function refreshQueue($: Api) {
     const r = await runPhp($, ['php', '-r', snapshotPhp(queuesOf(services.queue.argv))], { timeoutMs: 30_000 })
     const parsed = parseSnapshot(r.stdout)
     if (parsed) {
+      waitingBefore = snapshot ? waiting(snapshot) : undefined
       snapshot = parsed
       snapshotError = parsed.error ?? ''
     } else {
@@ -512,7 +595,15 @@ async function refreshQueue($: Api) {
   }
   snapshotAt = Date.now()
   snapshotLoading = false
+  // Only the backlog warning depends on the snapshot: swap it in without running every check
+  const backlog = backlogCheck($)
+  checks = [...checks.filter(c => !c.backlog), ...(backlog ? [backlog] : [])]
   redraw($)
+}
+
+/** Jobs waiting across the snapshot's queues. */
+function waiting(snap: QueueSnapshot): number {
+  return Object.values(snap.sizes).reduce((n, size) => n + (Number(size) || 0), 0)
 }
 
 async function retryFailed($: Api, id: string): Promise<string> {
@@ -566,7 +657,7 @@ async function askAboutFailedJob($: Api, f: FailedJob) {
     redact(f.exception.split('\n').slice(0, 40).join('\n')),
     '```',
   ].join('\n')
-  $.prompt.submit({ text, asUser: true }).catch(err => $.ui.toast('Could not send to Claude: ' + String(err)))
+  sendToClaude($, text)
 }
 
 // ─── Log monitoring ────────────────────────────────────────────────────────
@@ -696,7 +787,7 @@ async function askAboutError($: Api, entry: LogEntry) {
     redact(formatEntry(entry, 30, projectDir)),
     '```',
   ].join('\n')
-  $.prompt.submit({ text, asUser: true }).catch(err => $.ui.toast('Could not send to Claude: ' + String(err)))
+  sendToClaude($, text)
 }
 
 async function clearLog($: Api) {
@@ -790,16 +881,35 @@ async function checkHealth($: Api) {
     ])
     // The file covers the default driver; about covers the cache driver too
     if (down || about?.environment?.maintenance_mode === true) {
-      next.push({ band: 'maintenance mode', color: 'red', detail: 'The app answers every request with 503 (storage/framework/down). /lara-artisan up brings it back.' })
+      next.push({
+        band: 'maintenance mode',
+        color: 'red',
+        detail: 'The app answers every request with 503 (storage/framework/down). `artisan up` brings it back.',
+        fix: { label: 'up', run: artisanFix($, [['up']]) },
+      })
     }
     const cached = Object.keys(CACHE_FILES).filter((_, i) => cacheFiles[i])
     if (cached.length) {
       const list = cached.join(', ')
-      next.push({ band: `${cached.join('+')} cached`, color: 'yellow', detail: `Laravel is using cached ${list}, so edits to them don't take effect until the cache is cleared: optimize:clear on the Commands tab.` })
+      // Only the caches that exist: optimize:clear would also empty the application cache
+      const clear = cached.map(c => CLEAR_COMMANDS[c as keyof typeof CACHE_FILES])
+      next.push({
+        band: `${cached.join('+')} cached`,
+        color: 'yellow',
+        detail: `Laravel is using cached ${list}, so edits to them don't take effect until the cache is cleared (${clear.join(', ')}).`,
+        fix: { label: 'clear', run: artisanFix($, clear.map(c => [c])) },
+      })
     }
     if (hot) {
-      next.push({ band: 'Vite not running (public/hot)', color: 'yellow', detail: "public/hot points pages at a Vite dev server that isn't running, so they load without CSS and JS. Start Vite (/lara-vite start) or delete public/hot." })
+      next.push({
+        band: 'Vite not running (public/hot)',
+        color: 'yellow',
+        detail: "public/hot points pages at a Vite dev server that isn't running, so they load without CSS and JS. Start Vite, or delete public/hot.",
+        fix: { label: 'start vite', run: () => startService($, 'vite') },
+      })
     }
+    const backlog = backlogCheck($)
+    if (backlog) next.push(backlog)
     const [herd, deps] = await Promise.all([checkHerd($), checkDeps($)])
     next.push(...herd, ...deps)
     checks = next
@@ -811,6 +921,76 @@ async function checkHealth($: Api) {
   redraw($)
   if (checkAgain) {
     checkAgain = false
+    void checkHealth($)
+  }
+}
+
+/** The artisan commands that clear each cache file. */
+const CLEAR_COMMANDS: Record<keyof typeof CACHE_FILES, string> = { config: 'config:clear', routes: 'route:clear', events: 'event:clear' }
+
+/** A fix that runs these artisan commands in turn (shown on the Commands tab), stopping at the first that fails. */
+function artisanFix($: Api, commands: string[][]): Fix['run'] {
+  return async () => {
+    for (const args of commands) {
+      const run = await runCommand($, 'artisan ' + args.join(' '), ['php', 'artisan', ...args, '--no-interaction'])
+      if (run.exitCode !== 0) return `✗ artisan ${args.join(' ')} (exit ${run.exitCode}); output on the Commands tab`
+    }
+    return `✓ artisan ${commands.map(c => c.join(' ')).join(', ')}`
+  }
+}
+
+/** Run the pending migrations, then count them again so the band's warning goes. */
+function migrateFix($: Api): Fix['run'] {
+  const migrate = artisanFix($, [['migrate']])
+  return async () => {
+    const said = await migrate()
+    await checkMigrations($)
+    return said
+  }
+}
+
+/** A fix that runs one command (Composer, npm), shown on the Commands tab. */
+function commandFix($: Api, label: string, argv: string[]): Fix['run'] {
+  return async () => {
+    const run = await runCommand($, label, argv)
+    return run.exitCode === 0 ? `✓ ${label}` : `✗ ${label} (exit ${run.exitCode}); output on the Commands tab`
+  }
+}
+
+/**
+ * Jobs waiting while this session runs no worker, so they won't run. Left out when the count dropped since
+ * the last snapshot: a worker elsewhere (another terminal, Horizon) is draining it.
+ */
+function backlogCheck($: Api): Check | undefined {
+  if (!snapshot || snapshot.connection === 'sync' || services.queue.run) return undefined
+  const now = waiting(snapshot)
+  if (!now || (waitingBefore !== undefined && now < waitingBefore)) return undefined
+  const sizes = Object.entries(snapshot.sizes).filter(([, n]) => n).map(([q, n]) => `${q}: ${n}`).join(', ')
+  return {
+    band: `${plural(now, 'job')} waiting, no worker`,
+    color: 'yellow',
+    detail: `${plural(now, 'job')} waiting on the ${snapshot.connection} queue (${sizes}) and no worker runs in this session, so they won't run. Start one, or ignore this if a worker runs elsewhere (delayed jobs count too).`,
+    fix: { label: 'start worker', run: () => startService($, 'queue') },
+    backlog: true,
+  }
+}
+
+/**
+ * Run a check's fix: the band's or the Services tab's button, so only ever the person's press. Shows how it
+ * went, then checks again so the warning clears.
+ */
+async function runFix($: Api, fix: Fix) {
+  if (fixing.has(fix.label)) return
+  fixing.add(fix.label)
+  redraw($)
+  try {
+    const said = await fix.run()
+    if (said) $.ui.toast(said, { timeoutMs: 6000 })
+  } catch (err) {
+    $.ui.toast(`${fix.label} failed: ${String(err)}`, { timeoutMs: 8000 })
+  } finally {
+    fixing.delete(fix.label)
+    redraw($)
     void checkHealth($)
   }
 }
@@ -839,7 +1019,8 @@ async function checkHerd($: Api): Promise<Check[]> {
     .map(({ service: s, driver, uses }) => ({
       band: `Herd ${s.name} stopped`,
       color: 'red' as const,
-      detail: `The app's ${uses.join(', ')} uses ${driver} on port ${s.port}, and Herd's ${s.name} ${s.version} there isn't running, so anything that needs it fails. Press start next to it below, or start it in Herd → Services.`,
+      detail: `The app's ${uses.join(', ')} uses ${driver} on port ${s.port}, and Herd's ${s.name} ${s.version} there isn't running, so anything that needs it fails.`,
+      fix: { label: `start ${s.name}`, run: () => startHerdService($, s) },
     }))
 }
 
@@ -872,6 +1053,54 @@ async function startHerdService($: Api, s: HerdService) {
     herdStarting.delete(s.port)
     void checkHealth($)
   }
+}
+
+/**
+ * Start or stop Herd's debug session (Herd Pro): while it runs, Herd records the queries, logs, dumps and
+ * HTTP calls the app makes, and stopping hands them over. Only the person's press. What it records can be
+ * confidential, so it stays in the mod until they choose to send it, asked and redacted like logs.
+ */
+async function toggleDebugSession($: Api) {
+  if (debugState === 'starting' || debugState === 'stopping') return
+  const starting = debugState === 'off'
+  debugState = starting ? 'starting' : 'stopping'
+  redraw($)
+  let after: DebugState = starting ? 'off' : 'on'
+  try {
+    // Fixed script text: Herd's own commands, nothing from elsewhere written into it
+    const command = starting ? 'tell application "Herd" to dumps start debug' : 'tell application "Herd" to dumps stop debug'
+    const r = await $.process.run(['osascript', '-e', command], { timeoutMs: 60_000 })
+    if (r.exitCode !== 0) {
+      const why = stripAnsi(r.stderr).trim().slice(0, 200) || 'exit ' + r.exitCode
+      $.ui.toast(`Herd couldn't ${starting ? 'start' : 'stop'} the debug session (it needs Herd Pro): ${why}`, { timeoutMs: 8000 })
+    } else if (starting) {
+      after = 'on'
+      debugCapture = undefined
+      $.ui.toast('Herd is recording queries, logs, dumps and HTTP calls. Use the app, then stop the session.', { timeoutMs: 6000 })
+    } else {
+      after = 'off'
+      debugCapture = { ...parseDebugCapture(r.stdout), at: Date.now() }
+    }
+  } catch (err) {
+    $.ui.toast(`Herd couldn't ${starting ? 'start' : 'stop'} the debug session: ${String(err)}`, { timeoutMs: 8000 })
+  } finally {
+    debugState = after
+    redraw($)
+  }
+}
+
+/** Send the debug session Herd recorded to Claude to look for problems: asked first, bound values and headers withheld. */
+async function askAboutDebugCapture($: Api) {
+  if (!debugCapture || !(await mayShare($, 'the debug session Herd recorded (queries, logs, dumps, HTTP calls)'))) return
+  const json = JSON.stringify(redactData(debugCapture.data), null, 1)
+  const text = [
+    'Herd recorded this debug session in my Laravel app: queries, logs, dumps and HTTP calls. Look for problems, such as errors, slow or repeated (N+1) queries and failed requests, and fix them.',
+    '',
+    '```json',
+    json.length > 30_000 ? json.slice(0, 30_000) + '\n…' : json,
+    '```',
+  ].join('\n')
+  sendToClaude($, text)
 }
 
 /** What Herd's services.plist lists; empty without Herd. A half-written plist keeps the last read and is read again next time. */
@@ -922,7 +1151,13 @@ async function checkDeps($: Api): Promise<Check[]> {
   if (key === depsSeen) return depsChecks
   const has = (file: string) => times[DEP_FILES.indexOf(file)]! >= 0
   const out: Check[] = []
-  const add = (tool: string, detail: string) => out.push({ band: `${tool} install needed`, color: 'yellow', detail })
+  const add = (tool: string, detail: string) =>
+    out.push({
+      band: `${tool} install needed`,
+      color: 'yellow',
+      detail,
+      fix: { label: `${tool} install`, run: commandFix($, `${tool} install`, tool === 'composer' ? ['composer', 'install', '--no-interaction'] : [pm, 'install']) },
+    })
   const differ = (lock: string, drift: string[], fix: string) =>
     `${plural(drift.length, 'package')} in ${lock} differ from what's installed (${drift.slice(0, 3).join(', ')}${drift.length > 3 ? '…' : ''}). Run ${fix}.`
 
@@ -964,6 +1199,9 @@ async function detectProject($: Api) {
   checks = []
   connections = []
   shareAllowed = false
+  lastTest = undefined
+  waitingBefore = undefined
+  hasBoost = false
   depsSeen = ''
   depsChecks = []
   about = undefined
@@ -989,6 +1227,7 @@ async function detectProject($: Api) {
 
   try {
     const composer = await $.fs.read('composer.json')
+    hasBoost = composer.includes('"laravel/boost"')
     if (composer.includes('"laravel/horizon"')) {
       services.queue.argv = ['php', 'artisan', 'horizon']
       services.queue.label = 'Horizon'
@@ -1003,7 +1242,7 @@ async function detectProject($: Api) {
 const commandFailed = (_$: Api, _e: unknown, next: { error: { message?: string } }) => ({ text: 'lara-cc: ' + (next.error.message ?? 'failed') })
 const toolFailed = (_$: Api, _e: unknown, next: { error: { message?: string } }) => ({ result: 'lara-cc: ' + (next.error.message ?? 'failed') })
 
-const TABS: Tab[] = ['services', 'queue', 'log', 'routes', 'commands', 'about']
+const TABS: Tab[] = ['services', 'queue', 'log', 'tests', 'routes', 'commands', 'about']
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -1011,7 +1250,7 @@ export const register: Register = on => {
     await detectProject($)
 
     const commands = [
-      { name: 'lara', description: 'Open the lara-cc pane', argumentHint: '[services|queue|log|routes|commands|about]', immediate: true as const },
+      { name: 'lara', description: 'Open the lara-cc pane', argumentHint: '[services|queue|log|tests|routes|commands|about]', immediate: true as const },
       { name: 'lara-artisan', description: 'Run php artisan <args>', argumentHint: '<command> [args]' },
       { name: 'lara-queue', description: 'Queue worker and failed jobs', argumentHint: '[start|stop|restart|logs|status|failed|retry <id|all>]', immediate: true as const },
       { name: 'lara-vite', description: 'Vite dev server: start, stop, restart, logs', argumentHint: '[start|stop|restart|logs]', immediate: true as const },
@@ -1058,7 +1297,8 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'logs',
       description:
-        'Read recent entries from the Laravel log (storage/logs), with exception origin and stack. Check it after running code, hitting a page or running tests, to see errors the app logged.',
+        'Read recent entries from the Laravel log (storage/logs), with exception origin and stack. Check it after running code, hitting a page or running tests, to see errors the app logged.' +
+        (hasBoost ? " Use this rather than Laravel Boost's read-log-entries or last-error." : ''),
       inputSchema: {
         type: 'object',
         properties: {
@@ -1101,6 +1341,8 @@ export const register: Register = on => {
         void watchLog($)
         // about is re-read so a changed APP_ENV or `artisan down` shows within a minute
         void loadAbout($).then(() => checkHealth($))
+        // Jobs piling up with no worker; not when the app has no queue to read (no database yet) or runs jobs inline
+        if (!services.queue.run && snapshot && !snapshotError && snapshot.connection !== 'sync') void refreshQueue($)
       })
       $.clock.every(15_000, () => {
         if (paneOpen && tab === 'queue') void refreshQueue($)
@@ -1245,22 +1487,65 @@ export const register: Register = on => {
     return { result: tail(`${shown.length} of ${list.length} routes\n` + shown.map(formatRoute).join('\n')) }
   }).catch(toolFailed)
 
-  // ── When Claude edits PHP: restart the queue worker, and remember the file for Pint ──
+  // ── Tests Claude runs itself: the result shows in the band and the Tests tab ──
 
-  on('tool.call', { tool: ['Edit', 'Write'] }, async ($, e, next) => {
+  // No .catch that calls next again: the command has already run, and must not run twice
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const result = await next(e)
-    const path = String((e as unknown as { file_path?: string }).file_path ?? '')
-    if (!path.endsWith('.php') || ('isError' in result && result.isError)) return result
-    editedPhp.add(path)
-    if (settings.autoRestartQueue && services.queue.run) {
-      restartTimer?.cancel()
-      restartTimer = $.clock.after(2000, async () => {
-        await restartService($, 'queue')
-        $.ui.toast(`${services.queue.label} restarted after PHP edits`)
-      })
+    try {
+      const command = String((e as unknown as { command?: string }).command ?? '')
+      if (isLaravel && isTestCommand(command) && !('deny' in result && result.deny)) noteTestRun($, 'Claude ran ' + command.slice(0, 60), resultText(result))
+    } catch (err) {
+      $.ui.log('lara-cc: could not read the test run: ' + String(err))
     }
     return result
-  }).catch(($, e, next) => next(e))
+  })
+
+  // ── Laravel Boost: its log tools get the same ask and redaction as lara-cc's, and step behind its logs tool ──
+
+  on('tool.describe', { tool: ['mcp__laravel-boost__read-log-entries', 'mcp__laravel-boost__last-error'] }, async ($, e, next) => {
+    const described = await next(e)
+    return { ...described, description: described.description + ' Prefer mcp__lara-cc__logs: the same entries, asked for and redacted.', isDeferred: true }
+  })
+
+  on('tool.call', { tool: BOOST_LOG_TOOLS }, async ($, e, next) => {
+    if (!(await mayShare($, "log entries through Laravel Boost's " + e.tool.replace('mcp__laravel-boost__', '')))) return { deny: NOT_SHARED }
+    return redactedResult(await next(e))
+  }).catch(() => ({ deny: 'lara-cc could not check this call, so it was not sent.' }))
+
+  // Config values: a key that names a secret isn't read at all, and every value is redacted
+  on('tool.call', { tool: 'mcp__laravel-boost__get-config' }, async ($, e, next) => {
+    const key = String((e as unknown as { key?: string }).key ?? '')
+    if (SECRET_CONFIG.test(key)) return { deny: `lara-cc refused ${key}: it can hold a secret (password, key, token). Ask the user if you need it.` }
+    return redactedResult(await next(e))
+  }).catch(() => ({ deny: 'lara-cc could not check this call, so it was not sent.' }))
+
+  // Whatever else Boost prints (tinker, queries, schema, app info) reaches Claude redacted, like artisan output
+  on('tool.call', { tool: BOOST_OTHER_TOOLS }, async ($, e, next) => redactedResult(await next(e))).catch(() => ({
+    deny: 'lara-cc could not redact this result, so it was not sent.',
+  }))
+
+  // ── When Claude edits PHP: restart the queue worker, and remember the file for Pint ──
+
+  // As with Bash: the edit has already been made, so nothing here may make it run again
+  on('tool.call', { tool: ['Edit', 'Write'] }, async ($, e, next) => {
+    const result = await next(e)
+    try {
+      const path = String((e as unknown as { file_path?: string }).file_path ?? '')
+      if (!path.endsWith('.php') || ('isError' in result && result.isError)) return result
+      editedPhp.add(path)
+      if (settings.autoRestartQueue && services.queue.run) {
+        restartTimer?.cancel()
+        restartTimer = $.clock.after(2000, async () => {
+          await restartService($, 'queue')
+          $.ui.toast(`${services.queue.label} restarted after PHP edits`)
+        })
+      }
+    } catch (err) {
+      $.ui.log('lara-cc: after an edit: ' + String(err))
+    }
+    return result
+  })
 
   on('turn.complete', async ($, e, next) => {
     // Claude may have cached config, installed packages or stopped Vite
@@ -1294,28 +1579,48 @@ export const register: Register = on => {
     const running = Object.values(services).filter(s => s.run)
     const failedStored = snapshot?.failedTotal ?? 0
     const crashed = Object.values(services).filter(s => s.crashed && !s.crashed.seen)
-    if (!running.length && !crashed.length && !unseenErrors && !failedStored && !pendingMigrations && !checks.length) return next(e)
+    const failingTests = lastTest?.failed ?? 0
+    if (!running.length && !crashed.length && !unseenErrors && !failedStored && !pendingMigrations && !failingTests && !checks.length) return next(e)
 
     const { Box, Text, Button } = $.ui.resolve(e)
     const theirs = await next(e)
-    const items: { text: string; color?: string }[] = []
+    type Item = { text: string; color?: string; fix?: Fix }
+    const items: Item[] = []
     for (const s of running) {
       const extra = s.name === 'queue' && (stats.done || stats.failed) ? ` ${stats.done}✓${stats.failed ? ` ${stats.failed}✗` : ''}` : ''
-      items.push({ text: '● ', color: 'green' }, { text: s.name + extra + '  ' })
+      items.push({ text: '●', color: 'green' }, { text: s.name + extra })
     }
-    for (const s of crashed) items.push({ text: `✗ ${s.name} exited (${s.crashed!.code})  `, color: 'red' })
-    if (unseenErrors) items.push({ text: `▲ ${plural(unseenErrors, 'new error')}  `, color: 'red' })
-    if (failedStored) items.push({ text: `${plural(failedStored, 'failed job')}  `, color: 'yellow' })
-    if (pendingMigrations) items.push({ text: `${plural(pendingMigrations, 'pending migration')}  `, color: 'yellow' })
-    const warnings = checks.map(c => ({ text: `⚠ ${c.band}  `, color: c.color }))
-    // Too wide for one row: fold the warnings into a count, which the Services tab lists in full
-    const width = [...items, ...warnings].reduce((n, i) => n + i.text.length, 'lara-cc  open'.length)
-    if (width <= e.props.bodyColumns) items.push(...warnings)
-    else if (checks.length) items.push({ text: `⚠ ${plural(checks.length, 'warning')}  `, color: checks.some(c => c.color === 'red') ? 'red' : 'yellow' })
-    const parts = items.map(i => <Text color={i.color}>{i.text}</Text>)
+    if (lastTest && !failingTests) items.push({ text: `✓ ${plural(lastTest.passed, 'test')}`, color: 'green' })
+    for (const s of crashed) {
+      items.push({ text: `✗ ${s.name} exited (${s.crashed!.code})`, color: 'red', fix: { label: `restart ${s.name}`, run: () => restartService($, s.name) } })
+    }
+    if (failingTests) items.push({ text: `✗ ${plural(failingTests, 'test')} failing`, color: 'red' })
+    if (unseenErrors) items.push({ text: `▲ ${plural(unseenErrors, 'new error')}`, color: 'red' })
+    if (failedStored) items.push({ text: plural(failedStored, 'failed job'), color: 'yellow' })
+    if (pendingMigrations) items.push({ text: plural(pendingMigrations, 'pending migration'), color: 'yellow', fix: { label: 'migrate', run: migrateFix($) } })
+    const warnings: Item[] = checks.map(c => ({ text: `⚠ ${c.band}`, color: c.color, fix: c.fix }))
+
+    // Too wide for one row: drop the fix buttons, then fold the warnings into a count (the Services tab has both)
+    const widthOf = (list: Item[], withFixes: boolean) =>
+      list.reduce((n, i) => n + i.text.length + 2 + (withFixes && i.fix ? i.fix.label.length + 3 : 0), 'lara-cc  open'.length)
+    let shown = [...items, ...warnings]
+    let withFixes = widthOf(shown, true) <= e.props.bodyColumns
+    if (!withFixes && widthOf(shown, false) > e.props.bodyColumns) {
+      shown = [...items]
+      if (checks.length) shown.push({ text: `⚠ ${plural(checks.length, 'warning')}`, color: checks.some(c => c.color === 'red') ? 'red' : 'yellow' })
+      withFixes = widthOf(shown, true) <= e.props.bodyColumns
+    }
+    const parts = shown.flatMap(i => {
+      const fix = withFixes ? i.fix : undefined
+      const text = <Text color={i.color}>{i.text + (fix ? ' ' : i.text === '●' ? ' ' : '  ')}</Text>
+      if (!fix) return [text]
+      // A fix runs only on the person's press
+      const busy = fixing.has(fix.label)
+      return [text, <Button key={'fix-' + fix.label} label={busy ? 'running…' : fix.label} dimColor={busy} onPress={() => void runFix($, fix)} />, <Text>{'  '}</Text>]
+    })
 
     // The Services tab explains crashes and checks
-    const target: Tab = crashed.length ? 'services' : unseenErrors ? 'log' : failedStored ? 'queue' : 'services'
+    const target: Tab = crashed.length ? 'services' : failingTests ? 'tests' : unseenErrors ? 'log' : failedStored ? 'queue' : 'services'
     const band = (
       <Box flexDirection="row">
         <Text dimColor>{'lara-cc  '}</Text>
@@ -1360,6 +1665,7 @@ export const register: Register = on => {
         {tabButton('services', 'Services', 's')}
         {tabButton('queue', 'Queue' + failedBadge, 'q')}
         {tabButton('log', 'Log' + errorBadge, 'l')}
+        {tabButton('tests', 'Tests' + (lastTest?.failed ? ` (${lastTest.failed})` : ''), 't')}
         {tabButton('routes', 'Routes', 'r')}
         {tabButton('commands', 'Commands', 'c')}
         {tabButton('about', 'About', 'a')}
@@ -1400,8 +1706,31 @@ export const register: Register = on => {
               )}
             </Box>
           )}
+          {herdList.length > 0 && (
+            <Box flexDirection="row" columnGap={2} flexWrap="wrap">
+              <Button
+                key="herd-debug"
+                label={{ off: 'start Herd debug session', starting: 'starting…', on: '● stop debug session', stopping: 'stopping…' }[debugState]}
+                dimColor={debugState === 'starting' || debugState === 'stopping'}
+                onPress={() => void toggleDebugSession($)}
+              />
+              {debugState === 'on' && <Text color="yellow">recording queries, logs, dumps and HTTP calls</Text>}
+              {debugState === 'off' && debugCapture && <Text dimColor>{`last session: ${debugCapture.summary} (${ago(debugCapture.at)} ago)`}</Text>}
+              {debugState === 'off' && debugCapture && <Button key="debug-ask" label="ask Claude" plain onPress={() => void askAboutDebugCapture($)} />}
+            </Box>
+          )}
           {checks.map(c => (
-            <Text color={c.color}>{`⚠ ${c.detail}`}</Text>
+            <Box flexDirection="row" columnGap={1}>
+              <Text color={c.color}>{`⚠ ${c.detail}`}</Text>
+              {c.fix && (
+                <Button
+                  key={'check-fix-' + c.fix.label}
+                  label={fixing.has(c.fix.label) ? 'running…' : c.fix.label}
+                  dimColor={fixing.has(c.fix.label)}
+                  onPress={() => void runFix($, c.fix!)}
+                />
+              )}
+            </Box>
           ))}
           {Object.values(services).map(svc => (
             <Box flexDirection="row" columnGap={1}>
@@ -1446,7 +1775,7 @@ export const register: Register = on => {
           </Box>
           <Text> </Text>
           <Text bold>{shown?.label ?? ''} output</Text>
-          {(shown?.lines.length ? shown.lines.slice(-Math.max(3, rows - Object.keys(services).length - 4 - (phpInfo ? 1 : 0) - herdRows - checks.length * 2)) : ['(no output yet)']).map(l => line(l, true))}
+          {(shown?.lines.length ? shown.lines.slice(-Math.max(3, rows - Object.keys(services).length - 4 - (phpInfo ? 1 : 0) - herdRows - (herdList.length ? 1 : 0) - checks.length * 2)) : ['(no output yet)']).map(l => line(l, true))}
         </Box>
       )
     } else if (tab === 'queue') {
@@ -1566,6 +1895,48 @@ export const register: Register = on => {
           )}
         </Box>
       )
+    } else if (tab === 'tests') {
+      const t = lastTest
+      // One command at a time: a run would replace what the Commands tab shows of another
+      const busy = !!lastRun?.isRunning
+      const perFailure = 3
+      const room = Math.max(1, Math.floor((rows - 5) / perFailure))
+      body = (
+        <Box flexDirection="column">
+          <Box flexDirection="row" columnGap={2} flexWrap="wrap">
+            <Button
+              key="tests-run"
+              label={testsRunning ? 'running…' : busy ? 'run tests (waiting for ' + lastRun!.label + ')' : 'run tests'}
+              dimColor={busy}
+              onPress={() => {
+                if (!busy) void runCommand($, 'test', ['php', 'artisan', 'test'])
+              }}
+            />
+            {t && t.failures.length > 1 && <Button key="tests-ask-all" label="ask Claude to fix all" plain onPress={() => askAboutTests($, t.failures)} />}
+          </Box>
+          {!t && <Text dimColor>No test run yet this session. Run them here, with /lara-test, or let Claude run them: the result shows here and in the band.</Text>}
+          {t && (
+            <Text bold color={t.failed ? 'red' : 'green'}>
+              {(t.failed ? `✗ ${t.failed} failed, ` : '✓ ') + `${t.passed} passed` + (t.skipped ? `, ${t.skipped} skipped` : '')}
+            </Text>
+          )}
+          {t && <Text dimColor>{`${t.label} · ${ago(t.at)} ago`}</Text>}
+          {t && t.failed > 0 && !t.failures.length && <Text dimColor>The output didn't include the failures. Run the tests here to see them.</Text>}
+          {t?.failures.slice(0, room).map((f, i) => (
+            <Box flexDirection="column">
+              <Box flexDirection="row" columnGap={1}>
+                <Text color="red">{'✗ ' + f.name}</Text>
+                <Button key={'ask-test-' + i} label="ask Claude" plain onPress={() => askAboutTest($, f)} />
+              </Box>
+              {f.detail
+                .filter(l => l.trim())
+                .slice(0, perFailure - 1)
+                .map(l => line('    ' + l, true))}
+            </Box>
+          ))}
+          {t && t.failures.length > room && line(`…and ${t.failures.length - room} more`, true)}
+        </Box>
+      )
     } else if (tab === 'routes') {
       const shown = routes ? filterRoutes(routes, routeFilter) : []
       body = (
@@ -1596,6 +1967,12 @@ export const register: Register = on => {
       body = (
         <Box flexDirection="column">
           {pendingMigrations > 0 && line(`${plural(pendingMigrations, 'pending migration')}: run /lara-artisan migrate`, false, 'yellow')}
+          {hasBoost && (
+            <Text dimColor>
+              Laravel Boost is installed. Its log tools ask before sending and are redacted, like lara-cc's logs tool; get-config refuses keys that can hold secrets; every other
+              Boost tool's output (tinker, database-query…) is redacted.
+            </Text>
+          )}
           {!about && <Text dimColor>Loading `php artisan about`…</Text>}
           {about &&
             Object.entries(about).map(([section, values]) => (
