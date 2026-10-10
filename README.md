@@ -36,9 +36,10 @@ It also flags the things that make a change "not work" without an error, and the
 - **`public/hot` with no Vite behind it**: pages load without CSS and JS. Vite running in another terminal counts; only dev servers on this machine (`localhost`, `*.test`) are ever checked.
 - **Cached config, routes or events**: edits to them don't take effect until the cache is cleared.
 - **Maintenance mode**, and **APP_ENV=production** on your machine (read from `artisan about`, not from `.env`).
+- **A stopped Herd service the app connects to**, e.g. `Herd MySQL stopped` while the database connection points at its port (also Redis, PostgreSQL, MariaDB, MongoDB, Reverb, Meilisearch, Typesense). The Services tab lists every Herd service and whether it's running. The mod reads Herd's `services.plist` (type, port and version, no credentials) and asks the app's config for the driver and port of each server on this machine it uses (database, cache, queue, session, broadcasting, Scout). Only those two values come back: passwords, usernames, URLs and remote hosts stay inside PHP and never reach the mod or Claude. A server on a port no Herd service has (Docker, DBngin) is left alone, and Herd is never asked for its site list.
 - **`composer install needed`** when `vendor/` differs from `composer.lock`, and **`npm install needed`** when `node_modules` differs from `package-lock.json` (for pnpm, Yarn and Bun, when `node_modules` is missing), e.g. after a `git pull`.
 
-The checks run at start-up, after each of Claude's turns, after commands and every minute. They read lockfiles and Laravel's marker files, never `.env`.
+The checks run at start-up, after each of Claude's turns, after commands and every minute. They read lockfiles, Laravel's marker files and Herd's service list, never `.env`.
 
 **Dev processes.** Queue worker (or Horizon), Vite and the scheduler, started and stopped from the **Services** tab or commands, with their output. Tick **autostart** to start them whenever you open Claude Code in this project.
 
@@ -67,11 +68,21 @@ Type `/lar` to see them all. Processes run for the life of the session and stop 
 
 ## What Claude gets
 
-- **`logs` tool**: recent log entries with where they happened and the stack, so Claude can check for errors after running code or tests.
-- **`queue` tool**: pending jobs, jobs run this session, failed jobs with their exceptions, and retrying them.
-- **`artisan` tool**: runs artisan commands. Refuses anything that can destroy data or run arbitrary code: `migrate:fresh/reset/refresh/rollback`, `db:wipe`, `db:seed`, `key:generate`, `down`, `queue:flush/clear/forget`, the `prune`/`clear` commands of the queue, models, Horizon, Telescope and Pulse, `tinker`, and the `--force`, `--env`, `--prune` and `--seed` options. Artisan resolves the command name first, so abbreviations like `migr:fr` are caught too. Run those yourself with `/lara-artisan`, which skips the check only when you type it (not when it's relayed from another session, a channel or a plugin).
+- **`logs` tool**: recent log entries with where they happened and the stack, so Claude can check for errors after running code or tests. Asks you first (see [Privacy](#privacy)).
+- **`queue` tool**: pending jobs, jobs run this session, failed jobs with their exceptions (asks you first), and retrying them.
+- **`artisan` tool**: runs artisan commands. Refuses anything that can destroy data or run arbitrary code: `migrate:fresh/reset/refresh/rollback`, `db:wipe`, `db:seed`, `key:generate`, `down`, `queue:flush/clear/forget`, the `prune`/`clear` commands of the queue, models, Horizon, Telescope and Pulse, `tinker`, and the `--force`, `--env`, `--prune` and `--seed` options. It also refuses `config:show`, `env:encrypt` and `env:decrypt`, which print secrets; `/lara-artisan` refuses those too, since its output goes into the conversation, so run them in your own terminal. Artisan resolves the command name first, so abbreviations like `migr:fr` are caught too. Run those yourself with `/lara-artisan`, which skips the check only when you type it (not when it's relayed from another session, a channel or a plugin).
 - **`service` tool**: start, stop, restart or read the output of the queue worker, Vite and the scheduler.
 - **`routes` tool**: filtered route list.
+
+## Privacy
+
+Laravel logs and failed-job exceptions can contain confidential data: email addresses, SQL values, tokens, request data. The mod reads them to show you the Log and Queue tabs, toasts and the band, and none of that goes to Claude.
+
+They reach Claude only through the `logs` and `queue` tools, `/lara-logs`, `/lara-queue failed`, and the **ask Claude** buttons. Each time, the mod first asks you in a dialog that explains this: **Send redacted**, **Allow this session**, or **Don't send**. If you dismiss the dialog, or nobody is there to answer (`claude -p`), nothing is sent.
+
+Before anything is sent, and in every command output that goes into the conversation (artisan, tests, npm, Composer, process output), the mod hides what looks confidential: passwords, tokens and keys by name, credentials in URLs, bearer tokens, email addresses, SQL values (the statement is kept up to `where`/`values`/`set`), stack frame arguments, and long random strings. This is best effort: it can't recognise every secret, which is why it still asks.
+
+The mod never reads `.env`. Outside the mod, Claude Code's own Read and Bash tools can still open `storage/logs` or run `php artisan config:show` if you allow them; add deny rules in your Claude Code permissions to block that.
 
 ## Settings
 

@@ -280,3 +280,161 @@ export function localHotUrl(text: string): string | undefined {
   const local = ['localhost', '127.0.0.1', '::1', '0.0.0.0'].includes(host) || host.endsWith('.test') || host.endsWith('.localhost')
   return local ? url.origin : undefined
 }
+
+export type HerdService = { type: string; name: string; port: number; version: string }
+
+/**
+ * Herd's installed services (MySQL, Redis…) from its services.plist, converted to JSON: type, name, port
+ * and version only. An entry without a plain type or a valid port is left out; unreadable JSON is none.
+ */
+export function herdServices(json: string): HerdService[] {
+  let list: unknown
+  try {
+    list = JSON.parse(json)
+  } catch {
+    return []
+  }
+  if (!Array.isArray(list)) return []
+  return list.flatMap((s: Record<string, unknown>) => {
+    const port = Number(s?.port)
+    if (typeof s?.type !== 'string' || !/^[a-z0-9]+$/.test(s.type) || !Number.isInteger(port) || port < 1 || port > 65535) return []
+    return [{ type: s.type, name: typeof s.name === 'string' ? s.name : s.type, port, version: typeof s.version === 'string' ? s.version : '' }]
+  })
+}
+
+/**
+ * PHP run with `php -r` from the project root: the driver and port of each server on this machine that the
+ * app's default database, cache, queue, session, broadcasting and Scout config connect to. Loads config without
+ * booting providers, so a server that's down can't stop it. Only those two values leave PHP: no credentials,
+ * usernames, URLs or remote hostnames ever reach the mod or Claude.
+ */
+export function connectionsPhp(): string {
+  return `
+require 'vendor/autoload.php';
+$app = require 'bootstrap/app.php';
+$app->bootstrapWith([Illuminate\\Foundation\\Bootstrap\\LoadEnvironmentVariables::class, Illuminate\\Foundation\\Bootstrap\\LoadConfiguration::class]);
+$out = [];
+$add = function ($use, $driver, $c, $port) use (&$out) {
+  if (!is_array($c) || !is_string($driver)) return;
+  $host = $c['host'] ?? '127.0.0.1';
+  if (is_array($host)) $host = reset($host);
+  $port = $c['port'] ?? $port;
+  // A URL (DB_URL, REDIS_URL, Meilisearch's host) wins; only its host and port are kept
+  $url = !empty($c['url']) && is_string($c['url']) ? $c['url'] : (is_string($host) && str_contains($host, '://') ? $host : null);
+  if ($url) { $u = parse_url($url) ?: []; $host = $u['host'] ?? ''; $port = $u['port'] ?? $port; }
+  $host = trim((string) $host, '[]');
+  if (!in_array($host, ['127.0.0.1', 'localhost', '::1'], true) || !is_numeric($port)) return;
+  $out[] = ['use' => $use, 'driver' => $driver, 'port' => (int) $port];
+};
+$redis = fn ($use, $name) => $add($use, 'redis', config('database.redis.' . ($name ?: 'default')), 6379);
+$db = config('database.connections.' . config('database.default'));
+$add('database', $db['driver'] ?? null, $db, ['mysql' => 3306, 'mariadb' => 3306, 'pgsql' => 5432, 'mongodb' => 27017][$db['driver'] ?? ''] ?? null);
+$cache = config('cache.stores.' . config('cache.default'));
+if (($cache['driver'] ?? '') === 'redis') $redis('cache', $cache['connection'] ?? null);
+$queue = config('queue.connections.' . config('queue.default'));
+if (($queue['driver'] ?? '') === 'redis') $redis('queue', $queue['connection'] ?? null);
+if (config('session.driver') === 'redis') $redis('session', config('session.connection'));
+$cast = config('broadcasting.connections.' . config('broadcasting.default'));
+if (($cast['driver'] ?? '') === 'reverb') $add('broadcasting', 'reverb', $cast['options'] ?? null, 8080);
+if (config('scout.driver') === 'meilisearch') $add('scout', 'meilisearch', config('scout.meilisearch'), 7700);
+if (config('scout.driver') === 'typesense') $add('scout', 'typesense', config('scout.typesense.client-settings.nodes.0'), 8108);
+echo json_encode(['connections' => $out]);
+`
+}
+
+export type AppConnection = { use: string; driver: string; port: number }
+
+/** Read connectionsPhp's JSON, skipping any PHP warnings printed before it; undefined when there's none. */
+export function parseConnections(stdout: string): AppConnection[] | undefined {
+  const start = stdout.indexOf('{"connections"')
+  if (start < 0) return undefined
+  let list: unknown
+  try {
+    list = (JSON.parse(stdout.slice(start)) as { connections?: unknown }).connections
+  } catch {
+    return undefined
+  }
+  if (!Array.isArray(list)) return undefined
+  return list.flatMap((c: Record<string, unknown>) =>
+    typeof c?.use === 'string' && typeof c.driver === 'string' && Number.isInteger(c.port) ? [{ use: c.use, driver: c.driver, port: c.port as number }] : [],
+  )
+}
+
+/** The Herd service types that can serve each driver. */
+const DRIVER_SERVICES: Record<string, string[]> = {
+  mysql: ['mysql', 'mariadb'],
+  mariadb: ['mariadb', 'mysql'],
+  pgsql: ['postgresql'],
+  mongodb: ['mongodb'],
+  redis: ['redis'],
+  reverb: ['reverb'],
+  meilisearch: ['meilisearch'],
+  typesense: ['typesense'],
+}
+
+/**
+ * The Herd services the app connects to: one of the right type on the port the app's config names, with what
+ * uses it, e.g. `{ service: Redis…, driver: 'redis', uses: ['cache', 'queue'] }`. A server on a port no Herd
+ * service of that type has is someone else's (Docker, DBngin) and is left out.
+ */
+export function herdNeeds<T extends HerdService>(connections: AppConnection[], installed: T[]): { service: T; driver: string; uses: string[] }[] {
+  const out = new Map<T, { service: T; driver: string; uses: string[] }>()
+  for (const c of connections) {
+    const service = installed.find(s => s.port === c.port && DRIVER_SERVICES[c.driver]?.includes(s.type))
+    if (!service) continue
+    const entry = out.get(service) ?? { service, driver: c.driver, uses: [] }
+    if (!entry.uses.includes(c.use)) entry.uses.push(c.use)
+    out.set(service, entry)
+  }
+  return [...out.values()]
+}
+
+// ─── Redaction: what goes to Claude ────────────────────────────────────────
+
+/** Key names whose value is a secret: `password=…`, `"api_key": "…"`, `'token' => '…'`. */
+const SECRET_KEY = String.raw`[\w.-]*(?:passw(?:or)?d|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|authorization|credentials?|cookie|signature|dsn)[\w.-]*`
+const KEY_VALUE = new RegExp(String.raw`(["']?)(${SECRET_KEY})\1(\s*(?:=>|[:=])\s*)(?:"[^"]*"|'[^']*'|[^\s,;&)}\]]+)`, 'gi')
+
+/** A stack frame's arguments, `Foo->bar('secret', Array)`, cut to `Foo->bar(...)`. */
+function frameWithoutArgs(line: string): string {
+  return line.replace(/^(\s*#\d+ .*?: [^(]*)\((.+)\)\s*$/, '$1(...)')
+}
+
+/**
+ * Values in an SQL error. Laravel puts the bindings into the SQL unquoted, so they can't be told apart: the
+ * statement is kept up to `where`, `values`, `set` or `having` (table and columns) and the rest cut. In the
+ * driver's own message, quoted strings that aren't identifiers and Postgres' `Key (email)=(…)` are hidden.
+ */
+function sqlWithoutValues(line: string): string {
+  if (!/SQLSTATE|SQL: /.test(line)) return line
+  const at = line.indexOf('SQL: ')
+  const message = (at < 0 ? line : line.slice(0, at))
+    .replace(/'((?:[^'\\]|\\.)*)'/g, (all, inner: string) => (/^[a-z_][a-z0-9_]*(\.[a-z0-9_]+)*$/.test(inner) ? all : "'?'"))
+    .replace(/\)=\([^)]*\)/g, ')=(?)')
+  if (at < 0) return message
+  const sql = line.slice(at)
+  const cut = sql.search(/\s(where|values|set|having)\s/i)
+  return message + (cut < 0 ? sql : sql.slice(0, cut) + sql.slice(cut).replace(/^(\s\w+)[\s\S]*$/, '$1 …)'))
+}
+
+/**
+ * Hide what looks confidential in log entries, exceptions and command output before they go to Claude:
+ * passwords, tokens and keys by name, credentials in URLs, bearer tokens, email addresses, SQL values,
+ * stack frame arguments, and long random strings. Best effort: it can't know every secret, so callers
+ * still ask before sending log and exception text.
+ */
+export function redact(text: string): string {
+  return text
+    .split('\n')
+    .map(line => {
+      const out = /^\s*#\d+ /.test(line) ? frameWithoutArgs(line) : line
+      return sqlWithoutValues(out)
+    })
+    .join('\n')
+    .replace(/\b([a-z][\w+.-]*:\/\/)[^\s\/@:]*:[^\s\/@]*@/gi, '$1[redacted]@')
+    .replace(/\b(Bearer|Basic|Token)\s+[\w~+\/.=-]{8,}/g, '$1 [redacted]')
+    .replace(KEY_VALUE, '$1$2$1$3[redacted]')
+    .replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, '[email]')
+    .replace(/(?<![\w\/\\.-])(?=[\w+=-]*[A-Z])(?=[\w+=-]*[a-z])(?=[\w+=-]*\d)[\w+=-]{32,}/g, '[redacted]')
+    .replace(/\b[a-f0-9]{40,}\b/g, '[redacted]')
+}

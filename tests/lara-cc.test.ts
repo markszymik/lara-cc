@@ -10,7 +10,10 @@ import { LOG } from './fixtures'
  *
  * `herd`: the binary `herd php` reports; `shellPhp`: what plain `php` reports; `composerShim`: Composer on PATH is
  * a shell script; `files`: extra files in the project and their contents; `env`: the environment `artisan about`
- * reports; `exits`: exit code of spawned processes by command (`pnpm`); `curl`: curl's exit code.
+ * reports; `exits`: exit code of spawned processes by command (`pnpm`); `curl`: curl's exit code; `connections`: the
+ * local servers the app's config names (connectionsPhp); `herdServices`: Herd's services.plist as plutil turns it into JSON; `closed`: ports
+ * nothing listens on; `share`: the answer to the "send to Claude?" question (default Send redacted), whose
+ * questions land in `asked`.
  */
 type Fake = {
   history?: string
@@ -25,11 +28,17 @@ type Fake = {
   exits?: Record<string, number>
   curl?: number
   reads?: string[]
+  connections?: { use: string; driver: string; port: number }[]
+  herdServices?: unknown[]
+  closed?: number[]
+  share?: string
+  asked?: string[]
 }
 
 const COMPOSER = '/opt/bin/composer'
 const HERD_BIN = '/Users/me/Library/Application Support/Herd/bin'
 const HERD_CLI = HERD_BIN + '/herd'
+const HERD_PLIST = '/Users/me/Library/Application Support/Herd/config/services.plist'
 
 /** What the fake `php artisan help <name>` resolves each (lower-cased) name to. */
 const HELP: Record<string, string> = {
@@ -51,6 +60,8 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
     return key === undefined ? undefined : fake.files![key]
   }
   mock.store(on)
+  mock.env(on, { HOME: '/Users/me' })
+  if (fake.herdServices) fake.files = { ...fake.files, [HERD_PLIST]: '<?xml version="1.0"?><plist/>' }
   const clock = mock.clock(on)
   on('fs.exists', ($, e) => ({
     value:
@@ -70,6 +81,11 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
   on('command.register', () => ({ value: {} }))
   on('tool.register', () => ({ value: {} }))
   on('ui.toast', () => ({ value: undefined }))
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+    const question = String((e as unknown as { questions: { question: string }[] }).questions[0]?.question)
+    fake.asked?.push(question)
+    return { result: { answers: { [question]: fake.share ?? 'Send redacted' } } } as never
+  })
   on('session.cwd', () => ({ value: '/app' }))
   on('fs.list', () => ({ value: [] }))
   // Nothing else draws in the band
@@ -84,16 +100,19 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
     const argv = [...e.argv]
     ran.push(argv)
     const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    const missing = { value: { exitCode: 1, stdout: '', stderr: 'not found', isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv[0] === 'tail') return ok(fake.history ?? '')
     if (argv[0] === 'curl') return { value: { exitCode: fake.curl ?? 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv.join(' ') === 'php artisan about --json') return ok(JSON.stringify({ environment: { environment: fake.env ?? 'local' } }))
+    if (argv[0] === 'plutil') return argv.at(-1) === HERD_PLIST && fake.herdServices ? ok(JSON.stringify(fake.herdServices)) : missing
+    if (argv[0] === 'nc') return { value: { exitCode: fake.closed?.includes(Number(argv.at(-1))) ? 1 : 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     // Herd: which binary serves this folder, and Composer's path; without Herd there's no `herd` on PATH
-    const missing = { value: { exitCode: 1, stdout: '', stderr: 'not found', isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv[0] === 'herd') return fake.herd ? ok(`${fake.herd}\n8.3.21`) : missing
     if (argv.join(' ') === 'which herd') return fake.herd ? ok(HERD_CLI) : missing
     if (argv.join(' ') === 'which composer') return ok(COMPOSER)
     if (argv[0] === 'php' && argv[2]?.includes('PHP_BINARY')) return ok(`${fake.shellPhp ?? '/usr/bin/php'}\n8.4.1`)
     if (argv[1] === COMPOSER && argv[2] === '--version') return ok(fake.composerShim ? '#!/usr/bin/env bash\nexec mise x -- composer "$@"' : 'Composer version 2.10.2')
+    if (argv[0] === 'php' && argv[1] === '-r' && argv[2]?.includes("'connections'")) return ok('Deprecated: x\n' + JSON.stringify({ connections: fake.connections ?? [] }))
     if (argv[0] === 'php' && argv[1] === '-r') return ok(fake.snapshot ? JSON.stringify(fake.snapshot) : 'no snapshot')
     // `artisan help <name>` resolves abbreviations and case the way Symfony does
     if (argv[2] === 'help') {
@@ -439,4 +458,85 @@ test('a crashed process shows in the band until the Services tab is opened', asy
   expect(await drawBand($)).toContain('✗ vite exited (1)')
   await $.command.run({ command: 'lara', args: 'services' })
   expect(await drawBand($)).not.toContain('exited')
+})
+
+const MYSQL = { type: 'mysql', name: 'MySQL', port: '3306', version: '8.4.11', autoStart: true }
+const MYSQL_80 = { type: 'mysql', name: 'MySQL 8.0', port: '3307', version: '8.0.40', autoStart: true }
+const REDIS = { type: 'redis', name: 'Redis', port: '6379', version: '7.0.0', autoStart: true }
+
+test('the band flags a stopped Herd service the app connects to, reading only services.plist', async ($, on) => {
+  const ran: string[][] = []
+  const reads: string[] = []
+  const connections = [
+    { use: 'database', driver: 'mysql', port: 3307 },
+    { use: 'cache', driver: 'redis', port: 6379 },
+    { use: 'queue', driver: 'redis', port: 6379 },
+  ]
+  // MySQL 8.4 on 3306 is up, but the app uses 8.0 on 3307
+  const clock = fakeProject(on, ran, { connections, herdServices: [MYSQL, MYSQL_80, REDIS], closed: [3307], reads })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  const drawn = await drawBand($)
+  expect(drawn).toContain('Herd MySQL 8.0 stopped')
+  expect(drawn).not.toContain('Redis stopped')
+  expect(ran).toContainEqual(['nc', '-z', '-w', '1', 'localhost', '3307'])
+  // No AppleScript, no herd CLI beyond `herd php`, no .env
+  expect(ran.some(argv => argv[0] === 'osascript' || (argv[0] === 'herd' && argv[1] !== 'php'))).toBe(false)
+  expect(reads.some(path => path.includes('.env'))).toBe(false)
+})
+
+test('a stopped Herd service the app does not connect to is not flagged', async ($, on) => {
+  const ran: string[][] = []
+  // The database is on a port no Herd service has (Docker, DBngin), and nothing uses Redis
+  const connections = [{ use: 'database', driver: 'mysql', port: 33060 }]
+  const clock = fakeProject(on, ran, { connections, herdServices: [MYSQL, REDIS], closed: [3306, 6379] })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  expect(await drawBand($)).not.toContain('stopped')
+})
+
+test('log entries go to Claude only after asking, redacted, and not at all on no', async ($, on) => {
+  const ran: string[][] = []
+  const asked: string[] = []
+  const history = '[2026-10-10 10:00:00] local.ERROR: Login failed for jane@example.com password=hunter2 {"exception":"x"}\n'
+  const clock = fakeProject(on, ran, { history, asked, share: "Don't send" })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  const declined = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__logs' }))
+  expect(asked[0]).toContain('confidential')
+  expect(declined).toContain('chose not to send')
+  expect(declined).not.toContain('Login failed')
+})
+
+test('allowing for the session stops the asking, and what is sent is redacted', async ($, on) => {
+  const ran: string[][] = []
+  const asked: string[] = []
+  const history = '[2026-10-10 10:00:00] local.ERROR: Login failed for jane@example.com password=hunter2 {"exception":"x"}\n'
+  const clock = fakeProject(on, ran, { history, asked, share: 'Allow this session' })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  const first = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__logs' }))
+  await $.tool.call({ tool: 'mcp__lara-cc__logs' })
+  expect(asked.length).toBe(1)
+  expect(first).toContain('Login failed for [email] password=[redacted]')
+  expect(first).not.toContain('hunter2')
+})
+
+test('the artisan tool refuses commands that print secrets', async ($, on) => {
+  const ran: string[][] = []
+  HELP['config:show'] = 'config:show'
+  const clock = fakeProject(on, ran)
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  const out = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'config:show database' }))
+  expect(out).toContain('Refused')
+  // Typed by the person too: the output would land where Claude reads it
+  const typed = JSON.stringify(await $.command.run({ command: 'lara-artisan', args: 'config:show database', origin: { kind: 'composer' } } as never))
+  expect(typed).toContain('own terminal')
+  expect(ran.some(argv => argv.includes('config:show') && !argv.includes('help'))).toBe(false)
 })

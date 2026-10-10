@@ -4,21 +4,26 @@ import {
   artisanCommandName,
   clock,
   composerDrift,
+  connectionsPhp,
   durationMs,
   exceptionHeadline,
   feedLog,
   formatEntry,
   headline,
   helpName,
+  herdNeeds,
+  herdServices,
   isError,
   isWarning,
   localHotUrl,
   newLogState,
   npmDrift,
   origin,
+  parseConnections,
   parseSnapshot,
   parseWorkerLine,
   queuesOf,
+  redact,
   refusedOptions,
   shortClass,
   snapshotPhp,
@@ -26,7 +31,7 @@ import {
   stripAnsi,
   tail,
 } from './parse'
-import type { FailedJob, LogEntry, QueueSnapshot } from './parse'
+import type { AppConnection, FailedJob, HerdService, LogEntry, QueueSnapshot } from './parse'
 
 /**
  * lara-cc: an unofficial Claude Code mod for Laravel apps. Not affiliated with or endorsed by Laravel LLC or Anthropic.
@@ -83,6 +88,9 @@ const DESTRUCTIVE = [
  */
 const DESTRUCTIVE_OPTIONS = ['--force', '-f', '--env', '--prune', '--seed', '--seeder']
 
+/** Artisan commands Claude's tool refuses because they print secrets: config values (passwords, APP_KEY) or the .env encryption key. */
+const CONFIDENTIAL = ['config:show', 'env:encrypt', 'env:decrypt']
+
 const PANE = 'lara'
 const MAX_SERVICE_LINES = 400
 const TOAST_GAP_MS = 5000
@@ -133,6 +141,8 @@ let about: Record<string, Record<string, unknown>> | undefined
 let routes: Route[] | undefined
 let routeFilter = ''
 let pendingMigrations = 0
+// The person let log entries and failed-job exceptions go to Claude for the rest of this session (see mayShare)
+let shareAllowed = false
 const editedPhp = new Set<string>()
 
 // Log monitoring
@@ -150,6 +160,12 @@ let checking = false
 let checkAgain = false
 let depsSeen = ''
 let depsChecks: Check[] = []
+// Herd's installed services and whether each listens; services.plist is re-read only when it changes
+let herdList: (HerdService & { up: boolean })[] = []
+let herdSeen = -2
+let herdInstalled: HerdService[] = []
+// The driver and port of each local server the app's config connects to (see connectionsPhp), read with `about`
+let connections: AppConnection[] = []
 
 // Queue monitoring
 let jobs: Job[] = []
@@ -307,9 +323,10 @@ async function runCommand($: Api, label: string, argv: string[], timeoutMs = 600
   return lastRun
 }
 
+/** A run's result for Claude (tool results and command output in the transcript), with secrets redacted. */
 function formatRun(run: LastRun): string {
   const head = run.exitCode === 0 ? `✓ ${run.label}` : `✗ ${run.label} (exit ${run.exitCode})`
-  return run.output ? `${head}\n${run.output}` : head
+  return redact(run.output ? `${head}\n${run.output}` : head)
 }
 
 /**
@@ -319,14 +336,10 @@ function formatRun(run: LastRun): string {
 async function checkArtisan($: Api, argv: string[]): Promise<{ refused?: string; error?: string }> {
   const options = refusedOptions(argv, DESTRUCTIVE_OPTIONS)
   if (options.length) return { refused: `${options.join(' ')} can destroy data or point at another environment` }
-  const name = artisanCommandName(argv)
-  if (name === undefined) return {}
-  const r = await runPhp($, ['php', 'artisan', 'help', name, '--format=json', '--no-interaction'], { timeoutMs: 60_000 })
-  const resolved = r.exitCode === 0 ? helpName(r.stdout) : undefined
-  if (!resolved) {
-    const output = stripAnsi([r.stdout, r.stderr].filter(Boolean).join('\n')).trim()
-    return { error: `✗ artisan could not resolve "${name}"\n${tail(output, 2000)}` }
-  }
+  const { resolved, error } = await resolveArtisan($, argv)
+  if (error) return { error }
+  if (!resolved) return {}
+  if (CONFIDENTIAL.includes(resolved)) return { refused: `${resolved} prints configuration secrets (passwords, keys)` }
   if (DESTRUCTIVE.includes(resolved)) {
     return { refused: resolved === 'tinker' ? 'tinker runs arbitrary PHP' : `${resolved} can destroy data` }
   }
@@ -334,6 +347,17 @@ async function checkArtisan($: Api, argv: string[]): Promise<{ refused?: string;
 }
 
 /** Typed by the person (at the terminal or through Remote Control), not relayed from another session, channel or plugin. */
+/** The full name artisan resolves the command in `argv` to (`migr:fr` is migrate:fresh); none for bare `artisan`. */
+async function resolveArtisan($: Api, argv: string[]): Promise<{ resolved?: string; error?: string }> {
+  const name = artisanCommandName(argv)
+  if (name === undefined) return {}
+  const r = await runPhp($, ['php', 'artisan', 'help', name, '--format=json', '--no-interaction'], { timeoutMs: 60_000 })
+  const resolved = r.exitCode === 0 ? helpName(r.stdout) : undefined
+  if (resolved) return { resolved }
+  const output = stripAnsi([r.stdout, r.stderr].filter(Boolean).join('\n')).trim()
+  return { error: `✗ artisan could not resolve "${name}"\n${tail(output, 2000)}` }
+}
+
 function fromUser(origin: { kind: string } | undefined): boolean {
   return origin?.kind === 'composer' || origin?.kind === 'bridge'
 }
@@ -435,7 +459,7 @@ async function serviceAction($: Api, name: string, action: string): Promise<stri
   if (action === 'start') return startService($, name)
   if (action === 'stop') return stopService($, name)
   if (action === 'restart') return restartService($, name)
-  if (action === 'logs') return `${svc.label}, last 60 lines:\n` + (svc.lines.slice(-60).join('\n') || '(no output)')
+  if (action === 'logs') return `${svc.label}, last 60 lines:\n` + (redact(svc.lines.slice(-60).join('\n')) || '(no output)')
   const state = svc.run ? `${svc.label} is running (${ago(svc.startedAt ?? Date.now())}).` : `${svc.label} is stopped.`
   return name === 'queue' ? state + '\n' + queueSummary() : state
 }
@@ -522,12 +546,13 @@ function formatFailed(list: FailedJob[], withTrace: number): string {
     .map((f, i) => {
       const rest = i < withTrace ? f.exception.split('\n').slice(1, 13).filter(l => l.trim()) : []
       const trace = rest.length ? '\n' + rest.map(l => '    ' + l).join('\n') : ''
-      return `- ${f.id}  ${f.job}  (queue ${f.queue}, failed ${f.failedAt})\n  ${exceptionHeadline(f.exception)}${trace}`
+      return `- ${f.id}  ${f.job}  (queue ${f.queue}, failed ${f.failedAt})\n` + redact(`  ${exceptionHeadline(f.exception)}${trace}`)
     })
     .join('\n')
 }
 
-function askAboutFailedJob($: Api, f: FailedJob) {
+async function askAboutFailedJob($: Api, f: FailedJob) {
+  if (!(await mayShare($, 'this failed job and its exception'))) return
   const text = [
     'This queued job failed in my Laravel app. Find the cause and fix it. When fixed, retry it with the queue tool.',
     '',
@@ -536,7 +561,7 @@ function askAboutFailedJob($: Api, f: FailedJob) {
     `Queue: ${f.queue}, failed at ${f.failedAt}`,
     '',
     '```',
-    f.exception.split('\n').slice(0, 40).join('\n'),
+    redact(f.exception.split('\n').slice(0, 40).join('\n')),
     '```',
   ].join('\n')
   $.prompt.submit({ text, asUser: true }).catch(err => $.ui.toast('Could not send to Claude: ' + String(err)))
@@ -634,15 +659,39 @@ function logsText(filter: 'all' | 'warnings' | 'errors', count: number): string 
   const list = filteredLog(filter).slice(-count)
   if (!list.length) return `No ${filter === 'all' ? 'entries' : filter} in ${logPath || 'storage/logs'}.`
   const noun = filter === 'all' ? (list.length === 1 ? 'entry' : 'entries') : plural(list.length, filter.replace(/s$/, '')).replace(/^\d+ /, '')
-  return `Latest ${list.length} ${noun} from ${logPath}:\n\n` + list.map(e => formatEntry(e, 15, projectDir)).join('\n\n')
+  return `Latest ${list.length} ${noun} from ${logPath}:\n\n` + list.map(e => redact(formatEntry(e, 15, projectDir))).join('\n\n')
 }
 
-function askAboutError($: Api, entry: LogEntry) {
+/** What Claude gets when the person says no: why there's no text, and what to do instead. */
+const NOT_SHARED = 'The user chose not to send this to Claude, since logs and exceptions can contain confidential data. Ask them to describe the error instead.'
+
+/**
+ * Ask before log entries or failed-job exceptions go to Claude: they can hold confidential data that redact()
+ * doesn't catch. "Allow this session" stops the asking until the session ends; dismissed or headless is no.
+ */
+async function mayShare($: Api, what: string): Promise<boolean> {
+  if (shareAllowed) return true
+  const question =
+    'Logs and exceptions can contain confidential data: emails, SQL values, tokens, request data. lara-cc hides passwords, keys, tokens, emails, SQL values and stack arguments first, but cannot catch everything. ' +
+    `Send ${what} to Claude?`
+  const answer = await $.ui.ask(question, { header: 'Privacy', options: ['Send redacted', 'Allow this session', "Don't send"] }).catch(() => "Don't send")
+  if (answer === 'Allow this session') shareAllowed = true
+  return answer === 'Send redacted' || answer === 'Allow this session'
+}
+
+/** `1 log entry`, `5 log entries`: the most recent `count` of `filter` that would be sent. */
+function entriesToSend(filter: 'all' | 'warnings' | 'errors', count: number): string {
+  const n = Math.min(count, filteredLog(filter).length)
+  return n === 1 ? '1 log entry' : `${n} log entries`
+}
+
+async function askAboutError($: Api, entry: LogEntry) {
+  if (!(await mayShare($, 'this log entry'))) return
   const text = [
     `This error appeared in my Laravel log (${logPath}). Find the cause and fix it.`,
     '',
     '```',
-    formatEntry(entry, 30, projectDir),
+    redact(formatEntry(entry, 30, projectDir)),
     '```',
   ].join('\n')
   $.prompt.submit({ text, asUser: true }).catch(err => $.ui.toast('Could not send to Claude: ' + String(err)))
@@ -683,6 +732,9 @@ function formatRoute(r: Route): string {
 }
 
 async function loadAbout($: Api) {
+  const read = runPhp($, ['php', '-r', connectionsPhp()], { timeoutMs: 30_000 })
+    .then(r => (connections = parseConnections(r.stdout) ?? connections))
+    .catch(() => undefined)
   try {
     const r = await runPhp($, ['php', 'artisan', 'about', '--json'], { timeoutMs: 60_000 })
     // PHP may print deprecation warnings before the JSON
@@ -690,6 +742,7 @@ async function loadAbout($: Api) {
   } catch {
     about = undefined
   }
+  await read
   redraw($)
 }
 
@@ -712,8 +765,8 @@ const CACHE_FILES = { config: 'bootstrap/cache/config.php', routes: 'bootstrap/c
 
 /**
  * Look for things that quietly break the app and show them in the band: a production environment, maintenance
- * mode, cached config/routes/events, a public/hot pointing at a dead Vite, and dependencies out of step with the
- * lockfiles. Reads lockfiles and Laravel's marker files, never .env. Cheap: lockfiles are re-read only when changed.
+ * mode, cached config/routes/events, a public/hot pointing at a dead Vite, a stopped Herd service the app uses,
+ * and dependencies out of step with the lockfiles. Reads lockfiles and Laravel's marker files, never .env. Cheap: lockfiles are re-read only when changed.
  */
 async function checkHealth($: Api) {
   if (!isLaravel) return
@@ -745,7 +798,8 @@ async function checkHealth($: Api) {
     if (hot) {
       next.push({ band: 'Vite not running (public/hot)', color: 'yellow', detail: "public/hot points pages at a Vite dev server that isn't running, so they load without CSS and JS. Start Vite (/lara-vite start) or delete public/hot." })
     }
-    next.push(...(await checkDeps($)))
+    const [herd, deps] = await Promise.all([checkHerd($), checkDeps($)])
+    next.push(...herd, ...deps)
     checks = next
   } catch (err) {
     $.ui.log('lara-cc: health check failed: ' + String(err))
@@ -767,6 +821,52 @@ async function viteIsGone($: Api): Promise<boolean> {
   // -q first so a ~/.curlrc can't change the request; -k because local dev certificates are often self-signed
   const r = await $.process.run(['curl', '-q', '-s', '-o', '/dev/null', '-m', '2', '-k', url + '/'], { timeoutMs: 5_000 }).catch(() => undefined)
   return r?.exitCode === 7
+}
+
+/**
+ * Herd services the app connects to that aren't running, e.g. MySQL stopped while the database is on its port.
+ * Reads Herd's services.plist (type, port, version: no credentials), never its site list, and only checks this
+ * machine at the ports it names. A server on a port no Herd service has (Docker, DBngin, remote) is left alone.
+ */
+async function checkHerd($: Api): Promise<Check[]> {
+  const installed = await herdInstalledServices($)
+  const up = await Promise.all(installed.map(s => listening($, s.port)))
+  herdList = installed.map((s, i) => ({ ...s, up: up[i]! }))
+  return herdNeeds(connections, herdList)
+    .filter(need => !need.service.up)
+    .map(({ service: s, driver, uses }) => ({
+      band: `Herd ${s.name} stopped`,
+      color: 'red' as const,
+      detail: `The app's ${uses.join(', ')} uses ${driver} on port ${s.port}, and Herd's ${s.name} ${s.version} there isn't running, so anything that needs it fails. Start it in Herd → Services.`,
+    }))
+}
+
+/** What Herd's services.plist lists; empty without Herd. A half-written plist keeps the last read and is read again next time. */
+async function herdInstalledServices($: Api): Promise<HerdService[]> {
+  const home = await $.env.get('HOME').catch(() => undefined)
+  if (!home) return []
+  const plist = `${home}/Library/Application Support/Herd/config/services.plist`
+  const time = await mtime($, plist)
+  if (time === herdSeen) return herdInstalled
+  if (time < 0) {
+    herdSeen = time
+    herdInstalled = []
+    return herdInstalled
+  }
+  const r = await $.process.run(['plutil', '-convert', 'json', '-o', '-', plist], { timeoutMs: 5_000 }).catch(() => undefined)
+  if (r?.exitCode !== 0) return herdInstalled
+  herdSeen = time
+  herdInstalled = herdServices(r.stdout)
+  return herdInstalled
+}
+
+/**
+ * Something accepts connections on this machine's `port`, over IPv4 or IPv6 (`localhost` is both). nc connects
+ * and hangs up at once; a missing nc counts as listening.
+ */
+async function listening($: Api, port: number): Promise<boolean> {
+  const r = await $.process.run(['nc', '-z', '-w', '1', 'localhost', String(port)], { timeoutMs: 5_000 }).catch(() => undefined)
+  return r?.exitCode !== 1
 }
 
 /** Modification time of `path`, or -1 when it doesn't exist. */
@@ -829,6 +929,8 @@ async function detectProject($: Api) {
   composerArgv = ['composer']
   phpInfo = ''
   checks = []
+  connections = []
+  shareAllowed = false
   depsSeen = ''
   depsChecks = []
   about = undefined
@@ -992,6 +1094,12 @@ export const register: Register = on => {
       const check = await checkArtisan($, splitArgs(e.args))
       if (check.refused) return { text: `Refused: ${check.refused}. Only commands you type yourself skip this check.` }
       if (check.error) return { text: check.error }
+    } else {
+      // Typed by the person, but the output still lands in the conversation, where Claude reads it
+      const { resolved } = await resolveArtisan($, splitArgs(e.args))
+      if (resolved && CONFIDENTIAL.includes(resolved)) {
+        return { text: `Not run: ${resolved} prints configuration secrets, and this output goes into the conversation where Claude reads it. Run \`php artisan ${e.args.trim()}\` in your own terminal instead.` }
+      }
     }
     const run = await runCommand($, 'artisan ' + e.args, ['php', 'artisan', ...splitArgs(e.args), '--no-interaction'])
     return { text: formatRun(run) }
@@ -1002,7 +1110,8 @@ export const register: Register = on => {
     const [action = 'status', id = ''] = splitArgs(e.args)
     if (action === 'failed') {
       await refreshQueue($)
-      return { text: snapshot ? `${plural(snapshot.failedTotal, 'failed job')}:\n` + formatFailed(snapshot.failed, 3) : snapshotError }
+      if (snapshot?.failed.length && !(await mayShare($, `${plural(snapshot.failedTotal, 'failed job')} with their exceptions`))) return { text: NOT_SHARED }
+      return { text: snapshot ? `${plural(snapshot.failedTotal, 'failed job')}:\n` + formatFailed(snapshot.failed, 3) : redact(snapshotError) }
     }
     if (action === 'retry') return { text: id ? await retryFailed($, id) : 'Usage: /lara-queue retry <id|all>' }
     if (action === 'status') await refreshQueue($)
@@ -1022,6 +1131,7 @@ export const register: Register = on => {
     await logsLoaded()
     unseenErrors = 0
     redraw($)
+    if (filteredLog(filter).length && !(await mayShare($, entriesToSend(filter, count)))) return { text: NOT_SHARED }
     return { text: logsText(filter, count) }
   }).catch(commandFailed)
 
@@ -1075,7 +1185,9 @@ export const register: Register = on => {
     const args = e as unknown as { level?: string; count?: number }
     const level = (['errors', 'warnings', 'all'].includes(String(args.level)) ? args.level : 'errors') as 'errors' | 'warnings' | 'all'
     await logsLoaded()
-    return { result: logsText(level, Math.min(50, Math.max(1, Number(args.count) || 5))) }
+    const count = Math.min(50, Math.max(1, Number(args.count) || 5))
+    if (filteredLog(level).length && !(await mayShare($, entriesToSend(level, count)))) return { result: NOT_SHARED }
+    return { result: logsText(level, count) }
   }).catch(toolFailed)
 
   on('tool.call', { tool: 'mcp__lara-cc__queue' }, async ($, e) => {
@@ -1084,10 +1196,11 @@ export const register: Register = on => {
     if (args.action === 'retry') return { result: args.id ? await retryFailed($, String(args.id)) : 'Give the failed job id, or "all".' }
     await refreshQueue($)
     if (args.action === 'failed') {
-      return { result: snapshot ? `${plural(snapshot.failedTotal, 'failed job')}:\n` + formatFailed(snapshot.failed, 5) : snapshotError }
+      if (snapshot?.failed.length && !(await mayShare($, `${plural(snapshot.failedTotal, 'failed job')} with their exceptions`))) return { result: NOT_SHARED }
+      return { result: snapshot ? `${plural(snapshot.failedTotal, 'failed job')}:\n` + formatFailed(snapshot.failed, 5) : redact(snapshotError) }
     }
     const worker = services.queue.run ? `${services.queue.label} running (started by this session).` : `${services.queue.label} not started by this session.`
-    return { result: [worker, queueSummary(), snapshotError ? 'Note: ' + snapshotError : ''].filter(Boolean).join('\n') }
+    return { result: [worker, queueSummary(), snapshotError ? 'Note: ' + redact(snapshotError) : ''].filter(Boolean).join('\n') }
   }).catch(toolFailed)
 
   on('tool.call', { tool: 'mcp__lara-cc__routes' }, async ($, e) => {
@@ -1228,9 +1341,22 @@ export const register: Register = on => {
     if (tab === 'services') {
       const shown = services[logOf]
       const autostart = settings.autostart[projectDir] ?? []
+      const herdText = herdList.map(s => `○ ${s.name} ${s.version} :${s.port}`)
+      // The Herd row wraps on a narrow pane
+      const herdRows = herdList.length ? Math.ceil(['Herd services', ...herdText].join('  ').length / width) : 0
       body = (
         <Box flexDirection="column">
           {phpInfo && <Text dimColor>{phpInfo}</Text>}
+          {herdList.length > 0 && (
+            <Box flexDirection="row" columnGap={2} flexWrap="wrap">
+              <Text dimColor>Herd services</Text>
+              {herdList.map((s, i) => (
+                <Text color={s.up ? 'green' : undefined} dimColor={!s.up}>
+                  {s.up ? '●' + herdText[i]!.slice(1) : herdText[i]}
+                </Text>
+              ))}
+            </Box>
+          )}
           {checks.map(c => (
             <Text color={c.color}>{`⚠ ${c.detail}`}</Text>
           ))}
@@ -1277,7 +1403,7 @@ export const register: Register = on => {
           </Box>
           <Text> </Text>
           <Text bold>{shown?.label ?? ''} output</Text>
-          {(shown?.lines.length ? shown.lines.slice(-Math.max(3, rows - Object.keys(services).length - 4 - (phpInfo ? 1 : 0) - checks.length * 2)) : ['(no output yet)']).map(l => line(l, true))}
+          {(shown?.lines.length ? shown.lines.slice(-Math.max(3, rows - Object.keys(services).length - 4 - (phpInfo ? 1 : 0) - herdRows - checks.length * 2)) : ['(no output yet)']).map(l => line(l, true))}
         </Box>
       )
     } else if (tab === 'queue') {
@@ -1324,7 +1450,7 @@ export const register: Register = on => {
                 <Text dimColor>{`${f.queue} · ${f.failedAt}`}</Text>
                 <Button key={'retry-' + f.id} label="retry" plain onPress={() => void retryFailed($, f.id)} />
                 <Button key={'forget-' + f.id} label="forget" plain dimColor onPress={() => void forgetFailed($, f.id)} />
-                <Button key={'ask-' + f.id} label="ask Claude" plain onPress={() => askAboutFailedJob($, f)} />
+                <Button key={'ask-' + f.id} label="ask Claude" plain onPress={() => void askAboutFailedJob($, f)} />
               </Box>
               {line('  ' + exceptionHeadline(f.exception), true)}
             </Box>
@@ -1352,7 +1478,7 @@ export const register: Register = on => {
             {filterButton('all', 'all')}
             {filterButton('warnings', 'warnings+')}
             {filterButton('errors', 'errors')}
-            {latestError && <Button key="ask-error" label="ask Claude about latest error" plain onPress={() => askAboutError($, latestError)} />}
+            {latestError && <Button key="ask-error" label="ask Claude about latest error" plain onPress={() => void askAboutError($, latestError)} />}
             <Button key="log-clear" label="clear log" plain dimColor onPress={() => void clearLog($)} />
           </Box>
           <Text dimColor>{`${logPath || 'storage/logs'} · ${logRun ? 'following' : 'not following'} · ${list.length} entries`}</Text>

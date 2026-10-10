@@ -9,13 +9,17 @@ import {
   formatEntry,
   headline,
   helpName,
+  herdNeeds,
+  herdServices,
   isError,
   localHotUrl,
   newLogState,
   npmDrift,
   origin,
+  parseConnections,
   parseSnapshot,
   parseWorkerLine,
+  redact,
   projectPath,
   queuesOf,
   refusedOptions,
@@ -147,4 +151,76 @@ test('localHotUrl accepts only dev servers on this machine', () => {
   expect(localHotUrl('http://example.com:5173')).toBe(undefined)
   expect(localHotUrl('file:///etc/passwd')).toBe(undefined)
   expect(localHotUrl('not a url')).toBe(undefined)
+})
+
+test('herdServices keeps type, name, port and version, and drops entries it cannot use', () => {
+  const plist = JSON.stringify([
+    { type: 'mysql', name: 'MySQL', port: '3306', version: '8.4.11', autoStart: true, source: 'https://download.herdphp.com/x.zip' },
+    { type: 'redis', name: 'Redis', port: 'nope', version: '7' },
+    { type: '"; do shell script "x', name: 'odd', port: '1' },
+  ])
+  expect(herdServices(plist)).toEqual([{ type: 'mysql', name: 'MySQL', port: 3306, version: '8.4.11' }])
+  expect(herdServices('not json')).toEqual([])
+  expect(herdServices('{}')).toEqual([])
+})
+
+test('parseConnections reads the JSON after any PHP warnings, and drops malformed entries', () => {
+  const out = 'Deprecated: something\n{"connections":[{"use":"database","driver":"mysql","port":3306},{"use":"cache","driver":"redis","port":"6379"}]}'
+  expect(parseConnections(out)).toEqual([{ use: 'database', driver: 'mysql', port: 3306 }])
+  expect(parseConnections('PHP Fatal error: nope')).toBe(undefined)
+})
+
+test('herdNeeds matches connections to Herd services by type and port', () => {
+  const mysql = { type: 'mysql', name: 'MySQL', port: 3306, version: '8.4' }
+  const maria = { type: 'mariadb', name: 'MariaDB', port: 3307, version: '11' }
+  const redis = { type: 'redis', name: 'Redis', port: 6379, version: '7' }
+  const connections = [
+    { use: 'database', driver: 'mysql', port: 3307 },
+    { use: 'cache', driver: 'redis', port: 6379 },
+    { use: 'queue', driver: 'redis', port: 6379 },
+    // a port no Herd service has, and a port with a service of another type
+    { use: 'session', driver: 'redis', port: 6380 },
+    { use: 'scout', driver: 'meilisearch', port: 3306 },
+  ]
+  expect(herdNeeds(connections, [mysql, maria, redis])).toEqual([
+    { service: maria, driver: 'mysql', uses: ['database'] },
+    { service: redis, driver: 'redis', uses: ['cache', 'queue'] },
+  ])
+})
+
+test('redact hides secrets by name, in URLs and headers, emails and random keys', () => {
+  expect(redact('login failed password=hunter2 user=7')).toBe('login failed password=[redacted] user=7')
+  expect(redact('{"api_key":"abc123","name":"x"}')).toBe('{"api_key":[redacted],"name":"x"}')
+  expect(redact("['client_secret' => 'shh', 'id' => 4]")).toBe("['client_secret' => [redacted], 'id' => 4]")
+  expect(redact('Could not connect to redis://default:s3cret@127.0.0.1:6379')).toBe('Could not connect to redis://[redacted]@127.0.0.1:6379')
+  expect(redact('Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc')).toContain('[redacted]')
+  expect(redact('Mail to jane.doe+x@example.co.uk bounced')).toBe('Mail to [email] bounced')
+  expect(redact('key base64:Q2xhdWRlQ29kZUxhcmF2ZWxNb2RLZXkxMjM0NTY3OA== in use')).toBe('key base64:[redacted] in use')
+  expect(redact('sha 3f786850e387550fdab836ed7e6dc881de23001b')).toBe('sha [redacted]')
+})
+
+test('redact keeps what Claude needs to debug', () => {
+  const kept = [
+    'Undefined variable $order at app/Http/Controllers/OrderController.php:42',
+    'Job 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d failed',
+    'database/migrations/2024_01_01_000000_create_users_table.php',
+    'The password field is required.',
+    'Illuminate\\Database\\QueryException',
+  ]
+  for (const line of kept) expect(redact(line)).toBe(line)
+})
+
+test('redact cuts SQL values and stack frame arguments', () => {
+  const mysql =
+    "SQLSTATE[23000]: Integrity constraint violation: 1062 Duplicate entry 'jane@example.com' for key 'users_email_unique' (Connection: mysql, SQL: insert into `users` (`email`, `name`) values (jane@example.com, Jane Doe))"
+  expect(redact(mysql)).toBe(
+    "SQLSTATE[23000]: Integrity constraint violation: 1062 Duplicate entry '?' for key 'users_email_unique' (Connection: mysql, SQL: insert into `users` (`email`, `name`) values …)",
+  )
+  const pgsql = 'SQLSTATE[23505]: Unique violation: 7 ERROR: duplicate key DETAIL: Key (email)=(jane@x.io) already exists. (Connection: pgsql, SQL: select * from "users" where "token" = abc limit 1)'
+  expect(redact(pgsql)).toBe('SQLSTATE[23505]: Unique violation: 7 ERROR: duplicate key DETAIL: Key (email)=(?) already exists. (Connection: pgsql, SQL: select * from "users" where …)')
+  expect(redact("#3 /app/app/Services/Pay.php(12): App\\Services\\Pay->charge('4242424242424242', Object(App\\Models\\User))")).toBe(
+    '#3 /app/app/Services/Pay.php(12): App\\Services\\Pay->charge(...)',
+  )
+  expect(redact('#4 /app/vendor/x.php(9): Foo->bar()')).toBe('#4 /app/vendor/x.php(9): Foo->bar()')
+  expect(redact('#5 {main}')).toBe('#5 {main}')
 })

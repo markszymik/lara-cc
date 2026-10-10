@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-10
+
+### Added
+
+- The status band flags a Herd service the app connects to that isn't running (e.g. MySQL on the port the database connection uses), and the Services tab lists Herd's services with their status. Only the driver and port of the app's local connections leave PHP; no credentials, URLs or remote hosts reach the mod or Claude, and Herd's site list is never read.
+
+### Security
+
+- Log entries and failed-job exceptions go to Claude only after you agree in a dialog that explains they can contain confidential data (Send redacted, Allow this session, Don't send); dismissed or headless means nothing is sent.
+- Text sent to Claude (log entries, exceptions, artisan/test/npm/Composer and process output) is redacted first: passwords, tokens and keys, URL credentials, bearer tokens, email addresses, SQL values, stack frame arguments and long random strings.
+- Claude's `artisan` tool refuses `config:show`, `env:encrypt` and `env:decrypt`, which print secrets; `/lara-artisan` refuses them too, since its output lands in the conversation.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added
