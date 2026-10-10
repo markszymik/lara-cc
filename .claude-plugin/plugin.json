@@ -1,7 +1,7 @@
 {
   "name": "laravel",
   "displayName": "Laravel (unofficial)",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Unofficial Laravel mod for Claude Code (not affiliated with Laravel): live log and queue monitoring, managed queue/Vite/scheduler, artisan, routes, tests and tools Claude can call",
   "author": {
     "name": "Mark Szymik",
