@@ -1,16 +1,41 @@
 import type { EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnResult, Register } from 'claude-code'
 
+import {
+  clock,
+  durationMs,
+  exceptionHeadline,
+  feedLog,
+  formatEntry,
+  headline,
+  isError,
+  isWarning,
+  newLogState,
+  origin,
+  parseSnapshot,
+  parseWorkerLine,
+  queuesOf,
+  shortClass,
+  snapshotPhp,
+  splitArgs,
+  stripAnsi,
+  tail,
+} from './parse'
+import type { FailedJob, LogEntry, QueueSnapshot } from './parse'
+
 /**
  * Unofficial Laravel mod for Claude Code. Not affiliated with or endorsed by Laravel or Anthropic.
  *
- *   /laravel                   open the Laravel pane (overview, services, routes, commands, log)
+ *   /laravel [tab]             open the pane (services, queue, log, routes, commands, about)
  *   /laravel-artisan <args>    run `php artisan <args>`; output lands in the transcript for Claude
- *   /laravel-queue|-vite|-schedule [start|stop|restart|logs]   manage long-running processes
+ *   /laravel-queue [start|stop|restart|logs|status|failed|retry <id|all>]
+ *   /laravel-vite|-schedule [start|stop|restart|logs]
+ *   /laravel-logs [errors|warnings|all] [count]
+ *   /laravel-test [args]       php artisan test
  *   /laravel-routes [filter]   route list
  *   /laravel-npm <script>      `npm run <script>` (pnpm / yarn / bun detected from the lockfile)
  *   /laravel-composer <args>   run composer
  *
- * Claude also gets three tools: artisan, service and routes.
+ * Claude gets tools: artisan, service, routes, logs and queue.
  */
 
 type Api = EngineInterface
@@ -36,83 +61,133 @@ const QUICK: { key: string; label: string; argv: string[] }[] = [
 ]
 
 /** Artisan commands Claude's tool refuses. You can still run them yourself with /laravel-artisan. */
-const DESTRUCTIVE = /^(migrate:(fresh|reset|refresh|rollback)|db:wipe|db:seed|key:generate|down)\b/
+const DESTRUCTIVE = /^(migrate:(fresh|reset|refresh|rollback)|db:wipe|db:seed|key:generate|down|queue:(flush|clear))\b/
 
 const PANE = 'laravel'
-const MAX_LOG_LINES = 400
-const MAX_TEXT = 8000
+const MAX_SERVICE_LINES = 400
+const TOAST_GAP_MS = 5000
 
 // ─── State (module variables reset when the mod reloads; child processes die with it) ──
 
+type Tab = 'services' | 'queue' | 'log' | 'routes' | 'commands' | 'about'
 type Run = { stream: HookStream<ProcessSpawnChunk, ProcessSpawnResult>; done: Promise<void> }
 type Service = { name: string; label: string; argv: string[]; run?: Run; lines: string[]; startedAt?: number; partial: string }
 type LastRun = { label: string; isRunning: boolean; exitCode?: number; output: string }
 type Route = { method: string; uri: string; name: string | null; action: string }
+type Job = { job: string; time: string; status: 'running' | 'done' | 'failed'; ms?: number }
+type Settings = {
+  autoRestartQueue: boolean
+  pintAfterTurn: boolean
+  showBand: boolean
+  errorToasts: boolean
+  autostart: Record<string, string[]>
+}
+
+const DEFAULT_SETTINGS: Settings = { autoRestartQueue: true, pintAfterTurn: false, showBand: true, errorToasts: true, autostart: {} }
 
 const services: Record<string, Service> = {}
 for (const [name, def] of Object.entries(SERVICES)) {
   services[name] = { name, label: def.label, argv: [...def.argv], lines: [], partial: '' }
 }
 
+let settings: Settings = { ...DEFAULT_SETTINGS }
+let projectDir = ''
 let isLaravel = false
+let hasPint = false
 let pm = 'npm'
-let tab: 'overview' | 'services' | 'routes' | 'commands' | 'log' = 'services'
+
+let tab: Tab = 'services'
+let paneOpen = false
 let logOf = 'queue'
-let autoRestartQueue = true
+let lastToastAt = 0
 let restartTimer: { cancel: () => void } | undefined
 let lastRun: LastRun | undefined
 let about: Record<string, Record<string, unknown>> | undefined
 let routes: Route[] | undefined
 let routeFilter = ''
-let appLog = ''
+let pendingMigrations = 0
+const editedPhp = new Set<string>()
 
-// ─── Helpers ───────────────────────────────────────────────────────────────
+// Log monitoring
+let logPath = ''
+let logState = newLogState()
+let logRun: { stream: HookStream<ProcessSpawnChunk, ProcessSpawnResult> } | undefined
+let logFilter: 'all' | 'warnings' | 'errors' = 'all'
+let unseenErrors = 0
+let logReady: Promise<void> = Promise.resolve()
 
-function stripAnsi(text: string): string {
-  return text.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\r/g, '')
-}
+// Queue monitoring
+let jobs: Job[] = []
+const stats = { done: 0, failed: 0, totalMs: 0 }
+let snapshot: QueueSnapshot | undefined
+let snapshotAt = 0
+let snapshotError = ''
+let snapshotLoading = false
 
-function tail(text: string, max = MAX_TEXT): string {
-  return text.length > max ? '…' + text.slice(-max) : text
-}
-
-/** Split "make:model Post -m --force" into argv, keeping quoted strings together. */
-function splitArgs(input: string): string[] {
-  const out: string[] = []
-  for (const m of input.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)) out.push(m[1] ?? m[2] ?? m[3] ?? '')
-  return out
-}
+// ─── Small helpers ─────────────────────────────────────────────────────────
 
 function ago(ms: number): string {
-  const s = Math.floor((Date.now() - ms) / 1000)
+  const s = Math.max(0, Math.floor((Date.now() - ms) / 1000))
   if (s < 60) return s + 's'
   if (s < 3600) return Math.floor(s / 60) + 'm'
   return Math.floor(s / 3600) + 'h' + Math.floor((s % 3600) / 60) + 'm'
 }
 
-function pushText(svc: Service, text: string) {
-  const parts = (svc.partial + stripAnsi(text)).split('\n')
-  svc.partial = parts.pop() ?? ''
-  svc.lines.push(...parts.filter(line => line.trim() !== ''))
-  if (svc.lines.length > MAX_LOG_LINES) svc.lines.splice(0, svc.lines.length - MAX_LOG_LINES)
+function plural(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? '' : 's'}`
 }
 
 function redraw($: Api) {
   $.ui.invalidate('ui.render')
 }
 
-function updateStatus($: Api) {
-  const running = Object.values(services).filter(s => s.run).map(s => s.name)
-  $.ui.status(running.length ? '▶ ' + running.join(' · ') : undefined)
+/** A toast, at most one every few seconds so a burst of errors doesn't flood the screen. */
+function toast($: Api, text: string) {
+  const now = Date.now()
+  if (now - lastToastAt < TOAST_GAP_MS) return
+  lastToastAt = now
+  $.ui.toast(text.length > 140 ? text.slice(0, 139) + '…' : text, { timeoutMs: 6000 })
 }
 
 function notLaravel(): string {
   return 'No `artisan` file in this directory, so this does not look like a Laravel project. Start Claude Code from the project root.'
 }
 
-// ─── Running commands ──────────────────────────────────────────────────────
+async function openPane($: Api, on: Tab) {
+  tab = on
+  if (on === 'log') unseenErrors = 0
+  if (on === 'about' && !about) void loadAbout($)
+  if (on === 'routes' && !routes) void loadRoutes($)
+  if (on === 'queue') void refreshQueue($)
+  paneOpen = true
+  await $.ui.open({ id: PANE, title: 'Laravel', focus: true, closeOnEscape: true })
+  redraw($)
+}
 
-/** Run a one-shot command, keep its output for the Commands tab, and return it. */
+// ─── Settings (kept between sessions) ──────────────────────────────────────
+
+async function loadSettings($: Api) {
+  const saved = await $.store.get('settings')
+  if (saved && typeof saved === 'object') settings = { ...DEFAULT_SETTINGS, ...(saved as Partial<Settings>) }
+}
+
+async function toggle($: Api, key: 'autoRestartQueue' | 'pintAfterTurn' | 'showBand' | 'errorToasts') {
+  settings = { ...settings, [key]: !settings[key] }
+  redraw($)
+  await $.store.set('settings', settings)
+}
+
+async function toggleAutostart($: Api, name: string) {
+  const list = settings.autostart[projectDir] ?? []
+  const next = list.includes(name) ? list.filter(n => n !== name) : [...list, name]
+  settings = { ...settings, autostart: { ...settings.autostart, [projectDir]: next } }
+  redraw($)
+  await $.store.set('settings', settings)
+}
+
+// ─── One-shot commands ─────────────────────────────────────────────────────
+
+/** Run a command, keep its output for the Commands tab, and return it. */
 async function runCommand($: Api, label: string, argv: string[], timeoutMs = 600_000): Promise<LastRun> {
   lastRun = { label, isRunning: true, output: '' }
   redraw($)
@@ -134,6 +209,18 @@ function formatRun(run: LastRun): string {
 
 // ─── Long-running services ─────────────────────────────────────────────────
 
+function onServiceOutput($: Api, svc: Service, text: string) {
+  const parts = (svc.partial + stripAnsi(text)).split('\n')
+  svc.partial = parts.pop() ?? ''
+  for (const line of parts) {
+    if (line.trim() === '') continue
+    svc.lines.push(line)
+    if (svc.name === 'queue') onWorkerLine($, line)
+  }
+  if (svc.lines.length > MAX_SERVICE_LINES) svc.lines.splice(0, svc.lines.length - MAX_SERVICE_LINES)
+  redraw($)
+}
+
 function startService($: Api, name: string): string {
   const svc = services[name]
   if (!svc) return `Unknown service "${name}". Known: ${Object.keys(services).join(', ')}`
@@ -153,15 +240,14 @@ function startService($: Api, name: string): string {
     try {
       let step = await stream.next()
       while (!step.done) {
-        pushText(svc, step.value.text)
-        redraw($)
+        onServiceOutput($, svc, step.value.text)
         step = await stream.next()
       }
       // A stream closed by stopService ends without a result
       const end = step.value as ProcessSpawnResult | undefined
       if (!end || end.signal) svc.lines.push('■ stopped')
       else svc.lines.push(`■ exited with code ${end.code}`)
-      if (end?.code) $.ui.toast(`${svc.label} exited with code ${end.code}`)
+      if (end?.code) toast($, `${svc.label} exited with code ${end.code}`)
     } catch (err) {
       svc.lines.push('■ ' + String(err))
     }
@@ -170,11 +256,9 @@ function startService($: Api, name: string): string {
       svc.startedAt = undefined
     }
     finish()
-    updateStatus($)
     redraw($)
   })()
 
-  updateStatus($)
   redraw($)
   return `${svc.label} started: ${svc.argv.join(' ')}`
 }
@@ -194,7 +278,6 @@ async function stopService($: Api, name: string): Promise<string> {
     svc.startedAt = undefined
     svc.lines.push('■ stop requested (process may still be finishing)')
   }
-  updateStatus($)
   redraw($)
   return `${svc.label} stopped.`
 }
@@ -210,8 +293,225 @@ async function serviceAction($: Api, name: string, action: string): Promise<stri
   if (action === 'start') return startService($, name)
   if (action === 'stop') return stopService($, name)
   if (action === 'restart') return restartService($, name)
-  if (action === 'logs') return `${svc.label} — last 60 lines:\n` + svc.lines.slice(-60).join('\n')
-  return svc.run ? `${svc.label} is running (${ago(svc.startedAt ?? Date.now())}).` : `${svc.label} is stopped.`
+  if (action === 'logs') return `${svc.label}, last 60 lines:\n` + (svc.lines.slice(-60).join('\n') || '(no output)')
+  const state = svc.run ? `${svc.label} is running (${ago(svc.startedAt ?? Date.now())}).` : `${svc.label} is stopped.`
+  return name === 'queue' ? state + '\n' + queueSummary() : state
+}
+
+// ─── Queue monitoring ──────────────────────────────────────────────────────
+
+function onWorkerLine($: Api, line: string) {
+  const ev = parseWorkerLine(line)
+  if (!ev) return
+  if (ev.status === 'RUNNING') {
+    jobs.push({ job: ev.job, time: ev.time, status: 'running' })
+  } else {
+    const ms = durationMs(ev.duration)
+    const status = ev.status === 'DONE' ? 'done' : 'failed'
+    let i = jobs.length - 1
+    while (i >= 0 && !(jobs[i]?.status === 'running' && jobs[i]?.job === ev.job)) i--
+    const job = jobs[i]
+    if (job) Object.assign(job, { status, ms })
+    else jobs.push({ job: ev.job, time: ev.time, status, ms })
+    if (status === 'done') {
+      stats.done += 1
+      stats.totalMs += ms ?? 0
+    } else {
+      stats.failed += 1
+      toast($, `Job failed: ${shortClass(ev.job)}`)
+      // The failed_jobs row is written just after the line; look again shortly
+      $.clock.after(1500, () => void refreshQueue($))
+    }
+  }
+  if (jobs.length > 100) jobs.splice(0, jobs.length - 100)
+}
+
+async function refreshQueue($: Api) {
+  if (!isLaravel || snapshotLoading) return
+  snapshotLoading = true
+  redraw($)
+  try {
+    const r = await $.process.run(['php', '-r', snapshotPhp(queuesOf(services.queue.argv))], { timeoutMs: 30_000 })
+    const parsed = parseSnapshot(r.stdout)
+    if (parsed) {
+      snapshot = parsed
+      snapshotError = parsed.error ?? ''
+    } else {
+      snapshotError = stripAnsi(r.stderr || r.stdout).trim().split('\n')[0]?.slice(0, 300) || 'Could not read the queue state.'
+    }
+  } catch (err) {
+    snapshotError = String(err)
+  }
+  snapshotAt = Date.now()
+  snapshotLoading = false
+  redraw($)
+}
+
+async function retryFailed($: Api, id: string): Promise<string> {
+  const run = await runCommand($, `queue:retry ${id}`, ['php', 'artisan', 'queue:retry', id], 60_000)
+  await refreshQueue($)
+  return formatRun(run)
+}
+
+async function forgetFailed($: Api, id: string): Promise<string> {
+  const run = await runCommand($, `queue:forget ${id}`, ['php', 'artisan', 'queue:forget', id], 60_000)
+  await refreshQueue($)
+  return formatRun(run)
+}
+
+function queueSummary(): string {
+  const avg = stats.done ? Math.round(stats.totalMs / stats.done) : 0
+  const lines = [
+    `This session: ${stats.done} done, ${stats.failed} failed${stats.done ? `, avg ${avg}ms` : ''}.`,
+  ]
+  if (snapshot) {
+    lines.push(`Connection: ${snapshot.connection}${snapshot.connection === 'sync' ? ' (jobs run inline; no worker needed)' : ''}`)
+    lines.push('Pending: ' + (Object.entries(snapshot.sizes).map(([q, n]) => `${q}=${n}`).join(', ') || 'unknown'))
+    lines.push(`Failed jobs stored: ${snapshot.failedTotal}`)
+  }
+  const recent = jobs.slice(-10).map(j => `  ${j.status === 'done' ? '✓' : j.status === 'failed' ? '✗' : '…'} ${j.time} ${j.job}${j.ms !== undefined ? ` ${Math.round(j.ms)}ms` : ''}`)
+  if (recent.length) lines.push('Recent jobs:', ...recent)
+  return lines.join('\n')
+}
+
+function formatFailed(list: FailedJob[], withTrace: number): string {
+  if (!list.length) return 'No failed jobs.'
+  return list
+    .map((f, i) => {
+      const rest = i < withTrace ? f.exception.split('\n').slice(1, 13).filter(l => l.trim()) : []
+      const trace = rest.length ? '\n' + rest.map(l => '    ' + l).join('\n') : ''
+      return `- ${f.id}  ${f.job}  (queue ${f.queue}, failed ${f.failedAt})\n  ${exceptionHeadline(f.exception)}${trace}`
+    })
+    .join('\n')
+}
+
+function askAboutFailedJob($: Api, f: FailedJob) {
+  const text = [
+    'This queued job failed in my Laravel app. Find the cause and fix it. When fixed, retry it with the queue tool.',
+    '',
+    `Job: ${f.job}`,
+    `Failed job id: ${f.id}`,
+    `Queue: ${f.queue}, failed at ${f.failedAt}`,
+    '',
+    '```',
+    f.exception.split('\n').slice(0, 40).join('\n'),
+    '```',
+  ].join('\n')
+  $.prompt.submit({ text, asUser: true }).catch(err => $.ui.toast('Could not send to Claude: ' + String(err)))
+}
+
+// ─── Log monitoring ────────────────────────────────────────────────────────
+
+/** The newest laravel*.log in storage/logs (single or daily channel). */
+async function newestLog($: Api): Promise<string> {
+  const dir = 'storage/logs'
+  try {
+    const files = (await $.fs.list(dir)).filter(f => f.kind === 'file' && /^laravel(-\d{4}-\d\d-\d\d)?\.log$/.test(f.name))
+    let best = ''
+    let bestTime = -1
+    for (const f of files) {
+      const s = await $.fs.stat(dir + '/' + f.name)
+      if (s.mtimeMs > bestTime) {
+        best = f.name
+        bestTime = s.mtimeMs
+      }
+    }
+    if (best) return dir + '/' + best
+  } catch {
+    // no storage/logs yet
+  }
+  return dir + '/laravel.log'
+}
+
+/** Follow the newest log file; called at start and every minute, so a new daily file is picked up. */
+async function watchLog($: Api) {
+  if (!isLaravel) return
+  let loaded = () => {}
+  const ready = new Promise<void>(resolve => (loaded = resolve))
+  const previous = logReady
+  logReady = ready
+  try {
+    // One watch at a time, so two overlapping calls can't start two tails
+    await previous
+    const path = await newestLog($)
+    if (path === logPath && logRun) return
+    if (logRun) void logRun.stream.return({ code: null, signal: 'SIGTERM' }).catch(() => {})
+
+    logPath = path
+    logState = newLogState()
+    try {
+      const r = await $.process.run(['tail', '-n', '400', path], { timeoutMs: 10_000 })
+      if (r.exitCode === 0) feedLog(logState, r.stdout.endsWith('\n') ? r.stdout : r.stdout + '\n')
+    } catch {
+      // the file may not exist yet; tail -F below waits for it
+    }
+
+    const stream = $.process.spawn({ argv: ['tail', '-n', '0', '-F', path] })
+    const run = { stream }
+    logRun = run
+    void (async () => {
+      try {
+        for await (const chunk of stream) {
+          if (chunk.stream === 'stdout') onLogEntries($, feedLog(logState, chunk.text))
+        }
+      } catch {
+        // stream closed
+      }
+      if (logRun === run) logRun = undefined
+    })()
+    redraw($)
+  } finally {
+    loaded()
+  }
+}
+
+function onLogEntries($: Api, entries: LogEntry[]) {
+  const errors = entries.filter(isError)
+  if (errors.length) {
+    const viewing = paneOpen && tab === 'log'
+    if (!viewing) unseenErrors += errors.length
+    const last = errors[errors.length - 1]
+    if (last && settings.errorToasts) toast($, `Laravel ${last.level.toLowerCase()}: ${headline(last)}`)
+  }
+  redraw($)
+}
+
+function filteredLog(filter: 'all' | 'warnings' | 'errors'): LogEntry[] {
+  const all = logState.entries
+  if (filter === 'errors') return all.filter(isError)
+  if (filter === 'warnings') return all.filter(e => isError(e) || isWarning(e))
+  return all
+}
+
+/** Wait for the log's history to be read, so a call right after start sees it. */
+async function logsLoaded() {
+  await logReady
+}
+
+function logsText(filter: 'all' | 'warnings' | 'errors', count: number): string {
+  const list = filteredLog(filter).slice(-count)
+  if (!list.length) return `No ${filter === 'all' ? 'entries' : filter} in ${logPath || 'storage/logs'}.`
+  const noun = filter === 'all' ? (list.length === 1 ? 'entry' : 'entries') : plural(list.length, filter.replace(/s$/, '')).replace(/^\d+ /, '')
+  return `Latest ${list.length} ${noun} from ${logPath}:\n\n` + list.map(e => formatEntry(e, 15, projectDir)).join('\n\n')
+}
+
+function askAboutError($: Api, entry: LogEntry) {
+  const text = [
+    `This error appeared in my Laravel log (${logPath}). Find the cause and fix it.`,
+    '',
+    '```',
+    formatEntry(entry, 30, projectDir),
+    '```',
+  ].join('\n')
+  $.prompt.submit({ text, asUser: true }).catch(err => $.ui.toast('Could not send to Claude: ' + String(err)))
+}
+
+async function clearLog($: Api) {
+  if (!logPath) return
+  await $.fs.write(logPath, '')
+  logState = newLogState()
+  unseenErrors = 0
+  redraw($)
 }
 
 // ─── Project info ──────────────────────────────────────────────────────────
@@ -237,7 +537,7 @@ function filterRoutes(list: Route[], filter: string): Route[] {
 
 function formatRoute(r: Route): string {
   const method = r.method.replace('|HEAD', '').padEnd(9)
-  return `${method} /${r.uri.replace(/^\//, '')}${r.name ? '  ' + r.name : ''}  ${r.action.replace(/^App\\Http\\Controllers\\/, '')}`
+  return `${method} /${r.uri.replace(/^\//, '')}${r.name ? '  ' + r.name : ''}  ${shortClass(r.action)}`
 }
 
 async function loadAbout($: Api) {
@@ -250,26 +550,35 @@ async function loadAbout($: Api) {
   redraw($)
 }
 
-async function loadLog($: Api) {
+async function checkMigrations($: Api) {
   try {
-    const r = await $.process.run(['tail', '-n', '120', 'storage/logs/laravel.log'], { timeoutMs: 10_000 })
-    appLog = r.exitCode === 0 ? stripAnsi(r.stdout) : 'No storage/logs/laravel.log yet.'
-  } catch (err) {
-    appLog = String(err)
+    const r = await $.process.run(['php', 'artisan', 'migrate:status', '--no-ansi'], { timeoutMs: 60_000 })
+    if (r.exitCode !== 0) return
+    pendingMigrations = r.stdout.split('\n').filter(l => /\bPending\b/.test(l)).length
+    if (pendingMigrations) toast($, `${plural(pendingMigrations, 'pending migration')}. Run /laravel-artisan migrate`)
+    redraw($)
+  } catch {
+    // no database yet: nothing to report
   }
-  redraw($)
 }
 
 async function detectProject($: Api) {
+  projectDir = await $.session.cwd()
   isLaravel = await $.fs.exists('artisan')
   if (!isLaravel) return
+  hasPint = await $.fs.exists('vendor/bin/pint')
 
   if (await $.fs.exists('bun.lock')) pm = 'bun'
   else if (await $.fs.exists('bun.lockb')) pm = 'bun'
   else if (await $.fs.exists('pnpm-lock.yaml')) pm = 'pnpm'
   else if (await $.fs.exists('yarn.lock')) pm = 'yarn'
   services.vite.argv = [pm, 'run', 'dev']
-  for (const q of QUICK) if (q.argv[0] === 'npm') q.argv = [pm, ...q.argv.slice(1)], q.label = q.label.replace('npm', pm)
+  for (const q of QUICK) {
+    if (q.argv[0] === 'npm') {
+      q.argv = [pm, ...q.argv.slice(1)]
+      q.label = q.label.replace('npm', pm)
+    }
+  }
 
   try {
     const composer = await $.fs.read('composer.json')
@@ -282,21 +591,26 @@ async function detectProject($: Api) {
   }
 }
 
+// ─── The mod ───────────────────────────────────────────────────────────────
+
 const commandFailed = (_$: Api, _e: unknown, next: { error: { message?: string } }) => ({ text: 'laravel: ' + (next.error.message ?? 'failed') })
 const toolFailed = (_$: Api, _e: unknown, next: { error: { message?: string } }) => ({ result: 'laravel: ' + (next.error.message ?? 'failed') })
 
-// ─── The mod ───────────────────────────────────────────────────────────────
+const TABS: Tab[] = ['services', 'queue', 'log', 'routes', 'commands', 'about']
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    await loadSettings($)
     await detectProject($)
 
     const commands = [
-      { name: 'laravel', description: 'Open the Laravel pane', immediate: true as const },
+      { name: 'laravel', description: 'Open the Laravel pane', argumentHint: '[services|queue|log|routes|commands|about]', immediate: true as const },
       { name: 'laravel-artisan', description: 'Run php artisan <args>', argumentHint: '<command> [args]' },
-      { name: 'laravel-queue', description: 'Queue worker: start, stop, restart, logs', argumentHint: '[start|stop|restart|logs]', immediate: true as const },
+      { name: 'laravel-queue', description: 'Queue worker and failed jobs', argumentHint: '[start|stop|restart|logs|status|failed|retry <id|all>]', immediate: true as const },
       { name: 'laravel-vite', description: 'Vite dev server: start, stop, restart, logs', argumentHint: '[start|stop|restart|logs]', immediate: true as const },
       { name: 'laravel-schedule', description: 'Scheduler (schedule:work): start, stop, restart, logs', argumentHint: '[start|stop|restart|logs]', immediate: true as const },
+      { name: 'laravel-logs', description: 'Recent entries from storage/logs', argumentHint: '[errors|warnings|all] [count]', immediate: true as const },
+      { name: 'laravel-test', description: 'Run php artisan test', argumentHint: '[--filter=Name] [args]' },
       { name: 'laravel-routes', description: 'List routes, optionally filtered', argumentHint: '[filter]' },
       { name: 'laravel-npm', description: 'Run a package.json script (npm/pnpm/yarn/bun)', argumentHint: '<script>' },
       { name: 'laravel-composer', description: 'Run composer <args>', argumentHint: '<args>' },
@@ -335,21 +649,60 @@ export const register: Register = on => {
       isDeferred: false,
     })
     await $.tool.register({
+      name: 'logs',
+      description:
+        'Read recent entries from the Laravel log (storage/logs), with exception origin and stack. Check it after running code, hitting a page or running tests, to see errors the app logged.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          level: { type: 'string', enum: ['errors', 'warnings', 'all'], description: 'Default errors' },
+          count: { type: 'number', description: 'How many entries, newest last (default 5)' },
+        },
+      },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'queue',
+      description:
+        'Laravel queue state: pending jobs per queue, jobs the worker ran this session, and failed jobs with their exceptions. "failed" lists failed jobs with stack traces; "retry" re-queues one (id) or all.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['status', 'failed', 'retry'] },
+          id: { type: 'string', description: 'Failed job id for retry, or "all"' },
+        },
+        required: ['action'],
+      },
+      isDeferred: false,
+    })
+    await $.tool.register({
       name: 'routes',
       description: 'List the Laravel routes (method, URI, name, action), optionally filtered by a substring.',
       inputSchema: { type: 'object', properties: { filter: { type: 'string' } } },
       isDeferred: false,
     })
 
+    if (isLaravel) {
+      void watchLog($)
+      void checkMigrations($)
+      void refreshQueue($)
+      for (const name of settings.autostart[projectDir] ?? []) if (services[name]) startService($, name)
+      // Pick up a new daily log file, and keep the Queue tab current while it's showing
+      $.clock.every(60_000, () => void watchLog($))
+      $.clock.every(15_000, () => {
+        if (paneOpen && tab === 'queue') void refreshQueue($)
+      })
+    }
+
     return next(e)
   })
 
   // ── Slash commands ──
 
-  on('command.run', { command: 'laravel' }, async $ => {
+  on('command.run', { command: 'laravel' }, async ($, e) => {
     if (!isLaravel) return { text: notLaravel() }
-    await $.ui.open({ id: PANE, title: 'Laravel', focus: true, closeOnEscape: true })
-    if (!about) void loadAbout($)
+    const wanted = e.args.trim().toLowerCase() as Tab
+    await openPane($, TABS.includes(wanted) ? wanted : tab)
     return {}
   }).catch(commandFailed)
 
@@ -360,10 +713,38 @@ export const register: Register = on => {
     return { text: formatRun(run) }
   }).catch(commandFailed)
 
-  on('command.run', { command: ['laravel-queue', 'laravel-vite', 'laravel-schedule'] }, async ($, e) => {
+  on('command.run', { command: 'laravel-queue' }, async ($, e) => {
     if (!isLaravel) return { text: notLaravel() }
-    const action = e.args.trim() || 'status'
-    return { text: await serviceAction($, e.command.replace('laravel-', ''), action) }
+    const [action = 'status', id = ''] = splitArgs(e.args)
+    if (action === 'failed') {
+      await refreshQueue($)
+      return { text: snapshot ? `${plural(snapshot.failedTotal, 'failed job')}:\n` + formatFailed(snapshot.failed, 3) : snapshotError }
+    }
+    if (action === 'retry') return { text: id ? await retryFailed($, id) : 'Usage: /laravel-queue retry <id|all>' }
+    if (action === 'status') await refreshQueue($)
+    return { text: await serviceAction($, 'queue', action) }
+  }).catch(commandFailed)
+
+  on('command.run', { command: ['laravel-vite', 'laravel-schedule'] }, async ($, e) => {
+    if (!isLaravel) return { text: notLaravel() }
+    return { text: await serviceAction($, e.command.replace('laravel-', ''), e.args.trim() || 'status') }
+  }).catch(commandFailed)
+
+  on('command.run', { command: 'laravel-logs' }, async ($, e) => {
+    if (!isLaravel) return { text: notLaravel() }
+    const args = splitArgs(e.args)
+    const filter = (['errors', 'warnings', 'all'].find(f => args.includes(f)) ?? 'errors') as 'errors' | 'warnings' | 'all'
+    const count = Number(args.find(a => /^\d+$/.test(a)) ?? 5)
+    await logsLoaded()
+    unseenErrors = 0
+    redraw($)
+    return { text: logsText(filter, count) }
+  }).catch(commandFailed)
+
+  on('command.run', { command: 'laravel-test' }, async ($, e) => {
+    if (!isLaravel) return { text: notLaravel() }
+    const run = await runCommand($, 'test ' + e.args, ['php', 'artisan', 'test', ...splitArgs(e.args)])
+    return { text: formatRun(run) }
   }).catch(commandFailed)
 
   on('command.run', { command: 'laravel-routes' }, async ($, e) => {
@@ -403,6 +784,26 @@ export const register: Register = on => {
     return { result: await serviceAction($, String(args.name), String(args.action ?? 'status')) }
   }).catch(toolFailed)
 
+  on('tool.call', { tool: 'mcp__laravel__logs' }, async ($, e) => {
+    if (!isLaravel) return { result: notLaravel() }
+    const args = e as unknown as { level?: string; count?: number }
+    const level = (['errors', 'warnings', 'all'].includes(String(args.level)) ? args.level : 'errors') as 'errors' | 'warnings' | 'all'
+    await logsLoaded()
+    return { result: logsText(level, Math.min(50, Math.max(1, Number(args.count) || 5))) }
+  }).catch(toolFailed)
+
+  on('tool.call', { tool: 'mcp__laravel__queue' }, async ($, e) => {
+    if (!isLaravel) return { result: notLaravel() }
+    const args = e as unknown as { action?: string; id?: string }
+    if (args.action === 'retry') return { result: args.id ? await retryFailed($, String(args.id)) : 'Give the failed job id, or "all".' }
+    await refreshQueue($)
+    if (args.action === 'failed') {
+      return { result: snapshot ? `${plural(snapshot.failedTotal, 'failed job')}:\n` + formatFailed(snapshot.failed, 5) : snapshotError }
+    }
+    const worker = services.queue.run ? `${services.queue.label} running (started by this session).` : `${services.queue.label} not started by this session.`
+    return { result: [worker, queueSummary(), snapshotError ? 'Note: ' + snapshotError : ''].filter(Boolean).join('\n') }
+  }).catch(toolFailed)
+
   on('tool.call', { tool: 'mcp__laravel__routes' }, async ($, e) => {
     if (!isLaravel) return { result: notLaravel() }
     const list = await loadRoutes($)
@@ -412,12 +813,14 @@ export const register: Register = on => {
     return { result: tail(`${shown.length} of ${list.length} routes\n` + shown.map(formatRoute).join('\n')) }
   }).catch(toolFailed)
 
-  // ── Restart the queue worker after Claude edits PHP, so it runs the new code ──
+  // ── When Claude edits PHP: restart the queue worker, and remember the file for Pint ──
 
   on('tool.call', { tool: ['Edit', 'Write'] }, async ($, e, next) => {
     const result = await next(e)
     const path = String((e as unknown as { file_path?: string }).file_path ?? '')
-    if (autoRestartQueue && services.queue.run && path.endsWith('.php')) {
+    if (!path.endsWith('.php') || ('isError' in result && result.isError)) return result
+    editedPhp.add(path)
+    if (settings.autoRestartQueue && services.queue.run) {
       restartTimer?.cancel()
       restartTimer = $.clock.after(2000, async () => {
         await restartService($, 'queue')
@@ -427,6 +830,66 @@ export const register: Register = on => {
     return result
   }).catch(($, e, next) => next(e))
 
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined && editedPhp.size) {
+      const files = [...editedPhp].filter(f => !f.includes('/vendor/'))
+      editedPhp.clear()
+      if (settings.pintAfterTurn && hasPint && files.length) {
+        void (async () => {
+          try {
+            const r = await $.process.run(['vendor/bin/pint', ...files], { timeoutMs: 120_000 })
+            $.ui.log(r.exitCode === 0 ? `laravel: Pint formatted ${plural(files.length, 'file')}` : `laravel: Pint failed: ${stripAnsi(r.stdout + r.stderr).trim().slice(0, 300)}`)
+          } catch (err) {
+            $.ui.log('laravel: Pint failed: ' + String(err))
+          }
+        })()
+      }
+    }
+    return next(e)
+  })
+
+  on('ui.close', ($, e, next) => {
+    if (e.id === PANE) paneOpen = false
+    return next(e)
+  })
+
+  // ── The band above the prompt: one line, only when there's something to show ──
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (!isLaravel || !settings.showBand || e.props.hasSurvey) return next(e)
+    const running = Object.values(services).filter(s => s.run)
+    const failedStored = snapshot?.failedTotal ?? 0
+    if (!running.length && !unseenErrors && !failedStored && !pendingMigrations) return next(e)
+
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const theirs = await next(e)
+    const parts = []
+    for (const s of running) {
+      const extra = s.name === 'queue' && (stats.done || stats.failed) ? ` ${stats.done}✓${stats.failed ? ` ${stats.failed}✗` : ''}` : ''
+      parts.push(<Text color="green">{'● '}</Text>, <Text>{s.name + extra + '  '}</Text>)
+    }
+    if (unseenErrors) parts.push(<Text color="red">{`▲ ${plural(unseenErrors, 'new error')}  `}</Text>)
+    if (failedStored) parts.push(<Text color="yellow">{`${plural(failedStored, 'failed job')}  `}</Text>)
+    if (pendingMigrations) parts.push(<Text color="yellow">{`${plural(pendingMigrations, 'pending migration')}  `}</Text>)
+
+    const target: Tab = unseenErrors ? 'log' : failedStored ? 'queue' : 'services'
+    const band = (
+      <Box flexDirection="row">
+        <Text dimColor>{'laravel  '}</Text>
+        {parts}
+        <Button key="band-open" label="open" plain dimColor onPress={() => void openPane($, target)} />
+      </Box>
+    )
+    return theirs ? (
+      <Box flexDirection="column">
+        {band}
+        {theirs}
+      </Box>
+    ) : (
+      band
+    )
+  })
+
   // ── The pane ──
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -435,44 +898,39 @@ export const register: Register = on => {
     // Text fields exist in the terminal and the Desktop app, not in VS Code or mobile
     const Input = 'Input' in elements ? elements.Input : undefined
     const width = e.props.bodyColumns ?? 80
-    const rows = Math.max(8, (e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 30) - 6)
+    const rows = Math.max(10, (e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 30) - 6)
 
-    const tabButton = (id: typeof tab, label: string, hotkey: string) => (
-      <Button
-        key={'tab-' + id}
-        label={label}
-        hotkey={hotkey}
-        plain
-        dimColor={tab !== id}
-        onPress={() => {
-          tab = id
-          if (id === 'overview' && !about) void loadAbout($)
-          if (id === 'routes' && !routes) void loadRoutes($)
-          if (id === 'log') void loadLog($)
-          redraw($)
-        }}
-      />
+    const line = (text: string, dim = false, color?: string) => (
+      <Text dimColor={dim} color={color} wrap="truncate-end">
+        {text.slice(0, width + 20) || ' '}
+      </Text>
     )
 
+    const tabButton = (id: Tab, label: string, hotkey: string) => (
+      <Button key={'tab-' + id} label={label} hotkey={hotkey} plain dimColor={tab !== id} onPress={() => void openPane($, id)} />
+    )
+
+    const errorBadge = unseenErrors ? ` (${unseenErrors})` : ''
+    const failedBadge = snapshot?.failedTotal ? ` (${snapshot.failedTotal})` : ''
     const header = (
-      <Box flexDirection="row" columnGap={2}>
+      <Box flexDirection="row" columnGap={2} flexWrap="wrap">
         {tabButton('services', 'Services', 's')}
-        {tabButton('commands', 'Commands', 'c')}
+        {tabButton('queue', 'Queue' + failedBadge, 'q')}
+        {tabButton('log', 'Log' + errorBadge, 'l')}
         {tabButton('routes', 'Routes', 'r')}
-        {tabButton('log', 'Log', 'l')}
-        {tabButton('overview', 'About', 'a')}
+        {tabButton('commands', 'Commands', 'c')}
+        {tabButton('about', 'About', 'a')}
       </Box>
     )
 
-    const line = (text: string, dim = false) => (
-      <Text dimColor={dim} wrap="truncate-end">
-        {text.slice(0, width + 20) || ' '}
-      </Text>
+    const toggleButton = (key: 'autoRestartQueue' | 'pintAfterTurn' | 'showBand' | 'errorToasts', label: string) => (
+      <Button key={'set-' + key} label={`${settings[key] ? '[x]' : '[ ]'} ${label}`} plain dimColor={!settings[key]} onPress={() => void toggle($, key)} />
     )
 
     let body
     if (tab === 'services') {
       const shown = services[logOf]
+      const autostart = settings.autostart[projectDir] ?? []
       body = (
         <Box flexDirection="column">
           {Object.values(services).map(svc => (
@@ -490,30 +948,115 @@ export const register: Register = on => {
               <Button key={'restart-' + svc.name} label="restart" onPress={() => void restartService($, svc.name)} />
               <Button
                 key={'log-' + svc.name}
-                label="log"
+                label="output"
                 dimColor={logOf !== svc.name}
                 onPress={() => {
                   logOf = svc.name
                   redraw($)
                 }}
               />
+              <Button
+                key={'auto-' + svc.name}
+                label={autostart.includes(svc.name) ? '[x] autostart' : '[ ] autostart'}
+                plain
+                dimColor={!autostart.includes(svc.name)}
+                onPress={() => void toggleAutostart($, svc.name)}
+              />
             </Box>
           ))}
-          <Button
-            key="auto-restart"
-            label={`auto-restart ${services.queue.label.toLowerCase()} on PHP edits: ${autoRestartQueue ? 'on' : 'off'}`}
-            plain
-            dimColor
-            onPress={() => {
-              autoRestartQueue = !autoRestartQueue
-              redraw($)
-            }}
-          />
+          <Box flexDirection="row" columnGap={2} flexWrap="wrap">
+            {toggleButton('autoRestartQueue', 'restart queue on PHP edits')}
+            {hasPint && toggleButton('pintAfterTurn', 'Pint after each turn')}
+            {toggleButton('errorToasts', 'error toasts')}
+            {toggleButton('showBand', 'status band')}
+          </Box>
           <Text> </Text>
           <Text bold>{shown?.label ?? ''} output</Text>
-          {(shown?.lines.length ? shown.lines.slice(-(rows - Object.keys(services).length - 3)) : ['(no output yet)']).map(l =>
-            line(l, true),
-          )}
+          {(shown?.lines.length ? shown.lines.slice(-(rows - Object.keys(services).length - 4)) : ['(no output yet)']).map(l => line(l, true))}
+        </Box>
+      )
+    } else if (tab === 'queue') {
+      const avg = stats.done ? Math.round(stats.totalMs / stats.done) : 0
+      const failed = snapshot?.failed ?? []
+      const recent = jobs.slice(-Math.max(3, Math.floor((rows - 8) / 2)))
+      body = (
+        <Box flexDirection="column">
+          <Box flexDirection="row" columnGap={2}>
+            <Text>
+              {snapshot ? `connection ${snapshot.connection}` : snapshotLoading ? 'reading queue…' : 'queue state unknown'}
+            </Text>
+            {snapshot && (
+              <Text dimColor>{Object.entries(snapshot.sizes).map(([q, n]) => `${q}: ${n} pending`).join('  ')}</Text>
+            )}
+            <Button key="queue-refresh" label={snapshotAt ? `refresh (${ago(snapshotAt)} ago)` : 'refresh'} plain dimColor onPress={() => void refreshQueue($)} />
+          </Box>
+          {snapshot?.connection === 'sync' && line('QUEUE_CONNECTION=sync: jobs run inline during the request, so no worker is needed.', false, 'yellow')}
+          {snapshotError && line(snapshotError, false, 'red')}
+          <Text>
+            {`${services.queue.label}: ${services.queue.run ? 'running' : 'stopped'}  ·  ${stats.done} done  ·  ${stats.failed} failed${stats.done ? `  ·  avg ${avg}ms` : ''}`}
+          </Text>
+          <Text> </Text>
+          <Text bold>Recent jobs</Text>
+          {recent.length
+            ? recent.map(j =>
+                line(
+                  `${j.status === 'done' ? '✓' : j.status === 'failed' ? '✗' : '…'} ${clock(j.time)} ${shortClass(j.job)}${j.ms !== undefined ? `  ${Math.round(j.ms)}ms` : ''}`,
+                  j.status === 'done',
+                  j.status === 'failed' ? 'red' : j.status === 'running' ? 'yellow' : undefined,
+                ),
+              )
+            : line(services.queue.run ? 'Waiting for jobs…' : 'Start the worker (Services tab or /laravel-queue start) to see jobs here.', true)}
+          <Text> </Text>
+          <Box flexDirection="row" columnGap={2}>
+            <Text bold>{`Failed jobs (${snapshot?.failedTotal ?? 0})`}</Text>
+            {failed.length > 0 && <Button key="retry-all" label="retry all" plain onPress={() => void retryFailed($, 'all')} />}
+          </Box>
+          {failed.slice(0, Math.max(2, Math.floor((rows - recent.length - 8) / 2))).map(f => (
+            <Box flexDirection="column">
+              <Box flexDirection="row" columnGap={1}>
+                <Text color="red">✗</Text>
+                <Text bold>{shortClass(f.job)}</Text>
+                <Text dimColor>{`${f.queue} · ${f.failedAt}`}</Text>
+                <Button key={'retry-' + f.id} label="retry" plain onPress={() => void retryFailed($, f.id)} />
+                <Button key={'forget-' + f.id} label="forget" plain dimColor onPress={() => void forgetFailed($, f.id)} />
+                <Button key={'ask-' + f.id} label="ask Claude" plain onPress={() => askAboutFailedJob($, f)} />
+              </Box>
+              {line('  ' + exceptionHeadline(f.exception), true)}
+            </Box>
+          ))}
+        </Box>
+      )
+    } else if (tab === 'log') {
+      const list = filteredLog(logFilter)
+      const latestError = [...logState.entries].reverse().find(isError)
+      const filterButton = (id: typeof logFilter, label: string) => (
+        <Button
+          key={'filter-' + id}
+          label={label}
+          plain
+          dimColor={logFilter !== id}
+          onPress={() => {
+            logFilter = id
+            redraw($)
+          }}
+        />
+      )
+      body = (
+        <Box flexDirection="column">
+          <Box flexDirection="row" columnGap={2} flexWrap="wrap">
+            {filterButton('all', 'all')}
+            {filterButton('warnings', 'warnings+')}
+            {filterButton('errors', 'errors')}
+            {latestError && <Button key="ask-error" label="ask Claude about latest error" plain onPress={() => askAboutError($, latestError)} />}
+            <Button key="log-clear" label="clear log" plain dimColor onPress={() => void clearLog($)} />
+          </Box>
+          <Text dimColor>{`${logPath || 'storage/logs'} · ${logRun ? 'following' : 'not following'} · ${list.length} entries`}</Text>
+          {list.length === 0 && <Text dimColor>Nothing logged yet.</Text>}
+          {list.slice(-(rows - 2)).map(entry => {
+            const where = isError(entry) ? origin(entry, projectDir) : undefined
+            const color = isError(entry) ? 'red' : isWarning(entry) ? 'yellow' : undefined
+            return line(`${clock(entry.time)} ${entry.level.padEnd(8)} ${headline(entry)}${where ? `  (${where})` : ''}`, !color, color)
+          })}
         </Box>
       )
     } else if (tab === 'commands') {
@@ -524,16 +1067,18 @@ export const register: Register = on => {
               <Button key={'quick-' + q.key} label={q.label} hotkey={q.key} plain onPress={() => void runCommand($, q.label, q.argv)} />
             ))}
           </Box>
-          {Input && <Input
-            key="artisan-input"
-            label="artisan"
-            placeholder="make:model Post -m"
-            value=""
-            submitLabel="run"
-            onSubmit={value => {
-              if (value.trim()) void runCommand($, 'artisan ' + value, ['php', 'artisan', ...splitArgs(value), '--no-interaction'])
-            }}
-          />}
+          {Input && (
+            <Input
+              key="artisan-input"
+              label="artisan"
+              placeholder="make:model Post -m"
+              value=""
+              submitLabel="run"
+              onSubmit={value => {
+                if (value.trim()) void runCommand($, 'artisan ' + value, ['php', 'artisan', ...splitArgs(value), '--no-interaction'])
+              }}
+            />
+          )}
           <Text> </Text>
           {lastRun ? (
             <Box flexDirection="column">
@@ -551,57 +1096,52 @@ export const register: Register = on => {
       const shown = routes ? filterRoutes(routes, routeFilter) : []
       body = (
         <Box flexDirection="column">
-          {Input && <Input
-            key="route-filter"
-            label="filter"
-            placeholder="uri, name or controller"
-            value={routeFilter}
-            submitLabel="filter"
-            onInput={value => {
-              routeFilter = value
-              redraw($)
-            }}
-            onSubmit={value => {
-              routeFilter = value
-              redraw($)
-            }}
-          />}
+          {Input && (
+            <Input
+              key="route-filter"
+              label="filter"
+              placeholder="uri, name or controller"
+              value={routeFilter}
+              submitLabel="filter"
+              onInput={value => {
+                routeFilter = value
+                redraw($)
+              }}
+              onSubmit={value => {
+                routeFilter = value
+                redraw($)
+              }}
+            />
+          )}
           {!routes ? <Text dimColor>Loading routes…</Text> : <Text dimColor>{`${shown.length} of ${routes.length}`}</Text>}
           {shown.slice(0, rows - 3).map(r => line(formatRoute(r)))}
           <Button key="routes-refresh" label="refresh" plain dimColor onPress={() => void loadRoutes($)} />
         </Box>
       )
-    } else if (tab === 'log') {
-      body = (
-        <Box flexDirection="column">
-          <Box flexDirection="row" columnGap={2}>
-            <Button key="log-refresh" label="refresh" plain onPress={() => void loadLog($)} />
-            <Button
-              key="log-clear"
-              label="clear laravel.log"
-              plain
-              dimColor
-              onPress={async () => {
-                await $.fs.write('storage/logs/laravel.log', '')
-                await loadLog($)
-              }}
-            />
-          </Box>
-          {(appLog || 'Loading…').split('\n').slice(-(rows - 2)).map(l => line(l, true))}
-        </Box>
-      )
     } else {
       body = (
         <Box flexDirection="column">
+          {pendingMigrations > 0 && line(`${plural(pendingMigrations, 'pending migration')}: run /laravel-artisan migrate`, false, 'yellow')}
           {!about && <Text dimColor>Loading `php artisan about`…</Text>}
           {about &&
             Object.entries(about).map(([section, values]) => (
               <Box flexDirection="column">
                 <Text bold>{section}</Text>
-                {Object.entries(values ?? {}).map(([k, v]) => line(`  ${k.replace(/_/g, ' ')}: ${typeof v === 'object' ? JSON.stringify(v) : String(v)}`, true))}
+                {Object.entries(values ?? {}).map(([k, v]) =>
+                  line(`  ${k.replace(/_/g, ' ')}: ${typeof v === 'object' ? JSON.stringify(v) : String(v)}`, true),
+                )}
               </Box>
             ))}
-          <Button key="about-refresh" label="refresh" plain dimColor onPress={() => void loadAbout($)} />
+          <Button
+            key="about-refresh"
+            label="refresh"
+            plain
+            dimColor
+            onPress={() => {
+              void loadAbout($)
+              void checkMigrations($)
+            }}
+          />
         </Box>
       )
     }
