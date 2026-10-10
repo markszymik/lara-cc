@@ -5,7 +5,12 @@ import { LOG } from './fixtures'
 
 /** Stand in for a Laravel project on disk and for php/npm, so no real process runs.
  * Background work at start (log tail, migrate:status, queue snapshot) also lands in `ran`. */
-type Fake = { history?: string; live?: string; snapshot?: unknown }
+/** `herd`: the binary `herd php` reports; `shellPhp`: what plain `php` reports; `composerShim`: Composer on PATH is a shell script. */
+type Fake = { history?: string; live?: string; snapshot?: unknown; herd?: string; shellPhp?: string; composerShim?: boolean; spawned?: string[][] }
+
+const COMPOSER = '/opt/bin/composer'
+const HERD_BIN = '/Users/me/Library/Application Support/Herd/bin'
+const HERD_CLI = HERD_BIN + '/herd'
 
 /** What the fake `php artisan help <name>` resolves each (lower-cased) name to. */
 const HELP: Record<string, string> = {
@@ -23,7 +28,9 @@ const HELP: Record<string, string> = {
 function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
   mock.store(on)
   const clock = mock.clock(on)
-  on('fs.exists', ($, e) => ({ value: ['artisan', 'composer.json', 'pnpm-lock.yaml'].some(f => e.path === f || e.path.endsWith('/' + f)) }))
+  on('fs.exists', ($, e) => ({
+    value: ['artisan', 'composer.json', 'pnpm-lock.yaml'].some(f => e.path === f || e.path.endsWith('/' + f)) || [fake.herd, fake.shellPhp ?? '/usr/bin/php', COMPOSER, HERD_CLI].includes(e.path),
+  }))
   on('session.start', ($, e) => e)
   on('fs.read', () => ({ value: '{"require":{"laravel/framework":"^12.0"}}' }))
   on('command.register', () => ({ value: {} }))
@@ -33,6 +40,7 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
   on('fs.list', () => ({ value: [] }))
   // tail -F of the log: a quiet stream that ends at once
   on('process.spawn', async function* ($, e) {
+    fake.spawned?.push([...e.argv])
     if (e.argv[0] === 'tail' && fake.live) yield { stream: 'stdout' as const, text: fake.live }
     return { value: { code: 0, signal: null } }
   })
@@ -41,6 +49,13 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
     ran.push(argv)
     const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (argv[0] === 'tail') return ok(fake.history ?? '')
+    // Herd: which binary serves this folder, and Composer's path; without Herd there's no `herd` on PATH
+    const missing = { value: { exitCode: 1, stdout: '', stderr: 'not found', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (argv[0] === 'herd') return fake.herd ? ok(`${fake.herd}\n8.3.21`) : missing
+    if (argv.join(' ') === 'which herd') return fake.herd ? ok(HERD_CLI) : missing
+    if (argv.join(' ') === 'which composer') return ok(COMPOSER)
+    if (argv[0] === 'php' && argv[2]?.includes('PHP_BINARY')) return ok(`${fake.shellPhp ?? '/usr/bin/php'}\n8.4.1`)
+    if (argv[1] === COMPOSER && argv[2] === '--version') return ok(fake.composerShim ? '#!/usr/bin/env bash\nexec mise x -- composer "$@"' : 'Composer version 2.10.2')
     if (argv[0] === 'php' && argv[1] === '-r') return ok(fake.snapshot ? JSON.stringify(fake.snapshot) : 'no snapshot')
     // `artisan help <name>` resolves abbreviations and case the way Symfony does
     if (argv[2] === 'help') {
@@ -253,3 +268,54 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(JSON.stringify(await band.drawn())).not.toContain('new error')
   })
 }
+
+test('with Herd as the PATH php, artisan, composer and services run on the binary Herd serves the folder with', async ($, on) => {
+  const herd = HERD_BIN + '/php83'
+  const ran: string[][] = []
+  const spawned: string[][] = []
+  fakeProject(on, ran, { herd, shellPhp: HERD_BIN + '/php84', spawned })
+  await $.session.start({ cwd: '/app' })
+
+  await $.tool.call({ tool: 'mcp__laravel__artisan', command: 'migrate' })
+  expect(ran).toContainEqual([herd, 'artisan', 'help', 'migrate', '--format=json', '--no-interaction'])
+  expect(ran).toContainEqual([herd, 'artisan', 'migrate', '--no-interaction'])
+
+  await $.command.run({ command: 'laravel-composer', args: 'install' })
+  expect(ran).toContainEqual([herd, COMPOSER, 'install', '--no-interaction'])
+
+  const started = await $.tool.call({ tool: 'mcp__laravel__service', name: 'queue', action: 'start' })
+  expect(spawned).toContainEqual([herd, 'artisan', 'queue:work', '--tries=1'])
+  // Claude is told the binary that really runs, not `php`
+  expect(JSON.stringify(started)).toContain('php83 artisan queue:work')
+  expect(ran.some(argv => argv[0] === 'php' && argv[1] === 'artisan')).toBe(false)
+})
+
+test('with Herd installed but another php on PATH, the PATH php stays', async ($, on) => {
+  const ran: string[][] = []
+  fakeProject(on, ran, { herd: HERD_BIN + '/php83', shellPhp: '/opt/homebrew/bin/php' })
+  await $.session.start({ cwd: '/app' })
+
+  await $.tool.call({ tool: 'mcp__laravel__artisan', command: 'migrate' })
+  expect(ran).toContainEqual(['php', 'artisan', 'migrate', '--no-interaction'])
+  await $.command.run({ command: 'laravel-composer', args: 'install' })
+  expect(ran).toContainEqual(['composer', 'install', '--no-interaction'])
+})
+
+test('with Herd, a Composer that is a shell shim runs as is, not through PHP', async ($, on) => {
+  const ran: string[][] = []
+  fakeProject(on, ran, { herd: HERD_BIN + '/php83', shellPhp: HERD_BIN + '/php84', composerShim: true })
+  await $.session.start({ cwd: '/app' })
+
+  await $.command.run({ command: 'laravel-composer', args: 'install' })
+  expect(ran).toContainEqual(['composer', 'install', '--no-interaction'])
+})
+
+test('without Herd, php and composer come from PATH', async ($, on) => {
+  const ran: string[][] = []
+  fakeProject(on, ran)
+  await $.session.start({ cwd: '/app' })
+
+  await $.command.run({ command: 'laravel-composer', args: 'install' })
+  expect(ran).toContainEqual(['composer', 'install', '--no-interaction'])
+  expect(ran.some(argv => argv.join(' ') === 'which composer')).toBe(false)
+})

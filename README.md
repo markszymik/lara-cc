@@ -30,6 +30,8 @@ Start Claude Code from your Laravel project's root (the folder with `artisan`).
 
 **After Claude edits PHP.** The queue worker restarts so it runs the new code (on by default). Optionally, Pint formats the files Claude changed at the end of each turn (off by default).
 
+**Herd's PHP version.** When the `php` on your PATH is [Laravel Herd](https://herd.laravel.com)'s, artisan, Composer, Pint and the managed processes run on the PHP binary Herd serves your site with, so an isolated site (`herd isolate 8.3`) gets its own version even when `php` in your shell is another one. The Services tab shows which version, and says when your shell's `php` differs. If your PATH `php` comes from somewhere else (Homebrew, asdf), the mod keeps using it. The mod asks Herd only about the current folder: it reads no site list and no `.env`.
+
 **At start-up** it checks `migrate:status` and tells you about pending migrations.
 
 ## Commands
@@ -63,7 +65,7 @@ Toggles on the **Services** tab, remembered between sessions: restart queue on P
 
 ## Requirements
 
-macOS or Linux (log following uses `tail -F`), PHP on your `PATH`, and a Laravel app with `artisan` in the folder you start Claude Code from. Queue job tracking reads `queue:work` output; with Horizon you still get pending and failed jobs.
+macOS or Linux (log following uses `tail -F`), PHP on your `PATH` (or Herd), and a Laravel app with `artisan` in the folder you start Claude Code from. Queue job tracking reads `queue:work` output; with Horizon you still get pending and failed jobs.
 
 ## Customise
 

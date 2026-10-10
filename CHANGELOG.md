@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- When the PATH `php` is Laravel Herd's, artisan, Composer, Pint and the queue worker, scheduler and Horizon run on the PHP binary Herd serves the folder with, so isolated sites use their own PHP version; the Services tab shows it and flags when the shell's `php` differs.
+
 ### Security
 
 - Claude's `artisan` tool now asks artisan to resolve the command name before checking it, so abbreviations (`migr:fr`, `d:w`), odd casing (`MIGRATE:FRESH`) and leading options (`-q migrate:fresh`) can no longer bypass the destructive-command guard.

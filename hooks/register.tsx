@@ -113,6 +113,12 @@ let isLaravel = false
 let hasPint = false
 let pm = 'npm'
 
+// PHP: `php` from PATH, or the binary Herd serves this folder with (see detectPhp)
+let phpBin = 'php'
+let composerArgv = ['composer']
+let phpInfo = ''
+let phpReady: Promise<void> = Promise.resolve()
+
 let tab: Tab = 'services'
 let paneOpen = false
 let logOf = 'queue'
@@ -202,6 +208,73 @@ async function toggleAutostart($: Api, name: string) {
   await $.store.set('settings', settings)
 }
 
+// ─── PHP version ───────────────────────────────────────────────────────────
+
+/** The binary and version a PHP launch (`['php']`, `['herd', 'php']`) reports, or undefined when it doesn't run or answers oddly. */
+async function probePhp($: Api, argv: string[]): Promise<{ binary: string; version: string } | undefined> {
+  try {
+    const r = await $.process.run([...argv, '-r', 'echo PHP_BINARY, "\\n", PHP_VERSION;'], { timeoutMs: 15_000 })
+    // The last two lines: PHP may print warnings first
+    const [binary = '', version = ''] = r.stdout.trim().split(/\r?\n/).slice(-2).map(s => s.trim())
+    if (r.exitCode !== 0 || !binary.startsWith('/') || !/^\d+\.\d+\.\d+/.test(version) || !(await $.fs.exists(binary))) return undefined
+    return { binary, version }
+  } catch {
+    return undefined
+  }
+}
+
+/** The absolute path `which` finds for `name` on PATH, or ''. */
+async function onPath($: Api, name: string): Promise<string> {
+  const r = await $.process.run(['which', name], { timeoutMs: 5_000 }).catch(() => undefined)
+  const path = r?.exitCode === 0 ? r.stdout.trim() : ''
+  return path.startsWith('/') && (await $.fs.exists(path)) ? path : ''
+}
+
+const dirOf = (path: string) => path.slice(0, path.lastIndexOf('/'))
+
+/**
+ * When the `php` on PATH is Herd's, use the binary Herd serves this folder with instead (the site's isolated
+ * version), so artisan, composer and Pint run on the same PHP as the site. A PATH php from elsewhere (Homebrew,
+ * asdf) was chosen on purpose and stays. Herd is asked once: going through `herd php` on every call adds ~0.5s,
+ * and it doesn't pass signals on, so stopping a queue worker would leave PHP running.
+ * Asks only about this folder: reads no site list and no .env.
+ */
+async function detectPhp($: Api) {
+  const [herd, shell, hasHerd] = await Promise.all([probePhp($, ['herd', 'php']), probePhp($, ['php']), onPath($, 'herd')])
+  if (!herd) {
+    const using = shell ? `PHP ${shell.version} from PATH` : ''
+    phpInfo = hasHerd ? `Herd didn't say which PHP serves this folder${using ? `; using ${using}` : ''}` : using
+    return
+  }
+  if (shell && dirOf(shell.binary) !== dirOf(herd.binary)) {
+    phpInfo = `PHP ${shell.version} from PATH (not Herd's php, so Herd's site version isn't used)`
+    return
+  }
+  phpBin = herd.binary
+  phpInfo = `PHP ${herd.version} · Herd` + (shell && shell.binary !== herd.binary ? ` (isolated; php in your shell is ${shell.version})` : '')
+
+  // As `herd composer` does, run Composer on the site's PHP; only when it really is a PHP script (not an asdf/mise shim)
+  const composer = await onPath($, 'composer')
+  if (!composer) return
+  const r = await $.process.run([herd.binary, composer, '--version', '--no-ansi'], { timeoutMs: 15_000 }).catch(() => undefined)
+  if (r?.exitCode === 0 && /^Composer version/m.test(r.stdout)) composerArgv = [herd.binary, composer]
+}
+
+/** `argv` with php, composer and Pint run on the PHP that serves this folder. */
+function withPhp(argv: string[]): string[] {
+  const [cmd = '', ...rest] = argv
+  if (cmd === 'php') return [phpBin, ...rest]
+  if (cmd === 'composer') return [...composerArgv, ...rest]
+  if (cmd === 'vendor/bin/pint' && phpBin !== 'php') return [phpBin, cmd, ...rest]
+  return argv
+}
+
+/** `$.process.run`, once the PHP binary is known, with `withPhp` applied. */
+async function runPhp($: Api, argv: string[], init: { timeoutMs: number }) {
+  await phpReady
+  return $.process.run(withPhp(argv), init)
+}
+
 // ─── One-shot commands ─────────────────────────────────────────────────────
 
 /** Run a command, keep its output for the Commands tab, and return it. */
@@ -209,7 +282,7 @@ async function runCommand($: Api, label: string, argv: string[], timeoutMs = 600
   lastRun = { label, isRunning: true, output: '' }
   redraw($)
   try {
-    const r = await $.process.run(argv, { timeoutMs })
+    const r = await runPhp($, argv, { timeoutMs })
     const output = stripAnsi([r.stdout, r.stderr].filter(Boolean).join('\n')).trim()
     lastRun = { label, isRunning: false, exitCode: r.exitCode, output: tail(output) }
   } catch (err) {
@@ -233,7 +306,7 @@ async function checkArtisan($: Api, argv: string[]): Promise<{ refused?: string;
   if (options.length) return { refused: `${options.join(' ')} can destroy data or point at another environment` }
   const name = artisanCommandName(argv)
   if (name === undefined) return {}
-  const r = await $.process.run(['php', 'artisan', 'help', name, '--format=json', '--no-interaction'], { timeoutMs: 60_000 })
+  const r = await runPhp($, ['php', 'artisan', 'help', name, '--format=json', '--no-interaction'], { timeoutMs: 60_000 })
   const resolved = r.exitCode === 0 ? helpName(r.stdout) : undefined
   if (!resolved) {
     const output = stripAnsi([r.stdout, r.stderr].filter(Boolean).join('\n')).trim()
@@ -264,13 +337,16 @@ function onServiceOutput($: Api, svc: Service, text: string) {
   redraw($)
 }
 
-function startService($: Api, name: string): string {
+async function startService($: Api, name: string): Promise<string> {
   const svc = services[name]
   if (!svc) return `Unknown service "${name}". Known: ${Object.keys(services).join(', ')}`
+  await phpReady
+  // Nothing awaits between this check and the spawn, so two quick starts can't both get through
   if (svc.run) return `${svc.label} is already running.`
 
-  const stream = $.process.spawn({ argv: svc.argv })
-  svc.lines.push(`$ ${svc.argv.join(' ')}`)
+  const argv = withPhp(svc.argv)
+  const stream = $.process.spawn({ argv })
+  svc.lines.push(`$ ${argv.join(' ')}`)
   svc.startedAt = Date.now()
   svc.partial = ''
 
@@ -303,12 +379,14 @@ function startService($: Api, name: string): string {
   })()
 
   redraw($)
-  return `${svc.label} started: ${svc.argv.join(' ')}`
+  return `${svc.label} started: ${argv.join(' ')}`
 }
 
 async function stopService($: Api, name: string): Promise<string> {
   const svc = services[name]
   if (!svc) return `Unknown service "${name}".`
+  // A start waiting on phpReady goes first, so this sees (and stops) what it spawns
+  await phpReady
   const run = svc.run
   if (!run) return `${svc.label} is not running.`
   svc.lines.push('… stopping')
@@ -327,7 +405,7 @@ async function stopService($: Api, name: string): Promise<string> {
 
 async function restartService($: Api, name: string): Promise<string> {
   if (services[name]?.run) await stopService($, name)
-  return startService($, name).replace('started', 'restarted')
+  return (await startService($, name)).replace('started', 'restarted')
 }
 
 async function serviceAction($: Api, name: string, action: string): Promise<string> {
@@ -374,7 +452,7 @@ async function refreshQueue($: Api) {
   snapshotLoading = true
   redraw($)
   try {
-    const r = await $.process.run(['php', '-r', snapshotPhp(queuesOf(services.queue.argv))], { timeoutMs: 30_000 })
+    const r = await runPhp($, ['php', '-r', snapshotPhp(queuesOf(services.queue.argv))], { timeoutMs: 30_000 })
     const parsed = parseSnapshot(r.stdout)
     if (parsed) {
       snapshot = parsed
@@ -561,7 +639,7 @@ async function clearLog($: Api) {
 
 async function loadRoutes($: Api): Promise<Route[] | string> {
   try {
-    const r = await $.process.run(['php', 'artisan', 'route:list', '--json'], { timeoutMs: 60_000 })
+    const r = await runPhp($, ['php', 'artisan', 'route:list', '--json'], { timeoutMs: 60_000 })
     if (r.exitCode !== 0) return stripAnsi(r.stderr || r.stdout)
     const list = JSON.parse(r.stdout) as Route[]
     routes = list.map(x => ({ method: x.method, uri: x.uri, name: x.name, action: x.action }))
@@ -585,7 +663,7 @@ function formatRoute(r: Route): string {
 
 async function loadAbout($: Api) {
   try {
-    const r = await $.process.run(['php', 'artisan', 'about', '--json'], { timeoutMs: 60_000 })
+    const r = await runPhp($, ['php', 'artisan', 'about', '--json'], { timeoutMs: 60_000 })
     if (r.exitCode === 0) about = JSON.parse(r.stdout)
   } catch {
     about = undefined
@@ -595,7 +673,7 @@ async function loadAbout($: Api) {
 
 async function checkMigrations($: Api) {
   try {
-    const r = await $.process.run(['php', 'artisan', 'migrate:status', '--no-ansi'], { timeoutMs: 60_000 })
+    const r = await runPhp($, ['php', 'artisan', 'migrate:status', '--no-ansi'], { timeoutMs: 60_000 })
     if (r.exitCode !== 0) return
     pendingMigrations = r.stdout.split('\n').filter(l => /\bPending\b/.test(l)).length
     if (pendingMigrations) toast($, `${plural(pendingMigrations, 'pending migration')}. Run /laravel-artisan migrate`)
@@ -608,7 +686,13 @@ async function checkMigrations($: Api) {
 async function detectProject($: Api) {
   projectDir = await $.session.cwd()
   isLaravel = await $.fs.exists('artisan')
+  // Module state outlives a session: don't carry another folder's PHP over
+  phpBin = 'php'
+  composerArgv = ['composer']
+  phpInfo = ''
   if (!isLaravel) return
+  // In the background: PHP launches wait for it, session start doesn't
+  phpReady = detectPhp($).then(() => redraw($))
   hasPint = await $.fs.exists('vendor/bin/pint')
 
   if (await $.fs.exists('bun.lock')) pm = 'bun'
@@ -669,7 +753,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'artisan',
       description:
-        'Run a Laravel artisan command in the project and return its output, e.g. "route:list --path=api", "make:model Post -m", "db:show", "model:show User". Refuses commands that can destroy data or run arbitrary code (migrate:fresh/rollback, db:wipe, db:seed, tinker, --force, --env…); ask the user to run those.',
+        'Run a Laravel artisan command in the project and return its output, e.g. "route:list --path=api", "make:model Post -m", "db:show", "model:show User". Runs on the PHP version the site uses (Herd\'s isolated one, when set), which can differ from `php` in Bash. Refuses commands that can destroy data or run arbitrary code (migrate:fresh/rollback, db:wipe, db:seed, tinker, --force, --env…); ask the user to run those.',
       inputSchema: {
         type: 'object',
         properties: { command: { type: 'string', description: 'Everything after `php artisan`' } },
@@ -729,7 +813,7 @@ export const register: Register = on => {
       void watchLog($)
       void checkMigrations($)
       void refreshQueue($)
-      for (const name of settings.autostart[projectDir] ?? []) if (services[name]) startService($, name)
+      for (const name of settings.autostart[projectDir] ?? []) if (services[name]) void startService($, name)
       // Pick up a new daily log file, and keep the Queue tab current while it's showing
       $.clock.every(60_000, () => void watchLog($))
       $.clock.every(15_000, () => {
@@ -888,7 +972,7 @@ export const register: Register = on => {
       if (settings.pintAfterTurn && hasPint && files.length) {
         void (async () => {
           try {
-            const r = await $.process.run(['vendor/bin/pint', ...files], { timeoutMs: 120_000 })
+            const r = await runPhp($, ['vendor/bin/pint', ...files], { timeoutMs: 120_000 })
             $.ui.log(r.exitCode === 0 ? `laravel: Pint formatted ${plural(files.length, 'file')}` : `laravel: Pint failed: ${stripAnsi(r.stdout + r.stderr).trim().slice(0, 300)}`)
           } catch (err) {
             $.ui.log('laravel: Pint failed: ' + String(err))
@@ -984,6 +1068,7 @@ export const register: Register = on => {
       const autostart = settings.autostart[projectDir] ?? []
       body = (
         <Box flexDirection="column">
+          {phpInfo && <Text dimColor>{phpInfo}</Text>}
           {Object.values(services).map(svc => (
             <Box flexDirection="row" columnGap={1}>
               <Text color={svc.run ? 'green' : undefined} dimColor={!svc.run}>
