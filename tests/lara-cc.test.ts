@@ -105,6 +105,11 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
     if (argv[0] === 'curl') return { value: { exitCode: fake.curl ?? 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv.join(' ') === 'php artisan about --json') return ok(JSON.stringify({ environment: { environment: fake.env ?? 'local' } }))
     if (argv[0] === 'plutil') return argv.at(-1) === HERD_PLIST && fake.herdServices ? ok(JSON.stringify(fake.herdServices)) : missing
+    // Herd starts the service: its port answers from then on
+    if (argv[0] === 'osascript') {
+      fake.closed = fake.closed?.filter(port => port !== Number(argv.at(-2)))
+      return ok('')
+    }
     if (argv[0] === 'nc') return { value: { exitCode: fake.closed?.includes(Number(argv.at(-1))) ? 1 : 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     // Herd: which binary serves this folder, and Composer's path; without Herd there's no `herd` on PATH
     if (argv[0] === 'herd') return fake.herd ? ok(`${fake.herd}\n8.3.21`) : missing
@@ -539,4 +544,31 @@ test('the artisan tool refuses commands that print secrets', async ($, on) => {
   const typed = JSON.stringify(await $.command.run({ command: 'lara-artisan', args: 'config:show database', origin: { kind: 'composer' } } as never))
   expect(typed).toContain('own terminal')
   expect(ran.some(argv => argv.includes('config:show') && !argv.includes('help'))).toBe(false)
+})
+
+test('a stopped Herd service starts from its button on the Services tab, with values passed as arguments', async ($, on) => {
+  const ran: string[][] = []
+  const connections = [{ use: 'database', driver: 'mysql', port: 3306 }]
+  const clock = fakeProject(on, ran, { connections, herdServices: [MYSQL], closed: [3306] })
+  on('ui.open', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+  expect(await drawBand($)).toContain('Herd MySQL stopped')
+
+  const pane = await $.ui.mount({
+    plugin: 'lara-cc',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'lara',
+    props: { title: 'lara-cc', isFocused: true, bodyColumns: 100, placement: 'dock' } as never,
+  })
+  await pane.press({ key: 'tab-services' })
+  await pane.press({ key: 'herd-start-3306' })
+  await clock.settle()
+
+  const osascript = ran.find(argv => argv[0] === 'osascript')!
+  expect(osascript.slice(-3)).toEqual(['mysql', '3306', '8.4.11'])
+  // The script text is fixed: nothing from the plist is written into it
+  expect(osascript.filter((_, i) => osascript[i - 1] === '-e').join('\n')).not.toContain('mysql')
+  expect(await drawBand($)).not.toContain('stopped')
 })

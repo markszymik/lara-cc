@@ -164,6 +164,8 @@ let depsChecks: Check[] = []
 let herdList: (HerdService & { up: boolean })[] = []
 let herdSeen = -2
 let herdInstalled: HerdService[] = []
+// Ports of the Herd services a start button is starting, so it reads "starting…" meanwhile
+const herdStarting = new Set<number>()
 // The driver and port of each local server the app's config connects to (see connectionsPhp), read with `about`
 let connections: AppConnection[] = []
 
@@ -837,8 +839,39 @@ async function checkHerd($: Api): Promise<Check[]> {
     .map(({ service: s, driver, uses }) => ({
       band: `Herd ${s.name} stopped`,
       color: 'red' as const,
-      detail: `The app's ${uses.join(', ')} uses ${driver} on port ${s.port}, and Herd's ${s.name} ${s.version} there isn't running, so anything that needs it fails. Start it in Herd → Services.`,
+      detail: `The app's ${uses.join(', ')} uses ${driver} on port ${s.port}, and Herd's ${s.name} ${s.version} there isn't running, so anything that needs it fails. Press start next to it below, or start it in Herd → Services.`,
     }))
+}
+
+/**
+ * Start a Herd service: the Services tab's start button, so only ever the person's press, never Claude's.
+ * Uses Herd's own AppleScript command (as Herd's MCP server does), with the type, port and version passed
+ * as arguments rather than written into the script. macOS asks once whether the terminal may control Herd.
+ */
+async function startHerdService($: Api, s: HerdService) {
+  if (herdStarting.has(s.port)) return
+  herdStarting.add(s.port)
+  redraw($)
+  try {
+    const script = ['on run argv', 'tell application "Herd" to start extraservice (item 1 of argv) port (item 2 of argv) version (item 3 of argv)', 'end run']
+    const r = await $.process.run(['osascript', ...script.flatMap(line => ['-e', line]), s.type, String(s.port), s.version], { timeoutMs: 60_000 })
+    if (r.exitCode !== 0) {
+      $.ui.toast(`Herd couldn't start ${s.name}: ${stripAnsi(r.stderr).trim().slice(0, 200) || 'exit ' + r.exitCode}`, { timeoutMs: 8000 })
+      return
+    }
+    // Herd answers before the server listens
+    let up = await listening($, s.port)
+    for (let i = 0; i < 20 && !up; i++) {
+      await $.clock.sleep(500)
+      up = await listening($, s.port)
+    }
+    $.ui.toast(up ? `Herd ${s.name} is running` : `Herd ${s.name} hasn't started yet; check Herd → Services`, { timeoutMs: 6000 })
+  } catch (err) {
+    $.ui.toast(`Herd couldn't start ${s.name}: ${String(err)}`, { timeoutMs: 8000 })
+  } finally {
+    herdStarting.delete(s.port)
+    void checkHealth($)
+  }
 }
 
 /** What Herd's services.plist lists; empty without Herd. A half-written plist keeps the last read and is read again next time. */
@@ -1341,7 +1374,7 @@ export const register: Register = on => {
     if (tab === 'services') {
       const shown = services[logOf]
       const autostart = settings.autostart[projectDir] ?? []
-      const herdText = herdList.map(s => `○ ${s.name} ${s.version} :${s.port}`)
+      const herdText = herdList.map(s => `○ ${s.name} ${s.version} :${s.port}` + (s.up ? '' : ' starting…'))
       // The Herd row wraps on a narrow pane
       const herdRows = herdList.length ? Math.ceil(['Herd services', ...herdText].join('  ').length / width) : 0
       body = (
@@ -1350,11 +1383,21 @@ export const register: Register = on => {
           {herdList.length > 0 && (
             <Box flexDirection="row" columnGap={2} flexWrap="wrap">
               <Text dimColor>Herd services</Text>
-              {herdList.map((s, i) => (
-                <Text color={s.up ? 'green' : undefined} dimColor={!s.up}>
-                  {s.up ? '●' + herdText[i]!.slice(1) : herdText[i]}
-                </Text>
-              ))}
+              {herdList.map(s =>
+                s.up ? (
+                  <Text color="green">{`● ${s.name} ${s.version} :${s.port}`}</Text>
+                ) : (
+                  <Box flexDirection="row" columnGap={1}>
+                    <Text dimColor>{`○ ${s.name} ${s.version} :${s.port}`}</Text>
+                    <Button
+                      key={'herd-start-' + s.port}
+                      label={herdStarting.has(s.port) ? 'starting…' : 'start'}
+                      dimColor={herdStarting.has(s.port)}
+                      onPress={() => void startHerdService($, s)}
+                    />
+                  </Box>
+                ),
+              )}
             </Box>
           )}
           {checks.map(c => (

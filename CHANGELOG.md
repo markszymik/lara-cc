@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-10
+
+### Added
+
+- A **start** button next to each stopped Herd service on the Services tab, through Herd's AppleScript command with the service's type, port and version passed as arguments. Only the person's press starts one; Claude has no tool for it.
+
 ## [0.6.0] - 2026-10-10
 
 ### Added
