@@ -1,0 +1,10 @@
+{
+  "name": "laravel",
+  "version": "0.1.0",
+  "description": "Unofficial Laravel mod for Claude Code (not affiliated with Laravel): a /laravel pane, managed queue/vite/scheduler processes, artisan, routes, npm and composer commands, and tools Claude can call",
+  "author": { "name": "Mark Szymik", "url": "https://github.com/markszymik" },
+  "homepage": "https://github.com/markszymik/claude-code-laravel",
+  "repository": "https://github.com/markszymik/claude-code-laravel",
+  "license": "MIT",
+  "keywords": ["laravel", "php", "artisan", "queue", "vite", "unofficial"]
+}

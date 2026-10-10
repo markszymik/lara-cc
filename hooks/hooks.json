@@ -1,0 +1,4 @@
+{
+  "description": "Laravel mod hooks module",
+  "modules": ["./register.tsx"]
+}
