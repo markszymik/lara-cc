@@ -26,17 +26,17 @@ import {
 import type { FailedJob, LogEntry, QueueSnapshot } from './parse'
 
 /**
- * Unofficial Laravel mod for Claude Code. Not affiliated with or endorsed by Laravel or Anthropic.
+ * lara-cc: an unofficial Claude Code mod for Laravel apps. Not affiliated with or endorsed by Laravel LLC or Anthropic.
  *
- *   /laravel [tab]             open the pane (services, queue, log, routes, commands, about)
- *   /laravel-artisan <args>    run `php artisan <args>`; output lands in the transcript for Claude
- *   /laravel-queue [start|stop|restart|logs|status|failed|retry <id|all>]
- *   /laravel-vite|-schedule [start|stop|restart|logs]
- *   /laravel-logs [errors|warnings|all] [count]
- *   /laravel-test [args]       php artisan test
- *   /laravel-routes [filter]   route list
- *   /laravel-npm <script>      `npm run <script>` (pnpm / yarn / bun detected from the lockfile)
- *   /laravel-composer <args>   run composer
+ *   /lara [tab]             open the pane (services, queue, log, routes, commands, about)
+ *   /lara-artisan <args>    run `php artisan <args>`; output lands in the transcript for Claude
+ *   /lara-queue [start|stop|restart|logs|status|failed|retry <id|all>]
+ *   /lara-vite|-schedule [start|stop|restart|logs]
+ *   /lara-logs [errors|warnings|all] [count]
+ *   /lara-test [args]       php artisan test
+ *   /lara-routes [filter]   route list
+ *   /lara-npm <script>      `npm run <script>` (pnpm / yarn / bun detected from the lockfile)
+ *   /lara-composer <args>   run composer
  *
  * Claude gets tools: artisan, service, routes, logs and queue.
  */
@@ -66,7 +66,7 @@ const QUICK: { key: string; label: string; argv: string[] }[] = [
 /**
  * Artisan commands Claude's tool refuses, however they're spelled: artisan itself resolves the name first,
  * so `migr:fr` or `MIGRATE:FRESH` count as migrate:fresh. `tinker` is here because it runs any PHP.
- * You can still run them yourself with /laravel-artisan.
+ * You can still run them yourself with /lara-artisan.
  */
 const DESTRUCTIVE = [
   'migrate:fresh', 'migrate:reset', 'migrate:refresh', 'migrate:rollback', 'db:wipe', 'db:seed', 'key:generate', 'down',
@@ -80,7 +80,7 @@ const DESTRUCTIVE = [
  */
 const DESTRUCTIVE_OPTIONS = ['--force', '-f', '--env', '--prune', '--seed', '--seeder']
 
-const PANE = 'laravel'
+const PANE = 'lara'
 const MAX_SERVICE_LINES = 400
 const TOAST_GAP_MS = 5000
 
@@ -183,7 +183,7 @@ async function openPane($: Api, on: Tab) {
   if (on === 'routes' && !routes) void loadRoutes($)
   if (on === 'queue') void refreshQueue($)
   paneOpen = true
-  await $.ui.open({ id: PANE, title: 'Laravel', focus: true, closeOnEscape: true })
+  await $.ui.open({ id: PANE, title: 'lara-cc', focus: true, closeOnEscape: true })
   redraw($)
 }
 
@@ -676,7 +676,7 @@ async function checkMigrations($: Api) {
     const r = await runPhp($, ['php', 'artisan', 'migrate:status', '--no-ansi'], { timeoutMs: 60_000 })
     if (r.exitCode !== 0) return
     pendingMigrations = r.stdout.split('\n').filter(l => /\bPending\b/.test(l)).length
-    if (pendingMigrations) toast($, `${plural(pendingMigrations, 'pending migration')}. Run /laravel-artisan migrate`)
+    if (pendingMigrations) toast($, `${plural(pendingMigrations, 'pending migration')}. Run /lara-artisan migrate`)
     redraw($)
   } catch {
     // no database yet: nothing to report
@@ -720,8 +720,8 @@ async function detectProject($: Api) {
 
 // ─── The mod ───────────────────────────────────────────────────────────────
 
-const commandFailed = (_$: Api, _e: unknown, next: { error: { message?: string } }) => ({ text: 'laravel: ' + (next.error.message ?? 'failed') })
-const toolFailed = (_$: Api, _e: unknown, next: { error: { message?: string } }) => ({ result: 'laravel: ' + (next.error.message ?? 'failed') })
+const commandFailed = (_$: Api, _e: unknown, next: { error: { message?: string } }) => ({ text: 'lara-cc: ' + (next.error.message ?? 'failed') })
+const toolFailed = (_$: Api, _e: unknown, next: { error: { message?: string } }) => ({ result: 'lara-cc: ' + (next.error.message ?? 'failed') })
 
 const TABS: Tab[] = ['services', 'queue', 'log', 'routes', 'commands', 'about']
 
@@ -731,22 +731,22 @@ export const register: Register = on => {
     await detectProject($)
 
     const commands = [
-      { name: 'laravel', description: 'Open the Laravel pane', argumentHint: '[services|queue|log|routes|commands|about]', immediate: true as const },
-      { name: 'laravel-artisan', description: 'Run php artisan <args>', argumentHint: '<command> [args]' },
-      { name: 'laravel-queue', description: 'Queue worker and failed jobs', argumentHint: '[start|stop|restart|logs|status|failed|retry <id|all>]', immediate: true as const },
-      { name: 'laravel-vite', description: 'Vite dev server: start, stop, restart, logs', argumentHint: '[start|stop|restart|logs]', immediate: true as const },
-      { name: 'laravel-schedule', description: 'Scheduler (schedule:work): start, stop, restart, logs', argumentHint: '[start|stop|restart|logs]', immediate: true as const },
-      { name: 'laravel-logs', description: 'Recent entries from storage/logs', argumentHint: '[errors|warnings|all] [count]', immediate: true as const },
-      { name: 'laravel-test', description: 'Run php artisan test', argumentHint: '[--filter=Name] [args]' },
-      { name: 'laravel-routes', description: 'List routes, optionally filtered', argumentHint: '[filter]' },
-      { name: 'laravel-npm', description: 'Run a package.json script (npm/pnpm/yarn/bun)', argumentHint: '<script>' },
-      { name: 'laravel-composer', description: 'Run composer <args>', argumentHint: '<args>' },
+      { name: 'lara', description: 'Open the lara-cc pane', argumentHint: '[services|queue|log|routes|commands|about]', immediate: true as const },
+      { name: 'lara-artisan', description: 'Run php artisan <args>', argumentHint: '<command> [args]' },
+      { name: 'lara-queue', description: 'Queue worker and failed jobs', argumentHint: '[start|stop|restart|logs|status|failed|retry <id|all>]', immediate: true as const },
+      { name: 'lara-vite', description: 'Vite dev server: start, stop, restart, logs', argumentHint: '[start|stop|restart|logs]', immediate: true as const },
+      { name: 'lara-schedule', description: 'Scheduler (schedule:work): start, stop, restart, logs', argumentHint: '[start|stop|restart|logs]', immediate: true as const },
+      { name: 'lara-logs', description: 'Recent entries from storage/logs', argumentHint: '[errors|warnings|all] [count]', immediate: true as const },
+      { name: 'lara-test', description: 'Run php artisan test', argumentHint: '[--filter=Name] [args]' },
+      { name: 'lara-routes', description: 'List routes, optionally filtered', argumentHint: '[filter]' },
+      { name: 'lara-npm', description: 'Run a package.json script (npm/pnpm/yarn/bun)', argumentHint: '<script>' },
+      { name: 'lara-composer', description: 'Run composer <args>', argumentHint: '<args>' },
     ]
     for (const command of commands) {
       try {
         await $.command.register(command)
       } catch (err) {
-        $.ui.log(`laravel: could not register /${command.name}: ${String(err)}`)
+        $.ui.log(`lara-cc: could not register /${command.name}: ${String(err)}`)
       }
     }
 
@@ -826,16 +826,16 @@ export const register: Register = on => {
 
   // ── Slash commands ──
 
-  on('command.run', { command: 'laravel' }, async ($, e) => {
+  on('command.run', { command: 'lara' }, async ($, e) => {
     if (!isLaravel) return { text: notLaravel() }
     const wanted = e.args.trim().toLowerCase() as Tab
     await openPane($, TABS.includes(wanted) ? wanted : tab)
     return {}
   }).catch(commandFailed)
 
-  on('command.run', { command: 'laravel-artisan' }, async ($, e) => {
+  on('command.run', { command: 'lara-artisan' }, async ($, e) => {
     if (!isLaravel) return { text: notLaravel() }
-    if (!e.args.trim()) return { text: 'Usage: /laravel-artisan <command> [args], e.g. /laravel-artisan make:model Post -m' }
+    if (!e.args.trim()) return { text: 'Usage: /lara-artisan <command> [args], e.g. /lara-artisan make:model Post -m' }
     // Unguarded only when the person typed it; a relayed message gets the same check as Claude's tool
     if (!fromUser(e.origin)) {
       const check = await checkArtisan($, splitArgs(e.args))
@@ -846,24 +846,24 @@ export const register: Register = on => {
     return { text: formatRun(run) }
   }).catch(commandFailed)
 
-  on('command.run', { command: 'laravel-queue' }, async ($, e) => {
+  on('command.run', { command: 'lara-queue' }, async ($, e) => {
     if (!isLaravel) return { text: notLaravel() }
     const [action = 'status', id = ''] = splitArgs(e.args)
     if (action === 'failed') {
       await refreshQueue($)
       return { text: snapshot ? `${plural(snapshot.failedTotal, 'failed job')}:\n` + formatFailed(snapshot.failed, 3) : snapshotError }
     }
-    if (action === 'retry') return { text: id ? await retryFailed($, id) : 'Usage: /laravel-queue retry <id|all>' }
+    if (action === 'retry') return { text: id ? await retryFailed($, id) : 'Usage: /lara-queue retry <id|all>' }
     if (action === 'status') await refreshQueue($)
     return { text: await serviceAction($, 'queue', action) }
   }).catch(commandFailed)
 
-  on('command.run', { command: ['laravel-vite', 'laravel-schedule'] }, async ($, e) => {
+  on('command.run', { command: ['lara-vite', 'lara-schedule'] }, async ($, e) => {
     if (!isLaravel) return { text: notLaravel() }
-    return { text: await serviceAction($, e.command.replace('laravel-', ''), e.args.trim() || 'status') }
+    return { text: await serviceAction($, e.command.replace('lara-', ''), e.args.trim() || 'status') }
   }).catch(commandFailed)
 
-  on('command.run', { command: 'laravel-logs' }, async ($, e) => {
+  on('command.run', { command: 'lara-logs' }, async ($, e) => {
     if (!isLaravel) return { text: notLaravel() }
     const args = splitArgs(e.args)
     const filter = (['errors', 'warnings', 'all'].find(f => args.includes(f)) ?? 'errors') as 'errors' | 'warnings' | 'all'
@@ -874,13 +874,13 @@ export const register: Register = on => {
     return { text: logsText(filter, count) }
   }).catch(commandFailed)
 
-  on('command.run', { command: 'laravel-test' }, async ($, e) => {
+  on('command.run', { command: 'lara-test' }, async ($, e) => {
     if (!isLaravel) return { text: notLaravel() }
     const run = await runCommand($, 'test ' + e.args, ['php', 'artisan', 'test', ...splitArgs(e.args)])
     return { text: formatRun(run) }
   }).catch(commandFailed)
 
-  on('command.run', { command: 'laravel-routes' }, async ($, e) => {
+  on('command.run', { command: 'lara-routes' }, async ($, e) => {
     if (!isLaravel) return { text: notLaravel() }
     const list = await loadRoutes($)
     if (typeof list === 'string') return { text: list }
@@ -889,37 +889,37 @@ export const register: Register = on => {
     return { text: tail(`${shown.length} of ${list.length} routes\n` + shown.map(formatRoute).join('\n')) }
   }).catch(commandFailed)
 
-  on('command.run', { command: 'laravel-npm' }, async ($, e) => {
+  on('command.run', { command: 'lara-npm' }, async ($, e) => {
     const script = e.args.trim() || 'build'
     return { text: formatRun(await runCommand($, `${pm} run ${script}`, [pm, 'run', ...splitArgs(script)])) }
   }).catch(commandFailed)
 
-  on('command.run', { command: 'laravel-composer' }, async ($, e) => {
-    if (!e.args.trim()) return { text: 'Usage: /laravel-composer <args>, e.g. /laravel-composer require laravel/pail' }
+  on('command.run', { command: 'lara-composer' }, async ($, e) => {
+    if (!e.args.trim()) return { text: 'Usage: /lara-composer <args>, e.g. /lara-composer require laravel/pail' }
     return { text: formatRun(await runCommand($, 'composer ' + e.args, ['composer', ...splitArgs(e.args), '--no-interaction'])) }
   }).catch(commandFailed)
 
   // ── Tools for Claude ──
 
-  on('tool.call', { tool: 'mcp__laravel__artisan' }, async ($, e) => {
+  on('tool.call', { tool: 'mcp__lara-cc__artisan' }, async ($, e) => {
     if (!isLaravel) return { result: notLaravel() }
     const command = String((e as unknown as { command?: string }).command ?? '').trim()
     const check = await checkArtisan($, splitArgs(command))
     if (check.refused) {
-      return { result: `Refused: ${check.refused}. Ask the user to run it themselves with /laravel-artisan ${command}` }
+      return { result: `Refused: ${check.refused}. Ask the user to run it themselves with /lara-artisan ${command}` }
     }
     if (check.error) return { result: check.error }
     const run = await runCommand($, 'artisan ' + command, ['php', 'artisan', ...splitArgs(command), '--no-interaction'], 300_000)
     return { result: formatRun(run) }
   }).catch(toolFailed)
 
-  on('tool.call', { tool: 'mcp__laravel__service' }, async ($, e) => {
+  on('tool.call', { tool: 'mcp__lara-cc__service' }, async ($, e) => {
     if (!isLaravel) return { result: notLaravel() }
     const args = e as unknown as { name?: string; action?: string }
     return { result: await serviceAction($, String(args.name), String(args.action ?? 'status')) }
   }).catch(toolFailed)
 
-  on('tool.call', { tool: 'mcp__laravel__logs' }, async ($, e) => {
+  on('tool.call', { tool: 'mcp__lara-cc__logs' }, async ($, e) => {
     if (!isLaravel) return { result: notLaravel() }
     const args = e as unknown as { level?: string; count?: number }
     const level = (['errors', 'warnings', 'all'].includes(String(args.level)) ? args.level : 'errors') as 'errors' | 'warnings' | 'all'
@@ -927,7 +927,7 @@ export const register: Register = on => {
     return { result: logsText(level, Math.min(50, Math.max(1, Number(args.count) || 5))) }
   }).catch(toolFailed)
 
-  on('tool.call', { tool: 'mcp__laravel__queue' }, async ($, e) => {
+  on('tool.call', { tool: 'mcp__lara-cc__queue' }, async ($, e) => {
     if (!isLaravel) return { result: notLaravel() }
     const args = e as unknown as { action?: string; id?: string }
     if (args.action === 'retry') return { result: args.id ? await retryFailed($, String(args.id)) : 'Give the failed job id, or "all".' }
@@ -939,7 +939,7 @@ export const register: Register = on => {
     return { result: [worker, queueSummary(), snapshotError ? 'Note: ' + snapshotError : ''].filter(Boolean).join('\n') }
   }).catch(toolFailed)
 
-  on('tool.call', { tool: 'mcp__laravel__routes' }, async ($, e) => {
+  on('tool.call', { tool: 'mcp__lara-cc__routes' }, async ($, e) => {
     if (!isLaravel) return { result: notLaravel() }
     const list = await loadRoutes($)
     if (typeof list === 'string') return { result: list }
@@ -973,9 +973,9 @@ export const register: Register = on => {
         void (async () => {
           try {
             const r = await runPhp($, ['vendor/bin/pint', ...files], { timeoutMs: 120_000 })
-            $.ui.log(r.exitCode === 0 ? `laravel: Pint formatted ${plural(files.length, 'file')}` : `laravel: Pint failed: ${stripAnsi(r.stdout + r.stderr).trim().slice(0, 300)}`)
+            $.ui.log(r.exitCode === 0 ? `lara-cc: Pint formatted ${plural(files.length, 'file')}` : `lara-cc: Pint failed: ${stripAnsi(r.stdout + r.stderr).trim().slice(0, 300)}`)
           } catch (err) {
-            $.ui.log('laravel: Pint failed: ' + String(err))
+            $.ui.log('lara-cc: Pint failed: ' + String(err))
           }
         })()
       }
@@ -1010,7 +1010,7 @@ export const register: Register = on => {
     const target: Tab = unseenErrors ? 'log' : failedStored ? 'queue' : 'services'
     const band = (
       <Box flexDirection="row">
-        <Text dimColor>{'laravel  '}</Text>
+        <Text dimColor>{'lara-cc  '}</Text>
         {parts}
         <Button key="band-open" label="open" plain dimColor onPress={() => void openPane($, target)} />
       </Box>
@@ -1141,7 +1141,7 @@ export const register: Register = on => {
                   j.status === 'failed' ? 'red' : j.status === 'running' ? 'yellow' : undefined,
                 ),
               )
-            : line(services.queue.run ? 'Waiting for jobs…' : 'Start the worker (Services tab or /laravel-queue start) to see jobs here.', true)}
+            : line(services.queue.run ? 'Waiting for jobs…' : 'Start the worker (Services tab or /lara-queue start) to see jobs here.', true)}
           <Text> </Text>
           <Box flexDirection="row" columnGap={2}>
             <Text bold>{`Failed jobs (${snapshot?.failedTotal ?? 0})`}</Text>
@@ -1257,7 +1257,7 @@ export const register: Register = on => {
     } else {
       body = (
         <Box flexDirection="column">
-          {pendingMigrations > 0 && line(`${plural(pendingMigrations, 'pending migration')}: run /laravel-artisan migrate`, false, 'yellow')}
+          {pendingMigrations > 0 && line(`${plural(pendingMigrations, 'pending migration')}: run /lara-artisan migrate`, false, 'yellow')}
           {!about && <Text dimColor>Loading `php artisan about`…</Text>}
           {about &&
             Object.entries(about).map(([section, values]) => (

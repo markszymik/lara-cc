@@ -1,14 +1,14 @@
 {
-  "name": "markszymik-laravel",
-  "description": "Unofficial Laravel mod for Claude Code by Mark Szymik (not affiliated with Laravel or Anthropic)",
+  "name": "markszymik-lara-cc",
+  "description": "lara-cc by Mark Szymik: an unofficial Claude Code mod for Laravel apps (not affiliated with Laravel LLC or Anthropic)",
   "owner": {
     "name": "Mark Szymik"
   },
   "plugins": [
     {
-      "name": "laravel",
+      "name": "lara-cc",
       "source": "./",
-      "description": "Unofficial Laravel mod for Claude Code"
+      "description": "Unofficial Claude Code mod for Laravel apps"
     }
   ]
 }

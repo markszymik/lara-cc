@@ -76,32 +76,32 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
   return clock
 }
 
-test('/laravel-artisan runs php artisan with the arguments and returns clean output', async ($, on) => {
+test('/lara-artisan runs php artisan with the arguments and returns clean output', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran)
   await $.session.start({ cwd: '/app' })
 
-  const answer = await $.command.run({ command: 'laravel-artisan', args: 'make:model Post -m' })
+  const answer = await $.command.run({ command: 'lara-artisan', args: 'make:model Post -m' })
   expect(ran.find(argv => argv[2] === 'make:model')).toEqual(['php', 'artisan', 'make:model', 'Post', '-m', '--no-interaction'])
   expect(answer.text).toContain('✓ artisan make:model Post -m')
   expect(answer.text).not.toContain('\u001b[')
 })
 
-test('/laravel-npm uses the package manager from the lockfile', async ($, on) => {
+test('/lara-npm uses the package manager from the lockfile', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran)
   await $.session.start({ cwd: '/app' })
 
-  await $.command.run({ command: 'laravel-npm', args: 'build' })
+  await $.command.run({ command: 'lara-npm', args: 'build' })
   expect(ran.find(argv => argv[1] === 'run')).toEqual(['pnpm', 'run', 'build'])
 })
 
-test('/laravel-routes filters the route list', async ($, on) => {
+test('/lara-routes filters the route list', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran)
   await $.session.start({ cwd: '/app' })
 
-  const answer = await $.command.run({ command: 'laravel-routes', args: 'posts' })
+  const answer = await $.command.run({ command: 'lara-routes', args: 'posts' })
   expect(answer.text).toContain('1 of 3 routes')
   expect(answer.text).toContain('posts.store')
   expect(answer.text).not.toContain('users.index')
@@ -128,7 +128,7 @@ test('the artisan tool refuses destructive commands', async ($, on) => {
   ]
   for (const command of attempts) {
     const before = ran.length
-    const answer = await $.tool.call({ tool: 'mcp__laravel__artisan', command })
+    const answer = await $.tool.call({ tool: 'mcp__lara-cc__artisan', command })
     expect(JSON.stringify(answer)).toContain('Refused')
     // at most the `help` lookup ran, never the command itself
     expect(ran.slice(before).filter(argv => argv[2] !== 'help')).toEqual([])
@@ -140,7 +140,7 @@ test('the artisan tool runs safe commands once artisan has resolved the name', a
   fakeProject(on, ran)
   await $.session.start({ cwd: '/app' })
 
-  const answer = await $.tool.call({ tool: 'mcp__laravel__artisan', command: 'make:model Post -m' })
+  const answer = await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'make:model Post -m' })
   expect(JSON.stringify(answer)).toContain('✓ artisan make:model Post -m')
   expect(ran).toContainEqual(['php', 'artisan', 'help', 'make:model', '--format=json', '--no-interaction'])
   expect(ran).toContainEqual(['php', 'artisan', 'make:model', 'Post', '-m', '--no-interaction'])
@@ -151,27 +151,27 @@ test('the artisan tool does not run a name artisan cannot resolve', async ($, on
   fakeProject(on, ran)
   await $.session.start({ cwd: '/app' })
 
-  const answer = await $.tool.call({ tool: 'mcp__laravel__artisan', command: 'nope:thing' })
+  const answer = await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'nope:thing' })
   expect(JSON.stringify(answer)).toContain('could not resolve')
   expect(ran.some(argv => argv[2] === 'nope:thing')).toBe(false)
 })
 
-test('/laravel-artisan from a plugin or relayed message gets the same check', async ($, on) => {
+test('/lara-artisan from a plugin or relayed message gets the same check', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran)
   await $.session.start({ cwd: '/app' })
 
-  const answer = await $.command.run({ command: 'laravel-artisan', args: 'migr:fr' })
+  const answer = await $.command.run({ command: 'lara-artisan', args: 'migr:fr' })
   expect(answer.text).toContain('Refused: migrate:fresh can destroy data')
   expect(ran.some(argv => argv[2] === 'migr:fr')).toBe(false)
 })
 
-test('/laravel-schedule reports the scheduler', async ($, on) => {
+test('/lara-schedule reports the scheduler', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran)
   await $.session.start({ cwd: '/app' })
 
-  const answer = await $.command.run({ command: 'laravel-schedule', args: '' })
+  const answer = await $.command.run({ command: 'lara-schedule', args: '' })
   expect(answer.text).toBe('Scheduler is stopped.')
 })
 
@@ -182,10 +182,10 @@ test('the logs tool returns errors from the history and the live tail, with orig
   await $.session.start({ cwd: '/app' })
   await clock.settle()
 
-  const all = await $.tool.call({ tool: 'mcp__laravel__logs', level: 'all', count: 10 })
+  const all = await $.tool.call({ tool: 'mcp__lara-cc__logs', level: 'all', count: 10 })
   expect(JSON.stringify(all)).toContain('User 1 logged in')
 
-  const errors = JSON.stringify(await $.tool.call({ tool: 'mcp__laravel__logs' }))
+  const errors = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__logs' }))
   expect(errors).toContain('Call to undefined method')
   expect(errors).toContain('app/Http/Controllers/OrderController.php:42')
   expect(errors).not.toContain('logged in')
@@ -202,15 +202,15 @@ test('the queue tool lists failed jobs and retries one', async ($, on) => {
   fakeProject(on, ran, { snapshot })
   await $.session.start({ cwd: '/app' })
 
-  const status = JSON.stringify(await $.tool.call({ tool: 'mcp__laravel__queue', action: 'status' }))
+  const status = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'status' }))
   expect(status).toContain('default=4')
   expect(status).toContain('Failed jobs stored: 1')
 
-  const failed = JSON.stringify(await $.tool.call({ tool: 'mcp__laravel__queue', action: 'failed' }))
+  const failed = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'failed' }))
   expect(failed).toContain('abc-123')
   expect(failed).toContain('RuntimeException: Payment gateway down')
 
-  await $.tool.call({ tool: 'mcp__laravel__queue', action: 'retry', id: 'abc-123' })
+  await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'retry', id: 'abc-123' })
   expect(ran.some(argv => argv.join(' ') === 'php artisan queue:retry abc-123')).toBe(true)
 })
 
@@ -237,7 +237,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await clock.settle()
 
     const band = await $.ui.mount({
-      plugin: 'laravel',
+      plugin: 'lara-cc',
       surface,
       component: 'AbovePrompt',
       props: { hasSurvey: false, isWorking: false, maxRows: 4, bodyColumns: 100 } as never,
@@ -247,11 +247,11 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(drawn).toContain('1 failed job')
 
     const pane = await $.ui.mount({
-      plugin: 'laravel',
+      plugin: 'lara-cc',
       surface,
       component: 'Pane',
-      requestId: 'laravel',
-      props: { title: 'Laravel', isFocused: true, bodyColumns: 100, placement: 'dock' } as never,
+      requestId: 'lara',
+      props: { title: 'lara-cc', isFocused: true, bodyColumns: 100, placement: 'dock' } as never,
     })
     for (const tab of ['services', 'queue', 'log', 'routes', 'commands', 'about']) {
       await pane.press({ key: 'tab-' + tab })
@@ -276,14 +276,14 @@ test('with Herd as the PATH php, artisan, composer and services run on the binar
   fakeProject(on, ran, { herd, shellPhp: HERD_BIN + '/php84', spawned })
   await $.session.start({ cwd: '/app' })
 
-  await $.tool.call({ tool: 'mcp__laravel__artisan', command: 'migrate' })
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'migrate' })
   expect(ran).toContainEqual([herd, 'artisan', 'help', 'migrate', '--format=json', '--no-interaction'])
   expect(ran).toContainEqual([herd, 'artisan', 'migrate', '--no-interaction'])
 
-  await $.command.run({ command: 'laravel-composer', args: 'install' })
+  await $.command.run({ command: 'lara-composer', args: 'install' })
   expect(ran).toContainEqual([herd, COMPOSER, 'install', '--no-interaction'])
 
-  const started = await $.tool.call({ tool: 'mcp__laravel__service', name: 'queue', action: 'start' })
+  const started = await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
   expect(spawned).toContainEqual([herd, 'artisan', 'queue:work', '--tries=1'])
   // Claude is told the binary that really runs, not `php`
   expect(JSON.stringify(started)).toContain('php83 artisan queue:work')
@@ -295,9 +295,9 @@ test('with Herd installed but another php on PATH, the PATH php stays', async ($
   fakeProject(on, ran, { herd: HERD_BIN + '/php83', shellPhp: '/opt/homebrew/bin/php' })
   await $.session.start({ cwd: '/app' })
 
-  await $.tool.call({ tool: 'mcp__laravel__artisan', command: 'migrate' })
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'migrate' })
   expect(ran).toContainEqual(['php', 'artisan', 'migrate', '--no-interaction'])
-  await $.command.run({ command: 'laravel-composer', args: 'install' })
+  await $.command.run({ command: 'lara-composer', args: 'install' })
   expect(ran).toContainEqual(['composer', 'install', '--no-interaction'])
 })
 
@@ -306,7 +306,7 @@ test('with Herd, a Composer that is a shell shim runs as is, not through PHP', a
   fakeProject(on, ran, { herd: HERD_BIN + '/php83', shellPhp: HERD_BIN + '/php84', composerShim: true })
   await $.session.start({ cwd: '/app' })
 
-  await $.command.run({ command: 'laravel-composer', args: 'install' })
+  await $.command.run({ command: 'lara-composer', args: 'install' })
   expect(ran).toContainEqual(['composer', 'install', '--no-interaction'])
 })
 
@@ -315,7 +315,7 @@ test('without Herd, php and composer come from PATH', async ($, on) => {
   fakeProject(on, ran)
   await $.session.start({ cwd: '/app' })
 
-  await $.command.run({ command: 'laravel-composer', args: 'install' })
+  await $.command.run({ command: 'lara-composer', args: 'install' })
   expect(ran).toContainEqual(['composer', 'install', '--no-interaction'])
   expect(ran.some(argv => argv.join(' ') === 'which composer')).toBe(false)
 })

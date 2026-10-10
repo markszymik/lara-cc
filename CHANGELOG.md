@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-10
+
+### Changed
+
+- Renamed the mod from `laravel` to `lara-cc` (marketplace `markszymik-lara-cc`, repo `markszymik/lara-cc`) so it doesn't use the Laravel trademark as its name. Commands are now `/lara`, `/lara-artisan`, `/lara-queue`…, and Claude's tools `mcp__lara-cc__*`. Uninstall the old `laravel` plugin and install `lara-cc`; the pane's settings may start from their defaults again.
+
 ## [0.3.0] - 2026-10-10
 
 ### Added
