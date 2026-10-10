@@ -1,12 +1,31 @@
 import { expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { LOG } from './fixtures'
 
-/** Stand in for a Laravel project on disk and for php/npm, so no real process runs.
- * Background work at start (log tail, migrate:status, queue snapshot) also lands in `ran`. */
-/** `herd`: the binary `herd php` reports; `shellPhp`: what plain `php` reports; `composerShim`: Composer on PATH is a shell script. */
-type Fake = { history?: string; live?: string; snapshot?: unknown; herd?: string; shellPhp?: string; composerShim?: boolean; spawned?: string[][] }
+/**
+ * Stand in for a Laravel project on disk and for php/npm, so no real process runs.
+ * Background work at start (log tail, migrate:status, queue snapshot) also lands in `ran`.
+ *
+ * `herd`: the binary `herd php` reports; `shellPhp`: what plain `php` reports; `composerShim`: Composer on PATH is
+ * a shell script; `files`: extra files in the project and their contents; `env`: the environment `artisan about`
+ * reports; `exits`: exit code of spawned processes by command (`pnpm`); `curl`: curl's exit code.
+ */
+type Fake = {
+  history?: string
+  live?: string
+  snapshot?: unknown
+  herd?: string
+  shellPhp?: string
+  composerShim?: boolean
+  spawned?: string[][]
+  files?: Record<string, string>
+  env?: string
+  exits?: Record<string, number>
+  curl?: number
+  reads?: string[]
+}
 
 const COMPOSER = '/opt/bin/composer'
 const HERD_BIN = '/Users/me/Library/Application Support/Herd/bin'
@@ -26,29 +45,48 @@ const HELP: Record<string, string> = {
 }
 
 function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
+  // Hooks see absolute paths, resolved against the working directory
+  const file = (path: string) => {
+    const key = Object.keys(fake.files ?? {}).find(f => path === f || path.endsWith('/' + f))
+    return key === undefined ? undefined : fake.files![key]
+  }
   mock.store(on)
   const clock = mock.clock(on)
   on('fs.exists', ($, e) => ({
-    value: ['artisan', 'composer.json', 'pnpm-lock.yaml'].some(f => e.path === f || e.path.endsWith('/' + f)) || [fake.herd, fake.shellPhp ?? '/usr/bin/php', COMPOSER, HERD_CLI].includes(e.path),
+    value:
+      ['artisan', 'composer.json', 'pnpm-lock.yaml'].some(f => e.path === f || e.path.endsWith('/' + f)) ||
+      [fake.herd, fake.shellPhp ?? '/usr/bin/php', COMPOSER, HERD_CLI].includes(e.path) ||
+      file(e.path) !== undefined,
   }))
+  on('fs.stat', ($, e) => {
+    if (file(e.path) === undefined) throw new Error('ENOENT: ' + e.path)
+    return { value: { kind: 'file' as const, size: 1, mtimeMs: 1, isLink: false } as never }
+  })
   on('session.start', ($, e) => e)
-  on('fs.read', () => ({ value: '{"require":{"laravel/framework":"^12.0"}}' }))
+  on('fs.read', ($, e) => {
+    fake.reads?.push(e.path)
+    return { value: file(e.path) ?? '{"require":{"laravel/framework":"^12.0"}}' }
+  })
   on('command.register', () => ({ value: {} }))
   on('tool.register', () => ({ value: {} }))
   on('ui.toast', () => ({ value: undefined }))
   on('session.cwd', () => ({ value: '/app' }))
   on('fs.list', () => ({ value: [] }))
+  // Nothing else draws in the band
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => $.ui.resolve(e).Box({}))
   // tail -F of the log: a quiet stream that ends at once
   on('process.spawn', async function* ($, e) {
     fake.spawned?.push([...e.argv])
     if (e.argv[0] === 'tail' && fake.live) yield { stream: 'stdout' as const, text: fake.live }
-    return { value: { code: 0, signal: null } }
+    return { value: { code: fake.exits?.[e.argv[0]!] ?? 0, signal: null } }
   })
   on('process.run', ($, e) => {
     const argv = [...e.argv]
     ran.push(argv)
     const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (argv[0] === 'tail') return ok(fake.history ?? '')
+    if (argv[0] === 'curl') return { value: { exitCode: fake.curl ?? 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (argv.join(' ') === 'php artisan about --json') return ok(JSON.stringify({ environment: { environment: fake.env ?? 'local' } }))
     // Herd: which binary serves this folder, and Composer's path; without Herd there's no `herd` on PATH
     const missing = { value: { exitCode: 1, stdout: '', stderr: 'not found', isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv[0] === 'herd') return fake.herd ? ok(`${fake.herd}\n8.3.21`) : missing
@@ -231,8 +269,6 @@ for (const surface of ['terminal', 'desktop'] as const) {
       asked.push(e.text)
       return { text: e.text }
     })
-    // Nothing else draws in the band
-    on('ui.render', { component: 'AbovePrompt' }, ($, e) => $.ui.resolve(e).Box({}))
     await $.session.start({ cwd: '/app' })
     await clock.settle()
 
@@ -318,4 +354,89 @@ test('without Herd, php and composer come from PATH', async ($, on) => {
   await $.command.run({ command: 'lara-composer', args: 'install' })
   expect(ran).toContainEqual(['composer', 'install', '--no-interaction'])
   expect(ran.some(argv => argv.join(' ') === 'which composer')).toBe(false)
+})
+
+/** The band as drawn. */
+async function drawBand($: Engine): Promise<string> {
+  const band = await $.ui.mount({
+    plugin: 'lara-cc',
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: { hasSurvey: false, isWorking: false, maxRows: 4, bodyColumns: 200 } as never,
+  })
+  return JSON.stringify(await band.drawn())
+}
+
+test('the band flags a production environment, maintenance mode and cached config, without reading .env', async ($, on) => {
+  const ran: string[][] = []
+  const reads: string[] = []
+  const files = { 'storage/framework/down': '{}', 'bootstrap/cache/config.php': '<?php', 'bootstrap/cache/routes-v7.php': '<?php' }
+  const clock = fakeProject(on, ran, { files, env: 'production', reads })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  const drawn = await drawBand($)
+  expect(drawn).toContain('env: production')
+  expect(drawn).toContain('maintenance mode')
+  expect(drawn).toContain('config+routes cached')
+  expect(reads.some(path => path.includes('.env'))).toBe(false)
+})
+
+test('the band flags public/hot when the Vite it names is gone', async ($, on) => {
+  const ran: string[][] = []
+  const clock = fakeProject(on, ran, { files: { 'public/hot': 'http://[::1]:5173' }, curl: 7 })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  expect(await drawBand($)).toContain('Vite not running (public/hot)')
+  expect(ran).toContainEqual(['curl', '-q', '-s', '-o', '/dev/null', '-m', '2', '-k', 'http://[::1]:5173/'])
+})
+
+test('public/hot is fine while Vite answers, e.g. run in another terminal', async ($, on) => {
+  const ran: string[][] = []
+  const clock = fakeProject(on, ran, { files: { 'public/hot': 'https://shop.test:5173' }, curl: 0 })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  expect(await drawBand($)).not.toContain('public/hot')
+})
+
+test('public/hot naming another machine is never probed', async ($, on) => {
+  const ran: string[][] = []
+  const clock = fakeProject(on, ran, { files: { 'public/hot': 'http://example.com:5173' }, curl: 7 })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  expect(ran.some(argv => argv[0] === 'curl')).toBe(false)
+  expect(await drawBand($)).not.toContain('public/hot')
+})
+
+test('the band flags dependencies out of step with the lockfiles', async ($, on) => {
+  const ran: string[][] = []
+  const files = {
+    'composer.lock': JSON.stringify({ packages: [{ name: 'acme/billing', version: '2.1.0' }] }),
+    'vendor/composer/installed.json': JSON.stringify({ packages: [{ name: 'acme/billing', version: '2.0.0' }], dev: true }),
+    'pnpm-lock.yaml': 'lockfileVersion: 9.0',
+  }
+  const clock = fakeProject(on, ran, { files })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  const drawn = await drawBand($)
+  expect(drawn).toContain('composer install needed')
+  // no node_modules at all
+  expect(drawn).toContain('pnpm install needed')
+})
+
+test('a crashed process shows in the band until the Services tab is opened', async ($, on) => {
+  const ran: string[][] = []
+  const clock = fakeProject(on, ran, { exits: { pnpm: 1 } })
+  on('ui.open', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/app' })
+  await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'vite', action: 'start' })
+  await clock.settle()
+
+  expect(await drawBand($)).toContain('✗ vite exited (1)')
+  await $.command.run({ command: 'lara', args: 'services' })
+  expect(await drawBand($)).not.toContain('exited')
 })

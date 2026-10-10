@@ -3,6 +3,7 @@ import type { EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnResult
 import {
   artisanCommandName,
   clock,
+  composerDrift,
   durationMs,
   exceptionHeadline,
   feedLog,
@@ -11,7 +12,9 @@ import {
   helpName,
   isError,
   isWarning,
+  localHotUrl,
   newLogState,
+  npmDrift,
   origin,
   parseSnapshot,
   parseWorkerLine,
@@ -88,7 +91,8 @@ const TOAST_GAP_MS = 5000
 
 type Tab = 'services' | 'queue' | 'log' | 'routes' | 'commands' | 'about'
 type Run = { stream: HookStream<ProcessSpawnChunk, ProcessSpawnResult>; done: Promise<void> }
-type Service = { name: string; label: string; argv: string[]; run?: Run; lines: string[]; startedAt?: number; partial: string }
+/** `crashed`: the exit code of a run that ended on its own with an error; `seen` once the Services tab showed it. */
+type Service = { name: string; label: string; argv: string[]; run?: Run; lines: string[]; startedAt?: number; partial: string; crashed?: { code: number; seen: boolean } }
 type LastRun = { label: string; isRunning: boolean; exitCode?: number; output: string }
 type Route = { method: string; uri: string; name: string | null; action: string }
 type Job = { job: string; time: string; status: 'running' | 'done' | 'failed'; ms?: number }
@@ -139,6 +143,14 @@ let logFilter: 'all' | 'warnings' | 'errors' = 'all'
 let unseenErrors = 0
 let logReady: Promise<void> = Promise.resolve()
 
+// Health checks: things that quietly break the app (see checkHealth)
+type Check = { band: string; color: 'red' | 'yellow'; detail: string }
+let checks: Check[] = []
+let checking = false
+let checkAgain = false
+let depsSeen = ''
+let depsChecks: Check[] = []
+
 // Queue monitoring
 let jobs: Job[] = []
 const stats = { done: 0, failed: 0, totalMs: 0 }
@@ -179,6 +191,7 @@ function notLaravel(): string {
 async function openPane($: Api, on: Tab) {
   tab = on
   if (on === 'log') unseenErrors = 0
+  if (on === 'services') for (const svc of Object.values(services)) if (svc.crashed) svc.crashed.seen = true
   if (on === 'about' && !about) void loadAbout($)
   if (on === 'routes' && !routes) void loadRoutes($)
   if (on === 'queue') void refreshQueue($)
@@ -289,6 +302,8 @@ async function runCommand($: Api, label: string, argv: string[], timeoutMs = 600
     lastRun = { label, isRunning: false, exitCode: -1, output: 'Could not run `' + argv.join(' ') + '`: ' + String(err) }
   }
   redraw($)
+  // optimize:clear, composer install, artisan up… change what the checks see
+  void checkHealth($)
   return lastRun
 }
 
@@ -345,6 +360,7 @@ async function startService($: Api, name: string): Promise<string> {
   if (svc.run) return `${svc.label} is already running.`
 
   const argv = withPhp(svc.argv)
+  svc.crashed = undefined
   const stream = $.process.spawn({ argv })
   svc.lines.push(`$ ${argv.join(' ')}`)
   svc.startedAt = Date.now()
@@ -366,7 +382,10 @@ async function startService($: Api, name: string): Promise<string> {
       const end = step.value as ProcessSpawnResult | undefined
       if (!end || end.signal) svc.lines.push('■ stopped')
       else svc.lines.push(`■ exited with code ${end.code}`)
-      if (end?.code) toast($, `${svc.label} exited with code ${end.code}`)
+      if (end?.code) {
+        svc.crashed = { code: end.code, seen: paneOpen && tab === 'services' }
+        toast($, `${svc.label} exited with code ${end.code}`)
+      }
     } catch (err) {
       svc.lines.push('■ ' + String(err))
     }
@@ -376,6 +395,8 @@ async function startService($: Api, name: string): Promise<string> {
     }
     finish()
     redraw($)
+    // Vite leaves public/hot behind when it dies
+    void checkHealth($)
   })()
 
   redraw($)
@@ -664,7 +685,8 @@ function formatRoute(r: Route): string {
 async function loadAbout($: Api) {
   try {
     const r = await runPhp($, ['php', 'artisan', 'about', '--json'], { timeoutMs: 60_000 })
-    if (r.exitCode === 0) about = JSON.parse(r.stdout)
+    // PHP may print deprecation warnings before the JSON
+    if (r.exitCode === 0) about = JSON.parse(r.stdout.slice(r.stdout.indexOf('{')))
   } catch {
     about = undefined
   }
@@ -683,6 +705,122 @@ async function checkMigrations($: Api) {
   }
 }
 
+// ─── Health checks ─────────────────────────────────────────────────────────
+
+/** Laravel's cache files: while one exists, edits to what it caches don't take effect. */
+const CACHE_FILES = { config: 'bootstrap/cache/config.php', routes: 'bootstrap/cache/routes-v7.php', events: 'bootstrap/cache/events.php' }
+
+/**
+ * Look for things that quietly break the app and show them in the band: a production environment, maintenance
+ * mode, cached config/routes/events, a public/hot pointing at a dead Vite, and dependencies out of step with the
+ * lockfiles. Reads lockfiles and Laravel's marker files, never .env. Cheap: lockfiles are re-read only when changed.
+ */
+async function checkHealth($: Api) {
+  if (!isLaravel) return
+  // One run at a time; a request that arrives meanwhile runs again afterwards so nothing is missed
+  if (checking) {
+    checkAgain = true
+    return
+  }
+  checking = true
+  try {
+    const next: Check[] = []
+    if (about?.environment?.environment === 'production') {
+      next.push({ band: 'env: production', color: 'red', detail: 'APP_ENV is production on this machine: errors are hidden and migrations need --force.' })
+    }
+    const [down, hot, ...cacheFiles] = await Promise.all([
+      $.fs.exists('storage/framework/down'),
+      viteIsGone($),
+      ...Object.values(CACHE_FILES).map(f => $.fs.exists(f)),
+    ])
+    // The file covers the default driver; about covers the cache driver too
+    if (down || about?.environment?.maintenance_mode === true) {
+      next.push({ band: 'maintenance mode', color: 'red', detail: 'The app answers every request with 503 (storage/framework/down). /lara-artisan up brings it back.' })
+    }
+    const cached = Object.keys(CACHE_FILES).filter((_, i) => cacheFiles[i])
+    if (cached.length) {
+      const list = cached.join(', ')
+      next.push({ band: `${cached.join('+')} cached`, color: 'yellow', detail: `Laravel is using cached ${list}, so edits to them don't take effect until the cache is cleared: optimize:clear on the Commands tab.` })
+    }
+    if (hot) {
+      next.push({ band: 'Vite not running (public/hot)', color: 'yellow', detail: "public/hot points pages at a Vite dev server that isn't running, so they load without CSS and JS. Start Vite (/lara-vite start) or delete public/hot." })
+    }
+    next.push(...(await checkDeps($)))
+    checks = next
+  } catch (err) {
+    $.ui.log('lara-cc: health check failed: ' + String(err))
+  } finally {
+    checking = false
+  }
+  redraw($)
+  if (checkAgain) {
+    checkAgain = false
+    void checkHealth($)
+  }
+}
+
+/** public/hot names a local dev server and nothing listens there (curl exit 7: couldn't connect). Vite run elsewhere counts as running. */
+async function viteIsGone($: Api): Promise<boolean> {
+  if (services.vite?.run || !(await $.fs.exists('public/hot'))) return false
+  const url = localHotUrl(await $.fs.read('public/hot').catch(() => ''))
+  if (!url) return false
+  // -q first so a ~/.curlrc can't change the request; -k because local dev certificates are often self-signed
+  const r = await $.process.run(['curl', '-q', '-s', '-o', '/dev/null', '-m', '2', '-k', url + '/'], { timeoutMs: 5_000 }).catch(() => undefined)
+  return r?.exitCode === 7
+}
+
+/** Modification time of `path`, or -1 when it doesn't exist. */
+async function mtime($: Api, path: string): Promise<number> {
+  try {
+    return (await $.fs.stat(path)).mtimeMs
+  } catch {
+    return -1
+  }
+}
+
+const NODE_LOCKS: Record<string, string[]> = { npm: ['package-lock.json'], pnpm: ['pnpm-lock.yaml'], yarn: ['yarn.lock'], bun: ['bun.lock', 'bun.lockb'] }
+
+const DEP_FILES = ['composer.lock', 'vendor/composer/installed.json', 'package-lock.json', 'node_modules/.package-lock.json', 'node_modules', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb']
+
+/** Composer and node packages out of step with the lockfiles, e.g. after a `git pull`. */
+async function checkDeps($: Api): Promise<Check[]> {
+  const times = await Promise.all(DEP_FILES.map(f => mtime($, f)))
+  const key = times.join(',')
+  if (key === depsSeen) return depsChecks
+  const has = (file: string) => times[DEP_FILES.indexOf(file)]! >= 0
+  const out: Check[] = []
+  const add = (tool: string, detail: string) => out.push({ band: `${tool} install needed`, color: 'yellow', detail })
+  const differ = (lock: string, drift: string[], fix: string) =>
+    `${plural(drift.length, 'package')} in ${lock} differ from what's installed (${drift.slice(0, 3).join(', ')}${drift.length > 3 ? '…' : ''}). Run ${fix}.`
+
+  if (has('composer.lock')) {
+    const fix = 'composer install (/lara-composer install)'
+    if (!has('vendor/composer/installed.json')) add('composer', `vendor/ is missing. Run ${fix}.`)
+    else {
+      // An unreadable or half-written file (mid-install) is skipped, and read again once it changes
+      const drift = await Promise.all([$.fs.read('composer.lock'), $.fs.read('vendor/composer/installed.json')])
+        .then(([lock, installed]) => composerDrift(lock, installed))
+        .catch(() => [])
+      if (drift.length) add('composer', differ('composer.lock', drift, fix))
+    }
+  }
+
+  // The lockfile `pm` was picked from, so the advice matches the tool (a stray package-lock.json in a yarn project is ignored)
+  const nodeLock = NODE_LOCKS[pm]?.find(has)
+  if (nodeLock && !has('node_modules')) add(pm, `node_modules/ is missing. Run ${pm} install.`)
+  // Only npm keeps a record of what it installed precise enough to compare against the lockfile
+  else if (nodeLock === 'package-lock.json' && has('node_modules/.package-lock.json')) {
+    const drift = await Promise.all([$.fs.read('package-lock.json'), $.fs.read('node_modules/.package-lock.json')])
+      .then(([lock, installed]) => npmDrift(lock, installed))
+      .catch(() => [])
+    if (drift.length) add(pm, differ('package-lock.json', drift, `${pm} install`))
+  }
+
+  depsSeen = key
+  depsChecks = out
+  return out
+}
+
 async function detectProject($: Api) {
   projectDir = await $.session.cwd()
   isLaravel = await $.fs.exists('artisan')
@@ -690,6 +828,13 @@ async function detectProject($: Api) {
   phpBin = 'php'
   composerArgv = ['composer']
   phpInfo = ''
+  checks = []
+  depsSeen = ''
+  depsChecks = []
+  about = undefined
+  routes = undefined
+  pm = 'npm'
+  for (const svc of Object.values(services)) svc.crashed = undefined
   if (!isLaravel) return
   // In the background: PHP launches wait for it, session start doesn't
   phpReady = detectPhp($).then(() => redraw($))
@@ -701,9 +846,9 @@ async function detectProject($: Api) {
   else if (await $.fs.exists('yarn.lock')) pm = 'yarn'
   services.vite.argv = [pm, 'run', 'dev']
   for (const q of QUICK) {
-    if (q.argv[0] === 'npm') {
+    if (['npm', 'pnpm', 'yarn', 'bun'].includes(q.argv[0]!)) {
+      q.label = q.label.replace(q.argv[0]!, pm)
       q.argv = [pm, ...q.argv.slice(1)]
-      q.label = q.label.replace('npm', pm)
     }
   }
 
@@ -813,9 +958,15 @@ export const register: Register = on => {
       void watchLog($)
       void checkMigrations($)
       void refreshQueue($)
+      // about gives the environment name without reading .env; the checks run once it's in
+      void loadAbout($).then(() => checkHealth($))
       for (const name of settings.autostart[projectDir] ?? []) if (services[name]) void startService($, name)
       // Pick up a new daily log file, and keep the Queue tab current while it's showing
-      $.clock.every(60_000, () => void watchLog($))
+      $.clock.every(60_000, () => {
+        void watchLog($)
+        // about is re-read so a changed APP_ENV or `artisan down` shows within a minute
+        void loadAbout($).then(() => checkHealth($))
+      })
       $.clock.every(15_000, () => {
         if (paneOpen && tab === 'queue') void refreshQueue($)
       })
@@ -966,6 +1117,8 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
+    // Claude may have cached config, installed packages or stopped Vite
+    if (e.agentId === undefined) void checkHealth($)
     if (e.agentId === undefined && editedPhp.size) {
       const files = [...editedPhp].filter(f => !f.includes('/vendor/'))
       editedPhp.clear()
@@ -994,20 +1147,29 @@ export const register: Register = on => {
     if (!isLaravel || !settings.showBand || e.props.hasSurvey) return next(e)
     const running = Object.values(services).filter(s => s.run)
     const failedStored = snapshot?.failedTotal ?? 0
-    if (!running.length && !unseenErrors && !failedStored && !pendingMigrations) return next(e)
+    const crashed = Object.values(services).filter(s => s.crashed && !s.crashed.seen)
+    if (!running.length && !crashed.length && !unseenErrors && !failedStored && !pendingMigrations && !checks.length) return next(e)
 
     const { Box, Text, Button } = $.ui.resolve(e)
     const theirs = await next(e)
-    const parts = []
+    const items: { text: string; color?: string }[] = []
     for (const s of running) {
       const extra = s.name === 'queue' && (stats.done || stats.failed) ? ` ${stats.done}✓${stats.failed ? ` ${stats.failed}✗` : ''}` : ''
-      parts.push(<Text color="green">{'● '}</Text>, <Text>{s.name + extra + '  '}</Text>)
+      items.push({ text: '● ', color: 'green' }, { text: s.name + extra + '  ' })
     }
-    if (unseenErrors) parts.push(<Text color="red">{`▲ ${plural(unseenErrors, 'new error')}  `}</Text>)
-    if (failedStored) parts.push(<Text color="yellow">{`${plural(failedStored, 'failed job')}  `}</Text>)
-    if (pendingMigrations) parts.push(<Text color="yellow">{`${plural(pendingMigrations, 'pending migration')}  `}</Text>)
+    for (const s of crashed) items.push({ text: `✗ ${s.name} exited (${s.crashed!.code})  `, color: 'red' })
+    if (unseenErrors) items.push({ text: `▲ ${plural(unseenErrors, 'new error')}  `, color: 'red' })
+    if (failedStored) items.push({ text: `${plural(failedStored, 'failed job')}  `, color: 'yellow' })
+    if (pendingMigrations) items.push({ text: `${plural(pendingMigrations, 'pending migration')}  `, color: 'yellow' })
+    const warnings = checks.map(c => ({ text: `⚠ ${c.band}  `, color: c.color }))
+    // Too wide for one row: fold the warnings into a count, which the Services tab lists in full
+    const width = [...items, ...warnings].reduce((n, i) => n + i.text.length, 'lara-cc  open'.length)
+    if (width <= e.props.bodyColumns) items.push(...warnings)
+    else if (checks.length) items.push({ text: `⚠ ${plural(checks.length, 'warning')}  `, color: checks.some(c => c.color === 'red') ? 'red' : 'yellow' })
+    const parts = items.map(i => <Text color={i.color}>{i.text}</Text>)
 
-    const target: Tab = unseenErrors ? 'log' : failedStored ? 'queue' : 'services'
+    // The Services tab explains crashes and checks
+    const target: Tab = crashed.length ? 'services' : unseenErrors ? 'log' : failedStored ? 'queue' : 'services'
     const band = (
       <Box flexDirection="row">
         <Text dimColor>{'lara-cc  '}</Text>
@@ -1069,13 +1231,20 @@ export const register: Register = on => {
       body = (
         <Box flexDirection="column">
           {phpInfo && <Text dimColor>{phpInfo}</Text>}
+          {checks.map(c => (
+            <Text color={c.color}>{`⚠ ${c.detail}`}</Text>
+          ))}
           {Object.values(services).map(svc => (
             <Box flexDirection="row" columnGap={1}>
               <Text color={svc.run ? 'green' : undefined} dimColor={!svc.run}>
                 {svc.run ? '●' : '○'}
               </Text>
               <Text bold>{svc.label.padEnd(13)}</Text>
-              <Text dimColor>{(svc.run ? 'running ' + ago(svc.startedAt ?? Date.now()) : 'stopped').padEnd(13)}</Text>
+              {svc.crashed && !svc.run ? (
+                <Text color="red">{`exited (${svc.crashed.code})`.padEnd(13)}</Text>
+              ) : (
+                <Text dimColor>{(svc.run ? 'running ' + ago(svc.startedAt ?? Date.now()) : 'stopped').padEnd(13)}</Text>
+              )}
               {svc.run ? (
                 <Button key={'stop-' + svc.name} label="stop" onPress={() => void stopService($, svc.name)} />
               ) : (
@@ -1108,7 +1277,7 @@ export const register: Register = on => {
           </Box>
           <Text> </Text>
           <Text bold>{shown?.label ?? ''} output</Text>
-          {(shown?.lines.length ? shown.lines.slice(-(rows - Object.keys(services).length - 4)) : ['(no output yet)']).map(l => line(l, true))}
+          {(shown?.lines.length ? shown.lines.slice(-Math.max(3, rows - Object.keys(services).length - 4 - (phpInfo ? 1 : 0) - checks.length * 2)) : ['(no output yet)']).map(l => line(l, true))}
         </Box>
       )
     } else if (tab === 'queue') {
@@ -1274,7 +1443,7 @@ export const register: Register = on => {
             plain
             dimColor
             onPress={() => {
-              void loadAbout($)
+              void loadAbout($).then(() => checkHealth($))
               void checkMigrations($)
             }}
           />

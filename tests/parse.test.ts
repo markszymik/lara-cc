@@ -2,6 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import {
   artisanCommandName,
+  composerDrift,
   durationMs,
   exceptionHeadline,
   feedLog,
@@ -9,7 +10,9 @@ import {
   headline,
   helpName,
   isError,
+  localHotUrl,
   newLogState,
+  npmDrift,
   origin,
   parseSnapshot,
   parseWorkerLine,
@@ -91,4 +94,57 @@ test('helpName reads the resolved name from artisan help JSON, after any PHP war
   expect(helpName('{"name":"migrate:fresh","description":"Drop all tables"}')).toBe('migrate:fresh')
   expect(helpName('PHP Deprecated: x\n{"name":"down"}')).toBe('down')
   expect(helpName('ERROR  Command "mi" is ambiguous.')).toBe(undefined)
+})
+
+test('composerDrift lists packages that differ from composer.lock', () => {
+  const lock = JSON.stringify({ packages: [{ name: 'a/one', version: '1.0.0' }, { name: 'a/two', version: '2.0.0' }], 'packages-dev': [{ name: 'a/dev', version: '1.0.0' }] })
+  const same = JSON.stringify({ packages: [{ name: 'a/one', version: '1.0.0' }, { name: 'a/two', version: '2.0.0' }, { name: 'a/dev', version: '1.0.0' }], dev: true })
+  expect(composerDrift(lock, same)).toEqual([])
+  const changed = JSON.stringify({ packages: [{ name: 'a/one', version: '0.9.0' }, { name: 'a/gone', version: '1.0.0' }, { name: 'a/dev', version: '1.0.0' }], dev: true })
+  expect(composerDrift(lock, changed)).toEqual(['a/gone', 'a/one', 'a/two'])
+  // --no-dev leaves dev packages out on purpose; Composer 1 wrote a plain list
+  expect(composerDrift(lock, JSON.stringify({ packages: [{ name: 'a/one', version: '1.0.0' }, { name: 'a/two', version: '2.0.0' }], dev: false }))).toEqual([])
+  expect(composerDrift(lock, JSON.stringify([{ name: 'a/one', version: '1.0.0' }, { name: 'a/two', version: '2.0.0' }, { name: 'a/dev', version: '1.0.0' }]))).toEqual([])
+})
+
+test('npmDrift compares package-lock.json with what npm installed, ignoring optional packages for other platforms', () => {
+  const lock = JSON.stringify({
+    packages: {
+      '': { name: 'app' },
+      'node_modules/vite': { version: '6.0.0' },
+      'node_modules/@esbuild/linux-x64': { version: '0.24.0', optional: true },
+      'node_modules/axios': { version: '1.7.0' },
+    },
+  })
+  const same = JSON.stringify({ packages: { 'node_modules/vite': { version: '6.0.0' }, 'node_modules/axios': { version: '1.7.0' } } })
+  expect(npmDrift(lock, same)).toEqual([])
+  const changed = JSON.stringify({ packages: { 'node_modules/vite': { version: '5.4.0' }, 'node_modules/left-pad': { version: '1.0.0' } } })
+  expect(npmDrift(lock, changed)).toEqual(['axios', 'left-pad', 'vite'])
+})
+
+test('npmDrift accepts --omit=dev installs, workspace packages and dev-only optional packages', () => {
+  const lock = JSON.stringify({
+    packages: {
+      '': { name: 'app' },
+      'packages/ui': { version: '1.0.0' },
+      'node_modules/ui': { link: true },
+      'node_modules/axios': { version: '1.7.0' },
+      'node_modules/vite': { version: '6.0.0', dev: true },
+      'node_modules/fsevents': { version: '2.3.3', dev: true, devOptional: true },
+    },
+  })
+  const prodOnly = JSON.stringify({ packages: { 'node_modules/ui': { link: true }, 'node_modules/axios': { version: '1.7.0' } } })
+  expect(npmDrift(lock, prodOnly)).toEqual([])
+  // With dev packages installed, a missing one still counts
+  const partial = JSON.stringify({ packages: { 'node_modules/ui': {}, 'node_modules/axios': { version: '1.7.0' }, 'node_modules/fsevents': { version: '2.3.3' } } })
+  expect(npmDrift(lock, partial)).toEqual(['vite'])
+})
+
+test('localHotUrl accepts only dev servers on this machine', () => {
+  expect(localHotUrl('http://[::1]:5173\n')).toBe('http://[::1]:5173')
+  expect(localHotUrl('http://localhost:5173')).toBe('http://localhost:5173')
+  expect(localHotUrl('https://shop.test:5173/some/path')).toBe('https://shop.test:5173')
+  expect(localHotUrl('http://example.com:5173')).toBe(undefined)
+  expect(localHotUrl('file:///etc/passwd')).toBe(undefined)
+  expect(localHotUrl('not a url')).toBe(undefined)
 })

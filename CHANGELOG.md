@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-10
+
+### Added
+
+- The status band flags a crashed dev process, a `public/hot` pointing at a Vite that isn't running, cached config/routes/events, maintenance mode, a production environment, and Composer or node packages out of step with the lockfiles; the Services tab explains each and how to fix it.
+
 ## [0.4.0] - 2026-10-10
 
 ### Changed

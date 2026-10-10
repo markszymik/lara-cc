@@ -30,6 +30,16 @@ Start Claude Code from your Laravel project's root (the folder with `artisan`).
 
 **Status band.** One line above the prompt, shown only when there's something to know: running processes, queue totals, new errors, failed jobs, pending migrations. Press **open** to jump to the right tab.
 
+It also flags the things that make a change "not work" without an error, and the Services tab explains each one and how to fix it:
+
+- **A process that crashed**, e.g. `✗ vite exited (1)`, until you open the Services tab.
+- **`public/hot` with no Vite behind it**: pages load without CSS and JS. Vite running in another terminal counts; only dev servers on this machine (`localhost`, `*.test`) are ever checked.
+- **Cached config, routes or events**: edits to them don't take effect until the cache is cleared.
+- **Maintenance mode**, and **APP_ENV=production** on your machine (read from `artisan about`, not from `.env`).
+- **`composer install needed`** when `vendor/` differs from `composer.lock`, and **`npm install needed`** when `node_modules` differs from `package-lock.json` (for pnpm, Yarn and Bun, when `node_modules` is missing), e.g. after a `git pull`.
+
+The checks run at start-up, after each of Claude's turns, after commands and every minute. They read lockfiles and Laravel's marker files, never `.env`.
+
 **Dev processes.** Queue worker (or Horizon), Vite and the scheduler, started and stopped from the **Services** tab or commands, with their output. Tick **autostart** to start them whenever you open Claude Code in this project.
 
 **After Claude edits PHP.** The queue worker restarts so it runs the new code (on by default). Optionally, Pint formats the files Claude changed at the end of each turn (off by default).

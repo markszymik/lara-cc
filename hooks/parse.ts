@@ -219,3 +219,64 @@ export function parseSnapshot(stdout: string): QueueSnapshot | undefined {
 export function exceptionHeadline(exception: string): string {
   return (exception.split('\n')[0] ?? '').replace(/^.*?\\(\w+(Exception|Error)):/, '$1:').slice(0, 300)
 }
+
+// ─── Health checks ─────────────────────────────────────────────────────────
+
+type ComposerPackage = { name: string; version: string }
+
+/**
+ * Packages whose installed version differs from composer.lock (changed, missing, or installed but no longer
+ * locked). `installedJson` is vendor/composer/installed.json: an object in Composer 2, a list in Composer 1.
+ */
+export function composerDrift(lockJson: string, installedJson: string): string[] {
+  const lock = JSON.parse(lockJson) as { packages?: ComposerPackage[]; 'packages-dev'?: ComposerPackage[] }
+  const installed = JSON.parse(installedJson) as { packages?: ComposerPackage[]; dev?: boolean } | ComposerPackage[]
+  const list = Array.isArray(installed) ? installed : (installed.packages ?? [])
+  // `composer install --no-dev` leaves the dev packages out on purpose
+  const dev = Array.isArray(installed) || installed.dev !== false
+  const want = new Map([...(lock.packages ?? []), ...(dev ? (lock['packages-dev'] ?? []) : [])].map(p => [p.name, p.version]))
+  const have = new Map(list.map(p => [p.name, p.version]))
+  return [...new Set([...want.keys(), ...have.keys()])].filter(name => want.get(name) !== have.get(name)).sort()
+}
+
+type NpmEntry = { version?: string; optional?: boolean; devOptional?: boolean; dev?: boolean }
+
+/**
+ * Packages whose installed version differs from package-lock.json, read from npm's own record of what it
+ * installed (node_modules/.package-lock.json). Not counted as missing: optional packages (other platforms'
+ * builds are never installed), dev packages after `npm install --omit=dev`, and workspace packages, which
+ * live outside node_modules.
+ */
+export function npmDrift(lockJson: string, installedJson: string): string[] {
+  const lock = (JSON.parse(lockJson) as { packages?: Record<string, NpmEntry> }).packages ?? {}
+  const have = (JSON.parse(installedJson) as { packages?: Record<string, NpmEntry> }).packages ?? {}
+  const deps = Object.entries(lock).filter(([path]) => path.includes('node_modules/'))
+  // An install that left out every dev package did so on purpose
+  const omitDev = deps.some(([, e]) => e.dev) && !deps.some(([path, e]) => e.dev && path in have)
+  const out = new Set<string>()
+  for (const [path, entry] of deps) {
+    const got = have[path]
+    if (got) {
+      if (got.version !== entry.version) out.add(path)
+    } else if (!entry.optional && !entry.devOptional && !(omitDev && entry.dev)) out.add(path)
+  }
+  for (const path of Object.keys(have)) if (path.includes('node_modules/') && !(path in lock)) out.add(path)
+  return [...out].map(path => path.replace(/^.*node_modules\//, '')).sort()
+}
+
+/**
+ * The origin in public/hot when it's a dev server on this machine (localhost, a loopback address, or a
+ * `.test`/`.localhost` host), else undefined: the mod only ever probes local servers.
+ */
+export function localHotUrl(text: string): string | undefined {
+  let url: URL
+  try {
+    url = new URL(text.trim())
+  } catch {
+    return undefined
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
+  const host = url.hostname.replace(/^\[|\]$/g, '')
+  const local = ['localhost', '127.0.0.1', '::1', '0.0.0.0'].includes(host) || host.endsWith('.test') || host.endsWith('.localhost')
+  return local ? url.origin : undefined
+}
