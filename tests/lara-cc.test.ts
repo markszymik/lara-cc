@@ -98,6 +98,7 @@ const HELP: Record<string, string> = {
   'route:list': 'route:list',
   'pulse:restart': 'pulse:restart',
   about: 'about',
+  'make:filament-user': 'make:filament-user',
 }
 
 function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
@@ -163,10 +164,12 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
     const missing = { value: { exitCode: 1, stdout: '', stderr: 'not found', isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv[0] === 'tail') return ok(fake.history ?? '')
     if (argv[0] === 'curl') return { value: { exitCode: fake.curl ?? 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-    if (argv.join(' ') === 'php artisan about --json') {
+    if (argv[1] === 'artisan' && argv[2] === 'about' && argv.includes('--json')) {
       const env = fake.env ?? 'local'
       await fake.aboutGate
-      return ok(JSON.stringify({ environment: { environment: env } }))
+      // json_encode escapes slashes, as PHP prints it
+      const about = { environment: { environment: env, laravel_version: '12.33.0', url: 'shop.example.com' }, drivers: { database: 'mysql' }, pulse: { dashboard: 'https://admin.example.com/pulse' } }
+      return ok(JSON.stringify(about).replace(/\//g, '\\/'))
     }
     if (argv[0] === 'plutil') return argv.at(-1) === HERD_PLIST && fake.herdServices ? ok(JSON.stringify(fake.herdServices)) : missing
     // Herd starts the service: its port answers from then on
@@ -650,8 +653,7 @@ test('allowing for the session stops the asking, and what is sent is redacted', 
 
 test("about and route:list reach the conversation without the app's URL or any route's domain", async ($, on) => {
   const ran: string[][] = []
-  const about = ['  Laravel Version .......... 12.33.0', '  URL ...................... shop.example.com', '  Database ................. mysql'].join('\n')
-  const clock = fakeProject(on, ran, { says: about })
+  const clock = fakeProject(on, ran)
   await $.session.start({ cwd: '/app' })
   await clock.settle()
 
@@ -662,7 +664,7 @@ test("about and route:list reach the conversation without the app's URL or any r
     const text = JSON.stringify(output)
     expect(text).toContain('12.33.0')
     expect(text).toContain('mysql')
-    expect(text).not.toContain('shop.example.com')
+    expect(text).not.toContain('example.com')
   }
 
   for (const output of [
@@ -1004,6 +1006,41 @@ test('commands lara-cc does not know to stay in the folder ask too; the ones it 
   await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'route:list' })
   await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'make:model Post' })
   expect(asked.length).toBe(before)
+})
+
+test("a package's make: command asks; tests ask unless phpunit.xml uses an in-memory database", async ($, on) => {
+  const ran: string[][] = []
+  const asked: string[] = []
+  const fake: Fake = { asked, run: "Don't run" }
+  const clock = fakeProject(on, ran, fake)
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  // Filament's make:filament-user inserts a user: not one of the file generators
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'make:filament-user' })
+  expect(asked.length).toBe(1)
+  expect(ran.some(argv => argv[2] === 'make:filament-user')).toBe(false)
+
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'test' })
+  expect(asked.at(-1)).toContain("phpunit.xml doesn't send it to an in-memory database")
+  expect(ran.some(argv => argv[2] === 'test' && argv[1] === 'artisan')).toBe(false)
+
+  fake.files = { 'phpunit.xml': '<phpunit><php><env name="DB_CONNECTION" value="sqlite"/><env name="DB_DATABASE" value=":memory:"/></php></phpunit>' }
+  const before = asked.length
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'test' })
+  expect(asked.length).toBe(before)
+  expect(ran.some(argv => argv[2] === 'test' && argv[1] === 'artisan')).toBe(true)
+})
+
+test('route:list for Claude keeps the middleware with -v', async ($, on) => {
+  const ran: string[][] = []
+  fakeProject(on, ran)
+  await $.session.start({ cwd: '/app' })
+
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'route:list' }))).not.toContain('[web]')
+  const verbose = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'route:list -v' }))
+  expect(verbose).toContain('/users  users.index')
+  expect(verbose).toContain('[web]')
 })
 
 test("before APP_ENV and the app's servers are read, the question says it doesn't know rather than none found", async ($, on) => {

@@ -33,10 +33,11 @@ import {
   PHP_OPTIONS,
   phpJson,
   queuesOf,
-  aboutWithoutAddresses,
+  aboutForClaude,
   clip,
   redact,
-  routeListLines,
+  parseRouteList,
+  testsUseMemoryDb,
   redactData,
   refusedOptions,
   routesPhp,
@@ -136,7 +137,7 @@ const IMPACTFUL: Record<string, string> = {
  * one, since a command lara-cc doesn't know (a package's, a new one) may reach the database, queue, cache or network.
  */
 const CONTAINED =
-  /^(make:\S+|about|list|help|env|inspire|test|optimize|clear-compiled|package:discover|storage:link|(route|event):(list|cache|clear)|(config|view):(cache|clear)|(config|lang|stub|vendor):publish|model:show|db:(table|monitor)|schema:dump|migrate:status|schedule:list|channel:list|queue:(failed|monitor)|ide-helper:\S+)$/
+  /^(make:(cache-table|cast|channel|class|command|component|config|controller|enum|event|exception|factory|interface|job|job-middleware|listener|livewire|mail|middleware|migration|model|notification|notifications-table|observer|policy|provider|queue-batches-table|queue-failed-table|queue-table|request|resource|rule|scope|seeder|session-table|test|trait|view|volt)|filament:make-\S+|make:filament-(resource|page|widget|panel|relation-manager|cluster|exporter|importer|theme)|about|list|help|env|inspire|optimize|clear-compiled|package:discover|storage:link|(route|event):(list|cache|clear)|(config|view):(cache|clear)|(config|lang|stub|vendor):publish|model:show|db:(table|monitor)|schema:dump|migrate:status|schedule:list|channel:list|queue:(failed|monitor)|ide-helper:(generate|meta|models|eloquent))$/
 
 /** Artisan commands Claude's tool refuses because they print secrets: config values (passwords, APP_KEY) or the .env encryption key. */
 const CONFIDENTIAL = ['env:encrypt', 'env:decrypt']
@@ -167,8 +168,11 @@ type Tab = 'services' | 'queue' | 'log' | 'tests' | 'routes' | 'commands' | 'abo
 type Run = { stream: HookStream<ProcessSpawnChunk, ProcessSpawnResult>; done: Promise<void> }
 /** `crashed`: the exit code of a run that ended on its own with an error; `seen` once the Services tab showed it. */
 type Service = { name: string; label: string; argv: string[]; run?: Run; lines: string[]; startedAt?: number; partial: string; crashed?: { code: number; seen: boolean } }
-/** `output`: for the Commands tab; `shared`: for Claude, the whole output redacted first and only then cut. */
-type LastRun = { label: string; isRunning: boolean; exitCode?: number; output: string; shared?: string }
+/**
+ * `output`: for the Commands tab, its end (or all of it, `whole`, for output shown to the person on Claude's
+ * request). `raw`: up to 200 KB of it, redacted and cut by formatRun only when it goes to Claude.
+ */
+type LastRun = { label: string; isRunning: boolean; exitCode?: number; output: string; raw?: string; whole?: boolean }
 type Job = { job: string; time: string; status: 'running' | 'done' | 'failed'; ms?: number }
 type Settings = {
   autoRestartQueue: boolean
@@ -412,7 +416,7 @@ async function runPhp($: Api, argv: string[], init: { timeoutMs: number }) {
 // ─── One-shot commands ─────────────────────────────────────────────────────
 
 /** Run a command, keep its output for the Commands tab, and return it. */
-async function runCommand($: Api, label: string, argv: string[], timeoutMs = 600_000): Promise<LastRun> {
+async function runCommand($: Api, label: string, argv: string[], timeoutMs = 600_000, whole = false): Promise<LastRun> {
   const isTests = isTestCommand(argv.join(' '))
   const project = projectRun
   lastRun = { label, isRunning: true, output: '' }
@@ -422,7 +426,7 @@ async function runCommand($: Api, label: string, argv: string[], timeoutMs = 600
   try {
     const r = await runPhp($, argv, { timeoutMs })
     const output = stripAnsi([r.stdout, r.stderr].filter(Boolean).join('\n')).trim()
-    run = { label, isRunning: false, exitCode: r.exitCode, output: tail(output), shared: tail(redact(output)) }
+    run = { label, isRunning: false, exitCode: r.exitCode, output: tail(output, whole ? 200_000 : 8000), raw: tail(output, 200_000), whole }
     if (isTests && project === projectRun) noteTestRun($, label, output)
   } catch (err) {
     run = { label, isRunning: false, exitCode: -1, output: 'Could not run `' + argv.join(' ') + '`: ' + String(err) }
@@ -490,7 +494,8 @@ function askAboutTests($: Api, failures: TestFailure[]) {
 /** A run's result for Claude (tool results and command output in the transcript), with secrets redacted. */
 function formatRun(run: LastRun): string {
   const head = redact(run.exitCode === 0 ? `✓ ${run.label}` : `✗ ${run.label} (exit ${run.exitCode})`)
-  const body = run.shared ?? redact(run.output)
+  // Redacted whole before the cut, so a cut can't part a key from its value
+  const body = tail(redact(run.raw ?? run.output))
   return body ? `${head}\n${body}` : head
 }
 
@@ -513,6 +518,12 @@ async function checkArtisan(
     return { resolved, refused: resolved === 'tinker' ? 'tinker runs arbitrary PHP' : `${resolved} can destroy data` }
   }
   if (CONTAINED.test(resolved)) return { resolved }
+  // Tests stay in the folder only when they can't touch a real database (RefreshDatabase resets the one configured)
+  if (resolved === 'test') {
+    const xml = await $.fs.read('phpunit.xml').catch(() => $.fs.read('phpunit.xml.dist').catch(() => ''))
+    if (testsUseMemoryDb(xml)) return { resolved }
+    return { resolved, impact: "runs the test suite, and phpunit.xml doesn't send it to an in-memory database, so RefreshDatabase and the like can reset or fill a real one" }
+  }
   return {
     resolved,
     impact: IMPACTFUL[resolved] ?? "isn't one lara-cc knows to stay inside the project folder, so it may reach the database, queue, cache or network",
@@ -524,17 +535,28 @@ async function checkArtisan(
  * commands print as a matter of course taken out: `about`'s app URL, and route:list's domains (it runs with
  * --json so the domain is a field to drop, whatever options were asked for).
  */
-async function artisanForConversation($: Api, args: string, resolved: string | undefined, timeoutMs?: number): Promise<string> {
+async function artisanForConversation($: Api, args: string, resolved: string | undefined, timeoutMs = 600_000): Promise<string> {
   const argv = splitArgs(args)
+  if (resolved === 'about') {
+    // Read as JSON, whatever format was asked for, so only allowed values are shown (see aboutForClaude)
+    const r = await runPhp($, ['php', 'artisan', ...argv.filter(a => a !== '--json'), '--json', '--no-interaction'], { timeoutMs })
+    const text = aboutForClaude(r.stdout)
+    return text ? `✓ artisan ${redact(args)} (addresses and other values that could be confidential left out)\n${redact(text)}` : `✗ artisan ${redact(args)}\n${failureReason(r.stdout + '\n' + r.stderr)}`
+  }
   if (resolved === 'route:list') {
-    const r = await runPhp($, ['php', 'artisan', ...argv.filter(a => a !== '--json'), '--json', '--no-interaction'], { timeoutMs: 120_000 })
-    const lines = routeListLines(r.stdout)
-    if (lines) return tail(`✓ artisan ${redact(args)} (domains left out)\n` + lines.join('\n'))
-    // Not the JSON: an app without routes, or an error, said in a line that names no domain
-    return `✗ artisan ${redact(args)}\n` + failureReason(r.stdout + '\n' + r.stderr)
+    const project = projectRun
+    const r = await runPhp($, ['php', 'artisan', ...argv.filter(a => a !== '--json'), '--json', '--no-interaction'], { timeoutMs })
+    const routes = parseRouteList(r.stdout)
+    if (!routes) return `✗ artisan ${redact(args)}\n${failureReason(r.stdout + '\n' + r.stderr)}`
+    const verbose = argv.some(a => /^-v+$/.test(a))
+    const lines = routes.map(route => formatRoute(route) + (route.onDomain ? '  (own domain)' : '') + (verbose && route.middleware.length ? `  [${route.middleware.join(', ')}]` : ''))
+    const body = tail(redact(lines.join('\n')))
+    if (project === projectRun) lastRun = { label: 'artisan ' + args, isRunning: false, exitCode: r.exitCode, output: body }
+    redraw($)
+    return `✓ artisan ${redact(args)} (${plural(routes.length, 'route')}; domains left out)\n${body}`
   }
   const run = await runCommand($, 'artisan ' + args, ['php', 'artisan', ...argv, '--no-interaction'], timeoutMs)
-  return resolved === 'about' ? aboutWithoutAddresses(formatRun(run)) : formatRun(run)
+  return formatRun(run)
 }
 
 /** What Claude gets when the person says no to running something: not to try again, and how they'd run it. */
@@ -569,10 +591,12 @@ async function showToPerson($: Api, args: string, ask: boolean): Promise<string>
   if (ask) {
     const question =
       `Claude wants to see php artisan ${args}. Its output can hold passwords, keys, hosts and users, so lara-cc shows it to you in its pane and doesn't send it to Claude. Show it?`
+    const project = projectRun
     const answer = await $.ui.ask(question, { header: 'Privacy', options: ['Show me', "Don't run"] }).catch(() => "Don't run")
-    if (answer !== 'Show me') return NOT_RUN
+    // A yes is for the folder the question was about
+    if (answer !== 'Show me' || project !== projectRun) return NOT_RUN
   }
-  const run = await runCommand($, 'artisan ' + args, ['php', 'artisan', ...splitArgs(args), '--no-interaction'])
+  const run = await runCommand($, 'artisan ' + args, ['php', 'artisan', ...splitArgs(args), '--no-interaction'], 600_000, true)
   await openPane($, 'commands').catch(() => {})
   return (
     `${run.exitCode === 0 ? '✓' : '✗'} artisan ${redact(args)}: shown to the user in the lara-cc pane (Commands tab). ` +
@@ -1119,7 +1143,7 @@ function filterRoutes(list: TabRoute[], filter: string): TabRoute[] {
   return list.filter(r => `${methodLabel(r.method)} ${uriText(r)} ${r.name ?? ''} ${r.action}`.toLowerCase().includes(f))
 }
 
-function formatRoute(r: TabRoute): string {
+function formatRoute(r: { method: string; uri: string; name: string | null; action: string }): string {
   return `${methodLabel(r.method).padEnd(9)} ${uriText(r)}${r.name ? '  ' + r.name : ''}  ${shortClass(r.action)}`
 }
 
@@ -2317,7 +2341,8 @@ export const register: Register = on => {
               <Text bold color={lastRun.isRunning ? 'yellow' : lastRun.exitCode === 0 ? 'green' : 'red'}>
                 {lastRun.isRunning ? '… ' + lastRun.label : (lastRun.exitCode === 0 ? '✓ ' : '✗ ') + lastRun.label}
               </Text>
-              {lastRun.output.split('\n').slice(-(rows - 5)).map(l => line(l, true))}
+              {/* Output shown on Claude's request is drawn whole, for the pane to scroll: the person was told it's there */}
+              {(lastRun.whole ? lastRun.output.split('\n') : lastRun.output.split('\n').slice(-(rows - 5))).map(l => line(l, true))}
             </Box>
           ) : (
             <Text dimColor>Press a number to run a command, or type an artisan command.</Text>

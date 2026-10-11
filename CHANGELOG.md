@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-10-11
+
+### Changed
+
+- Claude running `artisan test` asks first unless `phpunit.xml` sends the tests to an in-memory database, since `RefreshDatabase` resets whichever database the tests use; `/lara-test` and the Tests tab don't ask.
+- Only Laravel's own `make:*` generators (and Livewire's, Volt's and Filament's file generators) run unasked; a package's `make:` command such as `make:filament-user`, which writes to the database, asks.
+- `config:show` or `db:show` output shown on Claude's request is kept and drawn whole on the Commands tab, so you can scroll to what Claude asked about.
+- `route:list` for Claude keeps the middleware with `-v`, keeps the requested timeout, shows on the Commands tab, and lists routes like the `routes` tool.
+
+### Fixed
+
+- Redaction keeps up on long words after an auth scheme (`token aaaa…` took most of a second).
+
+### Security
+
+- `about` for Claude is built from its JSON with an allow-list (versions, drivers, environment, plain words); the address filter missed URLs in JSON (PHP escapes their slashes) and IP hosts.
+- URL credentials containing `;`, `(`, `)` and the like, which userinfo allows, are redacted again.
+- An upper-case `BEARER` (or `BASIC`, `TOKEN`) credential, and secrets under quoted key names longer than 40 characters, are redacted again.
+- `route:list` output for Claude is redacted, so a secret in a route's path (a webhook token) is hidden.
+- Answering "Show me" for `config:show`/`db:show` no longer runs it if the session moved to another folder while the question was open.
+
 ## [0.11.1] - 2026-10-11
 
 ### Changed

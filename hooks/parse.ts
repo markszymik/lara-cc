@@ -627,8 +627,8 @@ export function routeWindow(at: number, top: number, rows: number, count: number
 // ─── Redaction: what goes to Claude ────────────────────────────────────────
 
 /** Key names whose value is a secret: `password=…`, `"api_key": "…"`, `'token' => '…'`, `DB_USERNAME=…`. */
-// Bounded on each side: no key name is that long, and unbounded it backtracks for seconds on a long word
-const SECRET_KEY = String.raw`[\w.-]{0,40}(?:passw(?:or)?d|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|app[_-]?key|authorization|credentials?|cookie|signature|dsn|username)[\w.-]{0,40}`
+// Bounded on each side (config keys run long, but not this long), so a long word can't make it backtrack for seconds
+const SECRET_KEY = String.raw`[\w.-]{0,100}(?:passw(?:or)?d|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|app[_-]?key|authorization|credentials?|cookie|signature|dsn|username)[\w.-]{0,100}`
 /**
  * A secret key and its value, in JSON (also escaped inside a JSON string, `\"password\":\"…\"`), PHP arrays,
  * query strings, headers and .env lines. A quoted value is taken whole, escaped quotes and spaces included.
@@ -642,11 +642,23 @@ const KEY_VALUE = new RegExp(
  * A serialized string can hold quotes, so the value ends where the next serialized value (or the object) starts.
  */
 const SERIALIZED = new RegExp(
-  String.raw`(s:\d+:(\\?")(?:[^"\\]|\\u0000){0,40}?${SECRET_KEY}\2;)s:\d+:\2[\s\S]{0,20000}?\2;(?=[sibdaOCN][:;]|\}|$)`,
+  String.raw`(s:\d+:(\\?")(?:[^"\\]|\\u0000){0,100}?${SECRET_KEY}\2;)s:\d+:\2[\s\S]{0,20000}?\2;(?=[sibdaOCN][:;]|\}|$)`,
   'gi',
 )
 /** Tokens recognisable by their prefix: AWS key ids, Stripe and Slack keys, GitHub tokens, JWTs. */
 const KNOWN_TOKENS = /\b(?:AKIA[0-9A-Z]{16}|(?:sk|pk|rk)_(?:live|test)_\w{8,}|xox[abeprs]-[\w-]{8,}|gh[pousr]_\w{20,}|github_pat_\w{20,}|eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,})/g
+
+/**
+ * A word after Bearer, Basic or Token that is a credential rather than prose ("CSRF token mismatch", "Basic
+ * authentication failed"): 8+ characters with a digit, base64's + / =, or a lower-case letter later followed by
+ * an upper-case one. Checked in two linear passes, so a long word can't make it backtrack.
+ */
+function looksLikeCredential(value: string): boolean {
+  if (value.length < 8) return false
+  if (/[\d+\/=]/.test(value)) return true
+  const lower = value.search(/[a-z]/)
+  return lower >= 0 && /[A-Z]/.test(value.slice(lower))
+}
 
 /** A stack frame's arguments, `Foo->bar('secret', Array)`, cut to `Foo->bar(...)`. */
 function frameWithoutArgs(line: string): string {
@@ -684,12 +696,13 @@ export function redact(text: string): string {
       return sqlWithoutValues(out)
     })
     .join('\n')
-    // The user (and password) in a URL, up to its last @, so a password with an @ in it goes too; never past
-    // the URL's end into the next JSON field or argument
-    .replace(/\b([a-z][\w+.-]*:\/\/)[^\s\/@"'`,;<>(){}\[\]]*(?:@[^\s\/@"'`,;<>(){}\[\]]*)*@/gi, '$1[redacted]@')
-    // The credential after an auth scheme: 8+ characters with a digit, a lower-then-upper case mix or base64's
-    // symbols, so prose ("CSRF token mismatch", "Basic authentication failed") is left alone
-    .replace(/\b([Bb]earer|[Bb]asic|[Tt]oken)\s+(?=[\w~+\/.=-]{8})(?=[\w~+\/.=-]*(?:\d|[a-z][\w~+\/.=-]*[A-Z]|[+\/=]))[\w~+\/.=-]*[\w~+\/=-]/g, '$1 [redacted]')
+    // The user (and password) in a URL, up to its last @, so a password with an @ (or ; ( ) , … which userinfo
+    // allows) goes too; a quote ends it, so it never runs into the next JSON field or argument
+    .replace(/\b([a-z][\w+.-]*:\/\/)[^\s\/@"'`<>]*(?:@[^\s\/@"'`<>]*)*@/gi, '$1[redacted]@')
+    .replace(/\b(bearer|basic|token)(\s+)([\w~+\/.=-]{8,})/gi, (all, scheme: string, space: string, value: string) => {
+      const credential = value.replace(/\.+$/, '')
+      return looksLikeCredential(credential) ? `${scheme}${space}[redacted]${value.slice(credential.length)}` : all
+    })
     .replace(/\bbase64:[A-Za-z0-9+\/]{16,}={0,2}/g, 'base64:[redacted]')
     // Database login errors name the user: `for user 'forge'@'10.0.0.5'`, `for user "app"`
     .replace(/(\bfor user\s+)(["'])[^"']*\2(@(["'])[^"']*\4)?/gi, "$1$2?$2")
@@ -701,25 +714,43 @@ export function redact(text: string): string {
     .replace(/\b[a-f0-9]{40,}\b/g, '[redacted]')
 }
 
-/**
- * `artisan about` (text or `--json`) for the conversation, without the app's URL or any other web address or
- * host name a package lists. What Claude needs from it, the versions, drivers and environment, stays.
- */
-export function aboutWithoutAddresses(text: string): string {
-  return text
-    .replace(/^(\s*URL\b\s*\.*\s*)\S.*$/gim, '$1[not shown]')
-    .replace(/("url"\s*:\s*)"(?:[^"\\]|\\.)*"/gi, '$1"[not shown]"')
-    .replace(/\b[a-z][\w+.-]*:\/\/[^\s"']+/gi, '[address not shown]')
-    // A row whose value is a host name: `Url ....... shop.test`, `Domain ....... admin.example.com`
-    .replace(/^(\s*[\w ]+?\s\.{2,}\s+)[\w-]+(?:\.[\w-]+)*\.[a-z][\w-]*(?::\d+)?(?:\/\S*)?\s*$/gim, '$1[not shown]')
-    .replace(/("[\w ]+"\s*:\s*)"[\w-]+(?:\.[\w-]+)*\.[a-z][\w-]*(?::\d+)?(?:\/[^"]*)?"/gi, '$1"[not shown]"')
-}
+/** about's keys whose value is shown whatever it is: not addresses, and what Claude asks about. */
+const ABOUT_SHOWN = /^(application_name|environment|timezone|locale)$/
 
 /**
- * `artisan route:list --json` as lines for the conversation, each route's domain left out (a route with one says
- * so, without naming it). Undefined when the output isn't that JSON, e.g. an app with no routes.
+ * `artisan about --json` for the conversation, as `Section` / `  key: value` lines, from an allow-list rather
+ * than by spotting addresses: a value is shown when it's true/false, a number, a version (`12.33.0`, `12.x-dev`),
+ * a driver-like word (`mysql`, `redis`, `ENABLED`), or under ABOUT_SHOWN. Anything else (the app's URL, a host,
+ * an IP, a path, a package's own setting) is `[not shown]`. Undefined when the output isn't about's JSON.
  */
-export function routeListLines(stdout: string): string[] | undefined {
+export function aboutForClaude(stdout: string): string | undefined {
+  const data = phpJson(stdout)
+  if (!data) return undefined
+  const shown = (key: string, value: unknown): string => {
+    if (value === null || typeof value === 'boolean' || typeof value === 'number') return String(value)
+    if (typeof value !== 'string') return Array.isArray(value) ? value.map(v => shown(key, v)).join(', ') : '[not shown]'
+    if (ABOUT_SHOWN.test(key)) return value
+    const version = /^v?\d+(\.\d+)*(\.x)?(-[\w.]+)?$/.test(value) && !/^\d{1,3}(\.\d{1,3}){3}$/.test(value)
+    return version || /^[\w -]{1,40}$/.test(value) ? value : '[not shown]'
+  }
+  const lines: string[] = []
+  for (const [section, entries] of Object.entries(data)) {
+    lines.push(section)
+    if (entries && typeof entries === 'object' && !Array.isArray(entries)) {
+      for (const [key, value] of Object.entries(entries)) lines.push(`  ${key}: ${shown(key, value)}`)
+    } else lines.push(`  ${shown(section, entries)}`)
+  }
+  return lines.join('\n')
+}
+
+/** A route from `artisan route:list --json`, its domain reduced to whether it has one. */
+export type ListedRoute = { method: string; uri: string; name: string | null; action: string; onDomain: boolean; middleware: string[] }
+
+/**
+ * `artisan route:list --json` without domains: the conversation gets every route and whether it has a domain
+ * of its own, never the domain. Undefined when the output isn't that JSON, e.g. an app with no routes.
+ */
+export function parseRouteList(stdout: string): ListedRoute[] | undefined {
   const start = stdout.indexOf('[')
   const end = stdout.lastIndexOf(']')
   if (start < 0 || end < start) return undefined
@@ -733,10 +764,22 @@ export function routeListLines(stdout: string): string[] | undefined {
   const text = (v: unknown) => (typeof v === 'string' ? v : '')
   return list
     .filter((r): r is Record<string, unknown> => !!r && typeof r === 'object')
-    .map(r => {
-      const own = text(r.domain) ? '  (own domain)' : ''
-      return `${methodLabel(text(r.method)).padEnd(9)} ${text(r.uri)}${own}${text(r.name) ? '  ' + text(r.name) : ''}  ${shortClass(text(r.action))}`
-    })
+    .map(r => ({
+      method: text(r.method),
+      uri: text(r.uri),
+      name: text(r.name) || null,
+      action: text(r.action),
+      onDomain: !!text(r.domain),
+      middleware: Array.isArray(r.middleware) ? r.middleware.filter((m): m is string => typeof m === 'string') : [],
+    }))
+}
+
+/**
+ * Whether phpunit.xml sends the tests to an in-memory SQLite database, so a run can't reset or fill a real one
+ * (RefreshDatabase). Commented-out lines don't count.
+ */
+export function testsUseMemoryDb(xml: string): boolean {
+  return /<env\s+name="DB_DATABASE"\s+value=":memory:"/.test(xml.replace(/<!--[\s\S]*?-->/g, ''))
 }
 
 // ─── Test runs ─────────────────────────────────────────────────────────────
