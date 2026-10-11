@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.4] - 2026-10-11
+
+### Changed
+
+- The stated minimum Claude Code version is now v2.1.295, the oldest the tests pass on: since 0.9.0, older versions (2.1.287 to 2.1.294) can't draw the pane's Routes tab. CI now runs on both v2.1.295 and v2.1.296, and checks the README names each.
+
+### Security
+
+- CI runs with a read-only token and doesn't keep the checkout's credentials on disk while it runs code installed from npm.
+
 ## [0.11.3] - 2026-10-11
 
 ### Added

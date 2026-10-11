@@ -1348,7 +1348,7 @@ async function runFix($: Api, fix: Fix) {
 
 /** public/hot names a local dev server and nothing listens there (curl exit 7: couldn't connect). Vite run elsewhere counts as running. */
 async function viteIsGone($: Api): Promise<boolean> {
-  if (services.vite?.run || !(await $.fs.exists('public/hot'))) return false
+  if (services.vite.run || !(await $.fs.exists('public/hot'))) return false
   const url = localHotUrl(await $.fs.read('public/hot').catch(() => ''))
   if (!url) return false
   // -q first so a ~/.curlrc can't change the request; -k because local dev certificates are often self-signed
@@ -1571,8 +1571,9 @@ async function checkDeps($: Api): Promise<Check[]> {
  */
 function leaveProject() {
   projectRun++
-  for (const [name, def] of Object.entries(SERVICES)) {
-    const svc = services[name]!
+  for (const name of Object.keys(SERVICES) as (keyof typeof SERVICES)[]) {
+    const svc = services[name]
+    const def = SERVICES[name]
     // Closing the stream kills the child; its loop sees the run is no longer the service's and stays quiet
     if (svc.run) void svc.run.stream.return({ code: null, signal: 'SIGTERM' }).catch(() => {})
     Object.assign(svc, { argv: [...def.argv], label: def.label, run: undefined, startedAt: undefined, lines: [], partial: '' })

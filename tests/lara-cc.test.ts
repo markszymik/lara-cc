@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { On, PromptOrigin } from 'claude-code'
+import type { On, PromptOrigin, RenderSurface } from 'claude-code'
 
 import { PHP_OPTIONS } from '../hooks/parse'
 import { LOG } from './fixtures'
@@ -68,8 +68,12 @@ const plain = (argv: readonly string[]) => {
   return at < 0 ? [...argv] : [...argv.slice(0, at), ...argv.slice(at + PHP_OPTIONS.length)]
 }
 
-/** The session starting in `cwd`, as the REPL starts it. */
-const start = ($: Engine, cwd = '/app') => $.session.start({ cwd, surface: 'terminal', isInteractive: true })
+/** The session starting in `cwd`, as the REPL starts it unless told otherwise (`claude -p`: no surface, nobody at the prompt). */
+const start = ($: Engine, cwd = '/app', how: { surface?: RenderSurface | null; isInteractive?: boolean } = {}) =>
+  $.session.start({ cwd, surface: how.surface === undefined ? 'terminal' : how.surface, isInteractive: how.isInteractive ?? true })
+
+/** The person's own Enter at the prompt: a slash command they typed. */
+const TYPED: PromptOrigin = { kind: 'composer' }
 
 /**
  * `/<name> <args>` run on the main screen. Without `origin` it is relayed (Claude, another plugin), stamped
@@ -235,7 +239,7 @@ test('/lara-artisan runs php artisan with the arguments and returns clean output
   fakeProject(on, ran)
   await start($)
 
-  const answer = await slash($, 'lara-artisan', 'make:model Post -m')
+  const answer = await slash($, 'lara-artisan', 'make:model Post -m', TYPED)
   expect(ran.find(argv => argv[2] === 'make:model')).toEqual(['php', 'artisan', 'make:model', 'Post', '-m', '--no-interaction'])
   expect(answer.text).toContain('✓ artisan make:model Post -m')
   expect(answer.text).not.toContain('\u001b[')
@@ -246,7 +250,7 @@ test('/lara-npm uses the package manager from the lockfile', async ($, on) => {
   fakeProject(on, ran)
   await start($)
 
-  await slash($, 'lara-npm', 'build')
+  await slash($, 'lara-npm', 'build', TYPED)
   expect(ran.find(argv => argv[1] === 'run')).toEqual(['pnpm', 'run', 'build'])
 })
 
@@ -255,13 +259,13 @@ test('/lara-routes filters the route list', async ($, on) => {
   fakeProject(on, ran)
   await start($)
 
-  const answer = await slash($, 'lara-routes', 'posts')
+  const answer = await slash($, 'lara-routes', 'posts', TYPED)
   expect(answer.text).toContain('1 of 6 routes')
   expect(answer.text).toContain('posts.store')
   expect(answer.text).not.toContain('users.index')
   // The same list as the Routes tab: one PHP boot, no route:list, and no route's domain
   expect(ran.some(argv => argv.join(' ') === 'php artisan route:list --json')).toBe(false)
-  expect((await slash($, 'lara-routes', '')).text).not.toContain('example')
+  expect((await slash($, 'lara-routes', '', TYPED)).text).not.toContain('example')
 })
 
 test("the routes tool redacts why the routes couldn't be read", async ($, on) => {
@@ -341,7 +345,7 @@ test('/lara-schedule reports the scheduler', async ($, on) => {
   fakeProject(on, ran)
   await start($)
 
-  const answer = await slash($, 'lara-schedule', '')
+  const answer = await slash($, 'lara-schedule', '', TYPED)
   expect(answer.text).toBe('Scheduler is stopped.')
 })
 
@@ -401,7 +405,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       asked.push(e.text)
       return { text: e.text }
     })
-    await start($)
+    await start($, '/app', { surface })
     await clock.settle()
 
     const band = await $.ui.mount({
@@ -448,7 +452,7 @@ test('with Herd as the PATH php, artisan, composer and services run on the binar
   expect(ran).toContainEqual([herd, 'artisan', 'help', 'migrate', '--format=json', '--no-interaction'])
   expect(ran).toContainEqual([herd, 'artisan', 'migrate', '--no-interaction'])
 
-  await slash($, 'lara-composer', 'install')
+  await slash($, 'lara-composer', 'install', TYPED)
   expect(ran).toContainEqual([herd, COMPOSER, 'install', '--no-interaction'])
 
   const started = await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
@@ -467,7 +471,7 @@ test("every PHP the mod starts sends PHP's own warnings to stderr, so stdout hol
   await clock.settle()
 
   await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'migrate' })
-  await slash($, 'lara-composer', 'install')
+  await slash($, 'lara-composer', 'install', TYPED)
   await $.tool.call({ tool: 'mcp__lara-cc__routes' } as never)
   await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
   // Every launch of PHP: the probes, artisan, the php -r snippets, Composer through PHP, the worker
@@ -490,7 +494,7 @@ test('with Herd installed but another php on PATH, the PATH php stays', async ($
 
   await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'migrate' })
   expect(ran).toContainEqual(['php', 'artisan', 'migrate', '--no-interaction'])
-  await slash($, 'lara-composer', 'install')
+  await slash($, 'lara-composer', 'install', TYPED)
   expect(ran).toContainEqual(['composer', 'install', '--no-interaction'])
 })
 
@@ -499,7 +503,7 @@ test('with Herd, a Composer that is a shell shim runs as is, not through PHP', a
   fakeProject(on, ran, { herd: HERD_BIN + '/php83', shellPhp: HERD_BIN + '/php84', composerShim: true })
   await start($)
 
-  await slash($, 'lara-composer', 'install')
+  await slash($, 'lara-composer', 'install', TYPED)
   expect(ran).toContainEqual(['composer', 'install', '--no-interaction'])
 })
 
@@ -508,7 +512,7 @@ test('without Herd, php and composer come from PATH', async ($, on) => {
   fakeProject(on, ran)
   await start($)
 
-  await slash($, 'lara-composer', 'install')
+  await slash($, 'lara-composer', 'install', TYPED)
   expect(ran).toContainEqual(['composer', 'install', '--no-interaction'])
   expect(ran.some(argv => argv.join(' ') === 'which composer')).toBe(false)
 })
@@ -672,7 +676,7 @@ test("about and route:list reach the conversation without the app's URL or any r
 
   for (const output of [
     await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'about' }),
-    await slash($, 'lara-artisan', 'about', { kind: 'composer' }),
+    await slash($, 'lara-artisan', 'about', TYPED),
   ]) {
     const text = JSON.stringify(output)
     expect(text).toContain('12.33.0')
@@ -682,7 +686,7 @@ test("about and route:list reach the conversation without the app's URL or any r
 
   for (const output of [
     await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'route:list --path=team' }),
-    await slash($, 'lara-artisan', 'route:list', { kind: 'composer' }),
+    await slash($, 'lara-artisan', 'route:list', TYPED),
   ]) {
     const text = JSON.stringify(output)
     expect(text).toContain('users.index')
@@ -727,7 +731,7 @@ test('config:show and db:show are shown to the person in the pane, never to Clau
 
   // Typed by the person: no question, same result
   const before = asked.length
-  const typed = JSON.stringify(await slash($, 'lara-artisan', 'config:show database', { kind: 'composer' }))
+  const typed = JSON.stringify(await slash($, 'lara-artisan', 'config:show database', TYPED))
   expect(asked.length).toBe(before)
   expect(shown()).toBe(2)
   expect(typed).not.toContain('hunter2')
@@ -908,7 +912,7 @@ test('representative secrets reach Claude through no lara-cc route: tools, comma
     '/lara-queue failed': await slash($, 'lara-queue', 'failed'),
     'artisan tool output': await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'make:model Post' }),
     "artisan tool, a name artisan can't resolve": await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'nosuch:thing' }),
-    '/lara-artisan output': await slash($, 'lara-artisan', 'make:model Post', { kind: 'composer' }),
+    '/lara-artisan output': await slash($, 'lara-artisan', 'make:model Post', TYPED),
     '/lara-test': await slash($, 'lara-test', ''),
   }
   await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
@@ -956,7 +960,7 @@ test('with nobody to answer (claude -p), logs, failed jobs and Boost logs are no
     boostRan = true
     return { result: 'Login failed' } as never
   })
-  await start($)
+  await start($, '/app', { surface: null, isInteractive: false })
   await clock.settle()
 
   for (const output of [
@@ -1098,7 +1102,7 @@ test('retrying failed jobs and starting a worker ask when Claude does it, not wh
 
   // Typed by the person: no question
   const before = asked.length
-  await slash($, 'lara-queue', 'retry all', { kind: 'composer' })
+  await slash($, 'lara-queue', 'retry all', TYPED)
   expect(retries()).toBe(1)
   expect(asked.length).toBe(before)
 
@@ -1116,7 +1120,7 @@ test('restarting a worker the person started needs no question, so Claude can re
   const asked: string[] = []
   fakeProject(on, ran, { asked, spawned, hold: ['queue:work'], run: "Don't run" })
   await start($)
-  await slash($, 'lara-queue', 'start', { kind: 'composer' })
+  await slash($, 'lara-queue', 'start', TYPED)
 
   await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'restart' })
   expect(spawned.filter(argv => argv.includes('queue:work')).length).toBe(2)
@@ -1134,7 +1138,7 @@ test('/lara-composer and /lara-npm ask when the person did not type them', async
   expect(ran.some(argv => argv.includes('evil/pkg') || argv.join(' ') === 'pnpm run build')).toBe(false)
   expect(asked.length).toBe(2)
 
-  await slash($, 'lara-composer', 'require laravel/pail', { kind: 'composer' })
+  await slash($, 'lara-composer', 'require laravel/pail', TYPED)
   expect(ran.some(argv => argv.includes('laravel/pail'))).toBe(true)
   expect(asked.length).toBe(2)
 })

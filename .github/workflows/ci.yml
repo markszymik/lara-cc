@@ -1,26 +1,38 @@
 name: CI
 
-# Validate the mod and run its tests. The type check (tsc) runs locally:
-# it needs .claude-plugin/types/, which Claude Code writes when it loads the mod.
+# Validate the mod and run its tests on the oldest Claude Code it supports and the one it was last validated on.
+# The type check (tsc) runs locally: it needs .claude-plugin/types/, which Claude Code writes when it loads the mod.
 
 on:
   push:
     branches: [main]
   pull_request:
 
+# Read the code, nothing more: the steps below run code fetched from npm
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The minimum and the last validated version, as the README states them
+        claude-code: ['2.1.295', '2.1.296']
     env:
       # No update checks or telemetry: CI needs only the local CLI
       DISABLE_AUTOUPDATER: "1"
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      # The version the tests were last validated on; bump it with the README
-      - run: npm install -g @anthropic-ai/claude-code@2.1.296
+      - name: README names this version
+        run: grep -qF "v${{ matrix.claude-code }}" README.md
+      - run: npm install -g @anthropic-ai/claude-code@${{ matrix.claude-code }}
       - run: claude plugin validate --strict .
       - run: claude plugin test .

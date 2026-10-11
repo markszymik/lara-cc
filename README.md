@@ -10,7 +10,7 @@ Tooling for Laravel apps inside Claude Code: a `/lara` pane, managed dev process
 
 ## Install
 
-Needs Claude Code v2.1.287 or later (`claude --version`). In a Claude Code terminal session, run:
+Needs Claude Code v2.1.295 or later (`claude --version`). In a Claude Code terminal session, run:
 
 ```
 /plugin install lara-cc --marketplace markszymik/lara-cc
@@ -156,7 +156,7 @@ Toggles on the **Services** tab, remembered between sessions: restart queue on P
 
 macOS or Linux (log following uses `tail -F`), PHP on your `PATH` (or Herd), and a Laravel app with `artisan` in the folder you start Claude Code from. Queue job tracking reads `queue:work` output; with Horizon you still get pending and failed jobs.
 
-**Compatibility.** Needs Claude Code v2.1.287 or later; last validated on v2.1.296. CI validates the mod and runs its tests on every push and pull request. Mod APIs are early access and can change between Claude Code releases, so a newer version may need a lara-cc update.
+**Compatibility.** Needs Claude Code v2.1.295 or later; last validated on v2.1.296. CI validates the mod and runs its tests on both on every push and pull request (older versions can't draw the pane's Routes tab). Mod APIs are early access and can change between Claude Code releases, so a newer version may need a lara-cc update.
 
 ## Customise
 
