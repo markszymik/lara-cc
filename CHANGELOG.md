@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-11
+
+### Fixed
+
+- A Herd service whose port can't be checked (no `nc`, or `nc` failing) shows as "unchecked" in the band and on the Services tab, instead of passing as running; starting it no longer reports "running" without having checked.
+- When the session moves to another folder, nothing of the previous project carries over: a Horizon setup no longer sticks to an app without Horizon, the processes the session started there are stopped, and its logs, jobs, queue state, service output, last command and Herd debug capture are cleared. Results still arriving for the folder left behind are dropped, and the background timers aren't doubled.
+
 ## [0.9.0] - 2026-10-11
 
 ### Added

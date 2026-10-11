@@ -18,7 +18,10 @@ import { LOG } from './fixtures'
  * `pending`: migrations migrate:status lists as pending, until `migrate` runs; `answers`: answers to the next
  * questions, in turn, before `share`; `editor`: the editor Laravel's `app.editor` names; `noEditor`: its links don't open;
  * `routesFail`: what routesPhp prints as it fails; `raw`: every command run or spawned, PHP_OPTIONS included (`ran`
- * and `spawned` leave them out, so they read as typed).
+ * and `spawned` leave them out, so they read as typed); `dir`: the session's folder (default /app); `nc`: nc is
+ * missing, or the exit code it gives every port; `hold`: spawned processes whose argv has one of these keep running
+ * until stopped; `aboutGate`: `artisan about` answers once it resolves, with the env at the time it was asked;
+ * `toasts`: the toasts shown.
  */
 type Fake = {
   history?: string
@@ -46,6 +49,11 @@ type Fake = {
   editor?: string
   noEditor?: boolean
   routesFail?: string
+  dir?: string
+  nc?: 'missing' | number
+  hold?: string[]
+  aboutGate?: Promise<void>
+  toasts?: string[]
 }
 
 const COMPOSER = '/opt/bin/composer'
@@ -112,24 +120,33 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
   })
   on('command.register', () => ({ value: {} }))
   on('tool.register', () => ({ value: {} }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', ($, e) => {
+    fake.toasts?.push(e.text)
+    return { value: undefined }
+  })
   on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
     const question = String((e as unknown as { questions: { question: string }[] }).questions[0]?.question)
     fake.asked?.push(question)
     return { result: { answers: { [question]: fake.answers?.shift() ?? fake.share ?? 'Send redacted' } } } as never
   })
-  on('session.cwd', () => ({ value: '/app' }))
+  on('session.cwd', () => ({ value: fake.dir ?? '/app' }))
   on('fs.list', () => ({ value: [] }))
   // Nothing else draws in the band
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => $.ui.resolve(e).Box({}))
   // tail -F of the log: a quiet stream that ends at once
-  on('process.spawn', async function* ($, e) {
+  on('process.spawn', async function* ($, e, next) {
     fake.raw?.push([...e.argv])
     fake.spawned?.push(plain(e.argv))
     if (e.argv[0] === 'tail' && fake.live) yield { stream: 'stdout' as const, text: fake.live }
+    if (fake.hold?.some(word => e.argv.includes(word))) {
+      yield { stream: 'stdout' as const, text: 'started\n' }
+      // Runs until the mod closes the stream
+      await new Promise<void>(resolve => next.signal.addEventListener('abort', () => resolve()))
+      return { value: { code: null, signal: 'SIGTERM' as const } }
+    }
     return { value: { code: fake.exits?.[e.argv[0]!] ?? 0, signal: null } }
   })
-  on('process.run', ($, e) => {
+  on('process.run', async ($, e) => {
     fake.raw?.push([...e.argv])
     const argv = plain(e.argv)
     ran.push(argv)
@@ -137,7 +154,11 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
     const missing = { value: { exitCode: 1, stdout: '', stderr: 'not found', isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv[0] === 'tail') return ok(fake.history ?? '')
     if (argv[0] === 'curl') return { value: { exitCode: fake.curl ?? 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-    if (argv.join(' ') === 'php artisan about --json') return ok(JSON.stringify({ environment: { environment: fake.env ?? 'local' } }))
+    if (argv.join(' ') === 'php artisan about --json') {
+      const env = fake.env ?? 'local'
+      await fake.aboutGate
+      return ok(JSON.stringify({ environment: { environment: env } }))
+    }
     if (argv[0] === 'plutil') return argv.at(-1) === HERD_PLIST && fake.herdServices ? ok(JSON.stringify(fake.herdServices)) : missing
     // Herd starts the service: its port answers from then on
     if (argv.includes('migrate:status')) return ok(Array.from({ length: fake.pending ?? 0 }, (_, i) => `2026_01_0${i + 1}_000000_x ..... Pending`).join('\n'))
@@ -148,7 +169,11 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
       fake.closed = fake.closed?.filter(port => port !== Number(argv.at(-2)))
       return ok('')
     }
-    if (argv[0] === 'nc') return { value: { exitCode: fake.closed?.includes(Number(argv.at(-1))) ? 1 : 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (argv[0] === 'nc') {
+      if (fake.nc === 'missing') throw new Error('spawn nc ENOENT')
+      const exitCode = fake.nc ?? (fake.closed?.includes(Number(argv.at(-1))) ? 1 : 0)
+      return { value: { exitCode, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     // Herd: which binary serves this folder, and Composer's path; without Herd there's no `herd` on PATH
     if (argv[0] === 'herd') return fake.herd ? ok(`${fake.herd}\n8.3.21`) : missing
     if (argv.join(' ') === 'which herd') return fake.herd ? ok(HERD_CLI) : missing
@@ -650,6 +675,119 @@ test('a stopped Herd service starts from its button on the Services tab, with va
   // The script text is fixed: nothing from the plist is written into it
   expect(osascript.filter((_, i) => osascript[i - 1] === '-e').join('\n')).not.toContain('mysql')
   expect(await drawBand($)).not.toContain('stopped')
+})
+
+for (const nc of ['missing', 2] as const) {
+  test(`a Herd service nc can't check (${nc === 'missing' ? 'nc missing' : 'exit ' + nc}) reads as unchecked, never running or stopped`, async ($, on) => {
+    const ran: string[][] = []
+    const toasts: string[] = []
+    const connections = [{ use: 'database', driver: 'mysql', port: 3306 }]
+    const clock = fakeProject(on, ran, { connections, herdServices: [MYSQL, REDIS], nc, toasts })
+    on('ui.open', () => ({ value: undefined }))
+    await $.session.start({ cwd: '/app' })
+    await clock.settle()
+
+    const band = await drawBand($)
+    expect(band).toContain('Herd MySQL unchecked')
+    expect(band).not.toContain('stopped')
+    // Redis isn't used, so it isn't flagged either way
+    expect(band).not.toContain('Redis')
+
+    const pane = await mountPane($)
+    await pane.press({ key: 'tab-services' })
+    const drawn = JSON.stringify(await pane.drawn())
+    expect(drawn).toContain('? MySQL 8.4.11 :3306 unchecked')
+    expect(drawn).not.toContain('● MySQL')
+
+    // Herd is asked, but the toast doesn't claim it's running, and a probe that can't answer gets a few tries, not 20
+    const probes = () => ran.filter(argv => argv[0] === 'nc' && argv.at(-1) === '3306').length
+    const before = probes()
+    await pane.press({ key: 'herd-start-3306' })
+    // Past the two retries, half a second apart
+    await clock.advance(1000)
+    expect(toasts.at(-1)).toContain("couldn't check port 3306")
+    // Three for the start, one for the checks that run after it
+    expect(probes() - before).toBe(4)
+  })
+}
+
+test('moving to another folder leaves nothing of the last: Horizon, its worker and output, logs and checks', async ($, on) => {
+  const ran: string[][] = []
+  const spawned: string[][] = []
+  const fake: Fake = { spawned, hold: ['horizon'], history: LOG, env: 'production', files: { 'composer.json': '{"require":{"laravel/horizon":"^5.0"}}' } }
+  const clock = fakeProject(on, ran, fake)
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+  await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
+  await clock.settle()
+  expect(spawned).toContainEqual(['php', 'artisan', 'horizon'])
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'status' }))).toContain('Horizon')
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__logs' }))).toContain('Call to undefined method')
+  expect(await drawBand($)).toContain('env: production')
+
+  // A plain Laravel app, without Horizon
+  Object.assign(fake, { dir: '/other', history: '', env: 'local', files: {} })
+  await $.session.start({ cwd: '/other' })
+  await clock.settle()
+
+  const status = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'status' }))
+  expect(status).not.toContain('Horizon')
+  expect(status).not.toContain('started')
+  // Not even the old worker's dying words
+  const output = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'logs' }))
+  expect(output).not.toContain('artisan horizon')
+  expect(output).not.toContain('■')
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__logs' }))).not.toContain('Call to undefined method')
+  expect(await drawBand($)).not.toContain('env: production')
+
+  await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
+  await clock.settle()
+  expect(spawned.at(-1)).toContain('queue:work')
+})
+
+test('what the last folder answers after the session has moved on is dropped', async ($, on) => {
+  const ran: string[][] = []
+  let answer = () => {}
+  // The first folder's `artisan about` is slow, and says production
+  const fake: Fake = { env: 'production', aboutGate: new Promise<void>(resolve => (answer = resolve)) }
+  const clock = fakeProject(on, ran, fake)
+  await $.session.start({ cwd: '/app' })
+
+  Object.assign(fake, { dir: '/other', env: 'local', aboutGate: undefined })
+  await $.session.start({ cwd: '/other' })
+  await clock.settle()
+  answer()
+  await clock.settle()
+
+  expect(await drawBand($)).not.toContain('env: production')
+})
+
+test('a session that starts again in the same folder keeps its worker, its output and what is still on its way', async ($, on) => {
+  const ran: string[][] = []
+  let answer = () => {}
+  let answerAgain = () => {}
+  // The first start's `artisan about` is slow, and says production
+  const fake: Fake = { hold: ['queue:work'], env: 'production', aboutGate: new Promise<void>(resolve => (answer = resolve)) }
+  const clock = fakeProject(on, ran, fake)
+  on('ui.open', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/app' })
+  await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
+  await $.command.run({ command: 'lara-artisan', args: 'make:model Post' })
+
+  Object.assign(fake, { env: 'local', aboutGate: new Promise<void>(resolve => (answerAgain = resolve)) })
+  await $.session.start({ cwd: '/app' })
+  answer()
+  await clock.settle()
+
+  // The late answer is this folder's, so it counts
+  expect(await drawBand($)).toContain('env: production')
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'logs' }))).toContain('started')
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' }))).toContain('already running')
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-commands' })
+  expect(JSON.stringify(await pane.drawn())).toContain('artisan make:model Post')
+  answerAgain()
+  await clock.settle()
 })
 
 async function mountPane($: Engine) {

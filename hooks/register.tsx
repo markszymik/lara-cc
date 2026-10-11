@@ -143,6 +143,10 @@ for (const [name, def] of Object.entries(SERVICES)) {
 
 let settings: Settings = { ...DEFAULT_SETTINGS }
 let projectDir = ''
+// Counts project detections, so async work started for a folder the session has since left is dropped
+let projectRun = 0
+// Cancels the timers session.start set, so running it again doesn't add a second set
+let timers: { cancel: () => void }[] = []
 let isLaravel = false
 let hasPint = false
 let pm = 'npm'
@@ -209,7 +213,8 @@ let checkAgain = false
 let depsSeen = ''
 let depsChecks: Check[] = []
 // Herd's installed services and whether each listens; services.plist is re-read only when it changes
-let herdList: (HerdService & { up: boolean })[] = []
+type Probe = 'up' | 'down' | 'unknown'
+let herdList: (HerdService & { up: Probe })[] = []
 let herdSeen = -2
 let herdInstalled: HerdService[] = []
 // Ports of the Herd services a start button is starting, so it reads "starting…" meanwhile
@@ -323,7 +328,9 @@ const dirOf = (path: string) => path.slice(0, path.lastIndexOf('/'))
  * Asks only about this folder: reads no site list and no .env.
  */
 async function detectPhp($: Api) {
+  const project = projectRun
   const [herd, shell, hasHerd] = await Promise.all([probePhp($, ['herd', 'php']), probePhp($, ['php']), onPath($, 'herd')])
+  if (project !== projectRun) return
   if (!herd) {
     const using = shell ? `PHP ${shell.version} from PATH` : ''
     phpInfo = hasHerd ? `Herd didn't say which PHP serves this folder${using ? `; using ${using}` : ''}` : using
@@ -340,7 +347,7 @@ async function detectPhp($: Api) {
   const composer = await onPath($, 'composer')
   if (!composer) return
   const r = await $.process.run([herd.binary, composer, '--version', '--no-ansi'], { timeoutMs: 15_000 }).catch(() => undefined)
-  if (r?.exitCode === 0 && /^Composer version/m.test(r.stdout)) composerArgv = [herd.binary, ...PHP_OPTIONS, composer]
+  if (project === projectRun && r?.exitCode === 0 && /^Composer version/m.test(r.stdout)) composerArgv = [herd.binary, ...PHP_OPTIONS, composer]
 }
 
 /** `argv` with php, composer and Pint run on the PHP that serves this folder, with PHP_OPTIONS. */
@@ -363,22 +370,28 @@ async function runPhp($: Api, argv: string[], init: { timeoutMs: number }) {
 /** Run a command, keep its output for the Commands tab, and return it. */
 async function runCommand($: Api, label: string, argv: string[], timeoutMs = 600_000): Promise<LastRun> {
   const isTests = isTestCommand(argv.join(' '))
+  const project = projectRun
   lastRun = { label, isRunning: true, output: '' }
   if (isTests) testsRunning = true
   redraw($)
+  let run: LastRun
   try {
     const r = await runPhp($, argv, { timeoutMs })
     const output = stripAnsi([r.stdout, r.stderr].filter(Boolean).join('\n')).trim()
-    lastRun = { label, isRunning: false, exitCode: r.exitCode, output: tail(output) }
-    if (isTests) noteTestRun($, label, output)
+    run = { label, isRunning: false, exitCode: r.exitCode, output: tail(output) }
+    if (isTests && project === projectRun) noteTestRun($, label, output)
   } catch (err) {
-    lastRun = { label, isRunning: false, exitCode: -1, output: 'Could not run `' + argv.join(' ') + '`: ' + String(err) }
+    run = { label, isRunning: false, exitCode: -1, output: 'Could not run `' + argv.join(' ') + '`: ' + String(err) }
   }
-  if (isTests) testsRunning = false
+  // The caller still gets the result; the Commands tab doesn't show it in another folder
+  if (project === projectRun) {
+    lastRun = run
+    if (isTests) testsRunning = false
+  }
   redraw($)
   // optimize:clear, composer install, artisan up… change what the checks see
   void checkHealth($)
-  return lastRun
+  return run
 }
 
 /** Send `text` to Claude as the person's message: the ask Claude buttons. */
@@ -486,7 +499,9 @@ function onServiceOutput($: Api, svc: Service, text: string) {
 async function startService($: Api, name: string): Promise<string> {
   const svc = services[name]
   if (!svc) return `Unknown service "${name}". Known: ${Object.keys(services).join(', ')}`
+  const project = projectRun
   await phpReady
+  if (project !== projectRun) return `${svc.label} not started: the session moved to another folder.`
   // Nothing awaits between this check and the spawn, so two quick starts can't both get through
   if (svc.run) return `${svc.label} is already running.`
 
@@ -506,19 +521,23 @@ async function startService($: Api, name: string): Promise<string> {
     try {
       let step = await stream.next()
       while (!step.done) {
-        onServiceOutput($, svc, step.value.text)
+        // A stop that timed out has let go of the run: what it still prints isn't the service's any more
+        if (svc.run === run) onServiceOutput($, svc, step.value.text)
         step = await stream.next()
       }
       // A stream closed by stopService ends without a result
       const end = step.value as ProcessSpawnResult | undefined
-      if (!end || end.signal) svc.lines.push('■ stopped')
-      else svc.lines.push(`■ exited with code ${end.code}`)
-      if (end?.code) {
-        svc.crashed = { code: end.code, seen: paneOpen && tab === 'services' }
-        toast($, `${svc.label} exited with code ${end.code}`)
+      // A stop that let go of the run (timed out, or the session moved on) has said its piece already
+      if (svc.run === run) {
+        if (!end || end.signal) svc.lines.push('■ stopped')
+        else svc.lines.push(`■ exited with code ${end.code}`)
+        if (end?.code) {
+          svc.crashed = { code: end.code, seen: paneOpen && tab === 'services' }
+          toast($, `${svc.label} exited with code ${end.code}`)
+        }
       }
     } catch (err) {
-      svc.lines.push('■ ' + String(err))
+      if (svc.run === run) svc.lines.push('■ ' + String(err))
     }
     if (svc.run === run) {
       svc.run = undefined
@@ -601,10 +620,13 @@ function onWorkerLine($: Api, line: string) {
 
 async function refreshQueue($: Api) {
   if (!isLaravel || snapshotLoading) return
+  const project = projectRun
   snapshotLoading = true
   redraw($)
   try {
     const r = await runPhp($, ['php', '-r', snapshotPhp(queuesOf(services.queue.argv))], { timeoutMs: 30_000 })
+    // Another folder's queue: detectProject has cleared the snapshot and the loading flag
+    if (project !== projectRun) return
     const parsed = parseSnapshot(r.stdout)
     if (parsed) {
       waitingBefore = snapshot ? waiting(snapshot) : undefined
@@ -614,6 +636,7 @@ async function refreshQueue($: Api) {
       snapshotError = stripAnsi(r.stderr || r.stdout).trim().split('\n')[0]?.slice(0, 300) || 'Could not read the queue state.'
     }
   } catch (err) {
+    if (project !== projectRun) return
     snapshotError = String(err)
   }
   snapshotAt = Date.now()
@@ -709,6 +732,7 @@ async function newestLog($: Api): Promise<string> {
 /** Follow the newest log file; called at start and every minute, so a new daily file is picked up. */
 async function watchLog($: Api) {
   if (!isLaravel) return
+  const project = projectRun
   let loaded = () => {}
   const ready = new Promise<void>(resolve => (loaded = resolve))
   const previous = logReady
@@ -717,17 +741,21 @@ async function watchLog($: Api) {
     // One watch at a time, so two overlapping calls can't start two tails
     await previous
     const path = await newestLog($)
-    if (path === logPath && logRun) return
+    if (project !== projectRun || (path === logPath && logRun)) return
+    // Let go of the old tail at once, so what it still sends while the new file is read isn't taken for it
     if (logRun) void logRun.stream.return({ code: null, signal: 'SIGTERM' }).catch(() => {})
+    logRun = undefined
 
     logPath = path
-    logState = newLogState()
+    const state = newLogState()
+    logState = state
     try {
       const r = await $.process.run(['tail', '-n', '400', path], { timeoutMs: 10_000 })
-      if (r.exitCode === 0) feedLog(logState, r.stdout.endsWith('\n') ? r.stdout : r.stdout + '\n')
+      if (r.exitCode === 0) feedLog(state, r.stdout.endsWith('\n') ? r.stdout : r.stdout + '\n')
     } catch {
       // the file may not exist yet; tail -F below waits for it
     }
+    if (project !== projectRun) return
 
     const stream = $.process.spawn({ argv: ['tail', '-n', '0', '-F', path] })
     const run = { stream }
@@ -735,7 +763,8 @@ async function watchLog($: Api) {
     void (async () => {
       try {
         for await (const chunk of stream) {
-          if (chunk.stream === 'stdout') onLogEntries($, feedLog(logState, chunk.text))
+          // A tail replaced by another (a new daily file, another folder) may still deliver a chunk
+          if (chunk.stream === 'stdout' && logRun === run) onLogEntries($, feedLog(logState, chunk.text))
         }
       } catch {
         // stream closed
@@ -974,23 +1003,28 @@ function methodColor(label: string): string {
 }
 
 async function loadAbout($: Api) {
-  const read = runPhp($, ['php', '-r', connectionsPhp()], { timeoutMs: 30_000 })
-    .then(r => (connections = parseConnections(r.stdout) ?? connections))
-    .catch(() => undefined)
+  const project = projectRun
+  const read = runPhp($, ['php', '-r', connectionsPhp()], { timeoutMs: 30_000 }).catch(() => undefined)
+  let found = about
   try {
     const r = await runPhp($, ['php', 'artisan', 'about', '--json'], { timeoutMs: 60_000 })
-    if (r.exitCode === 0) about = phpJson(r.stdout) as typeof about
+    if (r.exitCode === 0) found = phpJson(r.stdout) as typeof about
   } catch {
-    about = undefined
+    found = undefined
   }
-  await read
+  const conn = await read
+  // Read for a folder the session has since left
+  if (project !== projectRun) return
+  about = found
+  if (conn) connections = parseConnections(conn.stdout) ?? connections
   redraw($)
 }
 
 async function checkMigrations($: Api) {
+  const project = projectRun
   try {
     const r = await runPhp($, ['php', 'artisan', 'migrate:status', '--no-ansi'], { timeoutMs: 60_000 })
-    if (r.exitCode !== 0) return
+    if (r.exitCode !== 0 || project !== projectRun) return
     pendingMigrations = r.stdout.split('\n').filter(l => /\bPending\b/.test(l)).length
     if (pendingMigrations) toast($, `${plural(pendingMigrations, 'pending migration')}. Run /lara-artisan migrate`)
     redraw($)
@@ -1017,6 +1051,7 @@ async function checkHealth($: Api) {
     return
   }
   checking = true
+  const project = projectRun
   try {
     const next: Check[] = []
     if (about?.environment?.environment === 'production') {
@@ -1060,7 +1095,8 @@ async function checkHealth($: Api) {
     if (backlog) next.push(backlog)
     const [herd, deps] = await Promise.all([checkHerd($), checkDeps($)])
     next.push(...herd, ...deps)
-    checks = next
+    // Checked a folder the session has since left: the run requested meanwhile checks the new one
+    if (project === projectRun) checks = next
   } catch (err) {
     $.ui.log('lara-cc: health check failed: ' + String(err))
   } finally {
@@ -1160,16 +1196,28 @@ async function viteIsGone($: Api): Promise<boolean> {
  */
 async function checkHerd($: Api): Promise<Check[]> {
   const installed = await herdInstalledServices($)
-  const up = await Promise.all(installed.map(s => listening($, s.port)))
+  const up = await Promise.all(installed.map(s => probePort($, s.port)))
   herdList = installed.map((s, i) => ({ ...s, up: up[i]! }))
-  return herdNeeds(connections, herdList)
-    .filter(need => !need.service.up)
+  const needs = herdNeeds(connections, herdList)
+  const stopped: Check[] = needs
+    .filter(need => need.service.up === 'down')
     .map(({ service: s, driver, uses }) => ({
       band: `Herd ${s.name} stopped`,
       color: 'red' as const,
       detail: `The app's ${uses.join(', ')} uses ${driver} on port ${s.port}, and Herd's ${s.name} ${s.version} there isn't running, so anything that needs it fails.`,
       fix: { label: `start ${s.name}`, run: () => startHerdService($, s) },
     }))
+  // Neither running nor stopped: say so once, rather than calling them fine
+  const unchecked = needs.filter(need => need.service.up === 'unknown').map(need => need.service)
+  if (unchecked.length) {
+    const names = unchecked.map(s => `${s.name} (port ${s.port})`).join(', ')
+    stopped.push({
+      band: `Herd ${unchecked.map(s => s.name).join('+')} unchecked`,
+      color: 'yellow',
+      detail: `The app uses Herd's ${names}, but lara-cc couldn't tell whether ${unchecked.length > 1 ? 'they are' : 'it is'} running: nc is missing or didn't answer.`,
+    })
+  }
+  return stopped
 }
 
 /**
@@ -1188,13 +1236,18 @@ async function startHerdService($: Api, s: HerdService) {
       $.ui.toast(`Herd couldn't start ${s.name}: ${stripAnsi(r.stderr).trim().slice(0, 200) || 'exit ' + r.exitCode}`, { timeoutMs: 8000 })
       return
     }
-    // Herd answers before the server listens
-    let up = await listening($, s.port)
-    for (let i = 0; i < 20 && !up; i++) {
+    // Herd answers before the server listens. A probe that can't answer gets two more tries, not the whole wait
+    let up = await probePort($, s.port)
+    for (let i = 0; i < 20 && (up === 'down' || (up === 'unknown' && i < 2)); i++) {
       await $.clock.sleep(500)
-      up = await listening($, s.port)
+      up = await probePort($, s.port)
     }
-    $.ui.toast(up ? `Herd ${s.name} is running` : `Herd ${s.name} hasn't started yet; check Herd → Services`, { timeoutMs: 6000 })
+    const told = {
+      up: `Herd ${s.name} is running`,
+      down: `Herd ${s.name} hasn't started yet; check Herd → Services`,
+      unknown: `Herd was asked to start ${s.name}, but lara-cc couldn't check port ${s.port} (nc missing or not answering)`,
+    }
+    $.ui.toast(told[up], { timeoutMs: 6000 })
   } catch (err) {
     $.ui.toast(`Herd couldn't start ${s.name}: ${String(err)}`, { timeoutMs: 8000 })
   } finally {
@@ -1211,6 +1264,7 @@ async function startHerdService($: Api, s: HerdService) {
 async function toggleDebugSession($: Api) {
   if (debugState === 'starting' || debugState === 'stopping') return
   const starting = debugState === 'off'
+  const project = projectRun
   debugState = starting ? 'starting' : 'stopping'
   redraw($)
   let after: DebugState = starting ? 'off' : 'on'
@@ -1227,7 +1281,8 @@ async function toggleDebugSession($: Api) {
       $.ui.toast('Herd is recording queries, logs, dumps and HTTP calls. Use the app, then stop the session.', { timeoutMs: 6000 })
     } else {
       after = 'off'
-      debugCapture = { ...parseDebugCapture(r.stdout), at: Date.now() }
+      // Dropped if the session moved to another folder while Herd answered
+      if (project === projectRun) debugCapture = { ...parseDebugCapture(r.stdout), at: Date.now() }
     }
   } catch (err) {
     $.ui.toast(`Herd couldn't ${starting ? 'start' : 'stop'} the debug session: ${String(err)}`, { timeoutMs: 8000 })
@@ -1271,12 +1326,13 @@ async function herdInstalledServices($: Api): Promise<HerdService[]> {
 }
 
 /**
- * Something accepts connections on this machine's `port`, over IPv4 or IPv6 (`localhost` is both). nc connects
- * and hangs up at once; a missing nc counts as listening.
+ * Whether something accepts connections on this machine's `port`, over IPv4 or IPv6 (`localhost` is both): nc
+ * connects and hangs up at once. 'unknown' when nc is missing, hangs or exits some other way: a probe that
+ * didn't work is never taken for a listening port, nor for a closed one.
  */
-async function listening($: Api, port: number): Promise<boolean> {
+async function probePort($: Api, port: number): Promise<Probe> {
   const r = await $.process.run(['nc', '-z', '-w', '1', 'localhost', String(port)], { timeoutMs: 5_000 }).catch(() => undefined)
-  return r?.exitCode !== 1
+  return r?.exitCode === 0 ? 'up' : r?.exitCode === 1 ? 'down' : 'unknown'
 }
 
 /** Modification time of `path`, or -1 when it doesn't exist. */
@@ -1294,6 +1350,7 @@ const DEP_FILES = ['composer.lock', 'vendor/composer/installed.json', 'package-l
 
 /** Composer and node packages out of step with the lockfiles, e.g. after a `git pull`. */
 async function checkDeps($: Api): Promise<Check[]> {
+  const project = projectRun
   const times = await Promise.all(DEP_FILES.map(f => mtime($, f)))
   const key = times.join(',')
   if (key === depsSeen) return depsChecks
@@ -1332,13 +1389,52 @@ async function checkDeps($: Api): Promise<Check[]> {
     if (drift.length) add(pm, differ('package-lock.json', drift, `${pm} install`))
   }
 
-  depsSeen = key
-  depsChecks = out
+  // Not into the cache once the session has moved to another folder
+  if (project === projectRun) {
+    depsSeen = key
+    depsChecks = out
+  }
   return out
 }
 
+/**
+ * The session moved to another folder: stop what it started there and forget what it found, so nothing of
+ * that project (its Horizon, worker, logs, jobs, results) shows in this one. Work still running for it is
+ * dropped as it finishes (see projectRun). Doesn't wait for the processes to die: session start goes on.
+ */
+function leaveProject() {
+  projectRun++
+  for (const [name, def] of Object.entries(SERVICES)) {
+    const svc = services[name]!
+    // Closing the stream kills the child; its loop sees the run is no longer the service's and stays quiet
+    if (svc.run) void svc.run.stream.return({ code: null, signal: 'SIGTERM' }).catch(() => {})
+    Object.assign(svc, { argv: [...def.argv], label: def.label, run: undefined, startedAt: undefined, lines: [], partial: '' })
+  }
+  hasPint = false
+  if (logRun) void logRun.stream.return({ code: null, signal: 'SIGTERM' }).catch(() => {})
+  logRun = undefined
+  logPath = ''
+  logState = newLogState()
+  unseenErrors = 0
+  jobs = []
+  stats.done = stats.failed = stats.totalMs = 0
+  snapshot = undefined
+  snapshotAt = 0
+  snapshotError = ''
+  snapshotLoading = false
+  pendingMigrations = 0
+  lastRun = undefined
+  testsRunning = false
+  restartTimer?.cancel()
+  restartTimer = undefined
+  editedPhp.clear()
+  debugCapture = undefined
+}
+
 async function detectProject($: Api) {
-  projectDir = await $.session.cwd()
+  const dir = await $.session.cwd()
+  if (projectDir && dir !== projectDir) leaveProject()
+  projectDir = dir
   isLaravel = await $.fs.exists('artisan')
   // Module state outlives a session: don't carry another folder's PHP over
   phpBin = 'php'
@@ -1402,6 +1498,8 @@ const TABS: Tab[] = ['services', 'queue', 'log', 'tests', 'routes', 'commands', 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await loadSettings($)
+    for (const timer of timers) timer.cancel()
+    timers = []
     await detectProject($)
 
     const commands = [
@@ -1492,16 +1590,16 @@ export const register: Register = on => {
       void loadAbout($).then(() => checkHealth($))
       for (const name of settings.autostart[projectDir] ?? []) if (services[name]) void startService($, name)
       // Pick up a new daily log file, and keep the Queue tab current while it's showing
-      $.clock.every(60_000, () => {
+      timers.push($.clock.every(60_000, () => {
         void watchLog($)
         // about is re-read so a changed APP_ENV or `artisan down` shows within a minute
         void loadAbout($).then(() => checkHealth($))
         // Jobs piling up with no worker; not when the app has no queue to read (no database yet) or runs jobs inline
         if (!services.queue.run && snapshot && !snapshotError && snapshot.connection !== 'sync') void refreshQueue($)
-      })
-      $.clock.every(15_000, () => {
+      }))
+      timers.push($.clock.every(15_000, () => {
         if (paneOpen && tab === 'queue') void refreshQueue($)
-      })
+      }))
     }
 
     return next(e)
@@ -1860,7 +1958,7 @@ export const register: Register = on => {
     if (tab === 'services') {
       const shown = services[logOf]
       const autostart = settings.autostart[projectDir] ?? []
-      const herdText = herdList.map(s => `○ ${s.name} ${s.version} :${s.port}` + (s.up ? '' : ' starting…'))
+      const herdText = herdList.map(s => `○ ${s.name} ${s.version} :${s.port}` + (s.up === 'up' ? '' : s.up === 'down' ? ' starting…' : ' unchecked starting…'))
       // The Herd row wraps on a narrow pane
       const herdRows = herdList.length ? Math.ceil(['Herd services', ...herdText].join('  ').length / width) : 0
       body = (
@@ -1870,11 +1968,11 @@ export const register: Register = on => {
             <Box flexDirection="row" columnGap={2} flexWrap="wrap">
               <Text dimColor>Herd services</Text>
               {herdList.map(s =>
-                s.up ? (
+                s.up === 'up' ? (
                   <Text color="green">{`● ${s.name} ${s.version} :${s.port}`}</Text>
                 ) : (
                   <Box flexDirection="row" columnGap={1}>
-                    <Text dimColor>{`○ ${s.name} ${s.version} :${s.port}`}</Text>
+                    <Text dimColor>{s.up === 'down' ? `○ ${s.name} ${s.version} :${s.port}` : `? ${s.name} ${s.version} :${s.port} unchecked`}</Text>
                     <Button
                       key={'herd-start-' + s.port}
                       label={herdStarting.has(s.port) ? 'starting…' : 'start'}
