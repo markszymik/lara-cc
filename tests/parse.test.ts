@@ -27,6 +27,8 @@ import {
   parseTestRun,
   parseWorkerLine,
   phpJson,
+  clip,
+  tail,
   redact,
   redactData,
   projectPath,
@@ -209,6 +211,85 @@ test('redact hides secrets by name, in URLs and headers, emails and random keys'
   expect(redact('Mail to jane.doe+x@example.co.uk bounced')).toBe('Mail to [email] bounced')
   expect(redact('key base64:Q2xhdWRlQ29kZUxhcmF2ZWxNb2RLZXkxMjM0NTY3OA== in use')).toBe('key base64:[redacted] in use')
   expect(redact('sha 3f786850e387550fdab836ed7e6dc881de23001b')).toBe('sha [redacted]')
+})
+
+/**
+ * Common Laravel secrets, each with the parts that must never reach Claude. What surrounds them is kept, so
+ * Claude can still read the error.
+ */
+const SECRETS: [string, string, string[]][] = [
+  // .env-style lines
+  ['env password', 'DB_PASSWORD=hunter2', ['hunter2']],
+  ['env username', 'DB_USERNAME=forge_admin', ['forge_admin']],
+  ['env quoted', 'MAIL_PASSWORD="pa ss word"', ['pa ss word', 'ss word']],
+  ['APP_KEY with slashes', 'APP_KEY=base64:k3Y/9fQ+abcDEF/0123456789abcdefghiJKLmno=', ['k3Y', '0123456789abcdefghi']],
+  ['bare base64 key', 'cipher key base64:k3Y/9fQ+abcDEF/0123456789abcdefghiJKLmno= rejected', ['k3Y', '0123456789abcdefghi']],
+  ['AWS secret', 'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', ['wJalrXUtnFEMI', 'bPxRfiCYEXAMPLEKEY']],
+  ['AWS key id, bare', 'InvalidAccessKeyId: AKIAIOSFODNN7EXAMPLE does not exist', ['AKIAIOSFODNN7EXAMPLE']],
+  ['Stripe key, bare', 'charge with sk_live_51HxYzAbCdEfGhIjKl failed', ['51HxYzAbCdEfGhIjKl']],
+  ['Slack token, bare', 'posting with xoxb-123456789012-abcdefABCDEF failed', ['123456789012-abcdefABCDEF']],
+  ['Redis URL, password only', 'REDIS_URL=redis://:p%40ss@cache.internal:6379', ['p%40ss']],
+  // Headers
+  ['cookies', 'Cookie: laravel_session=eyJpdiI6IkV4YW1wbGUifQ%3D%3D; XSRF-TOKEN=abc123def', ['eyJpdiI6IkV4YW1wbGUifQ', 'abc123def']],
+  ['set-cookie', 'Set-Cookie: remember_web_59ba=abcDEF123456; path=/', ['abcDEF123456']],
+  ['API key header', 'X-Api-Key: live_abc123', ['live_abc123']],
+  ['basic auth', 'Authorization: Basic dXNlcjpwYXNzd29yZA==', ['dXNlcjpwYXNzd29yZA']],
+  ['bearer', 'Authorization: Bearer abc.def.ghi1234', ['abc.def.ghi1234']],
+  ['digest auth', 'Authorization: Digest username="bob", realm="app", nonce="dcd98b"', ['bob']],
+  ['lower-case bearer', 'authorization: bearer abc.def.ghi1234', ['abc.def.ghi1234']],
+  ['JWT, bare', 'decoding eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJlMTIz failed', ['eyJzdWIiOiIxIn0', 'c2lnbmF0dXJlMTIz']],
+  // Signed URLs
+  ['signed route', 'GET /download?expires=1700000000&signature=4f9a6c0e1d2b3a4f5e6d7c8b9a', ['4f9a6c0e1d2b3a4f5e6d7c8b9a']],
+  [
+    'S3 presigned URL',
+    'https://bucket.s3.amazonaws.com/f.pdf?X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20261011&X-Amz-Signature=abcdef0123456789&X-Amz-Security-Token=FwoGZXIvYXdzEJr',
+    ['AKIAIOSFODNN7EXAMPLE', 'abcdef0123456789', 'FwoGZXIvYXdzEJr'],
+  ],
+  // DSNs
+  ['database DSN', 'could not connect to mysql://forge:s3cr3t@db.internal:3306/app', ['forge', 's3cr3t']],
+  ['password with @', 'could not connect to pgsql://app:p@ss@db:5432', ['p@ss', 'ss@db']],
+  ['Sentry DSN', 'SENTRY_LARAVEL_DSN=https://e5b2a1c3d4@o123.ingest.sentry.io/456', ['e5b2a1c3d4']],
+  ['DSN in a sentence', 'Sentry rejected https://e5b2a1c3d4@o123.ingest.sentry.io/456', ['e5b2a1c3d4']],
+  // Database errors
+  ['MySQL user', "SQLSTATE[HY000] [1045] Access denied for user 'forge'@'10.0.0.5' (using password: YES)", ['forge', '10.0.0.5']],
+  ['Postgres user', 'SQLSTATE[08006] [7] FATAL:  password authentication failed for user "app_user"', ['app_user']],
+  ['SQL update binding', 'SQLSTATE[22001]: Data too long (Connection: mysql, SQL: update `users` set `password` = $2y$10$abcdefghij where `id` = 1)', ['$2y$10$abcdefghij']],
+  // Stack frames
+  ['frame arguments', "#0 /app/app/Auth.php(10): App\\Auth->login('jane', 'hunter2')", ['hunter2', "'jane'"]],
+  // JSON, nested and escaped
+  ['nested JSON', '{"user":{"id":1,"credentials":{"password":"hunter2"}},"token":"tok_123"}', ['hunter2', 'tok_123']],
+  ['escaped JSON', String.raw`{"payload":"{\"password\":\"hunter2\",\"api_token\":\"abc123\"}"}`, ['hunter2', 'abc123']],
+  ['JSON with escapes in the value', String.raw`{"password":"hun\"ter2"}`, ['hun', 'ter2']],
+  // PHP serialize() in queue payloads
+  ['serialized', 's:8:"password";s:7:"hunter2";s:2:"id";i:4;', ['hunter2']],
+  [
+    'serialized in a JSON payload, protected property',
+    String.raw`{"data":{"command":"O:17:\"App\\Jobs\\Charge\":2:{s:8:\"password\";s:7:\"hunter2\";s:8:\"\u0000*\u0000token\";s:6:\"tok123\";}"}}`,
+    ['hunter2', 'tok123'],
+  ],
+  // Multi-line errors
+  ['multi-line', "Login failed\npassword: hunter2\n#0 /app/a.php(3): auth('hunter2')", ['hunter2']],
+]
+
+for (const [name, input, secrets] of SECRETS) {
+  test(`redact hides ${name}`, () => {
+    const out = redact(input)
+    for (const secret of secrets) expect(out).not.toContain(secret)
+    expect(out).not.toBe(input)
+  })
+}
+
+test('tail and clip never cut a line or word in two, so a key keeps its value and a token stays whole', () => {
+  expect(tail('aaaa\npassword=hunter2\nbbbb', 18)).toBe('…\nbbbb')
+  // One long line: from the first word that's whole, here past the cut through `password`
+  expect(tail('x password=hunter2 Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7c', 50)).toBe('… Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7c')
+  expect(tail('short', 10)).toBe('short')
+  expect(clip('password: hunter2 and more', 12)).toBe('password:…')
+  expect(clip('Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7c', 20)).toBe('…')
+  for (const cut of [tail('aaaa\npassword=hunter2\nbbbb', 18), clip('token Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7c', 20)]) {
+    expect(redact(cut)).not.toContain('hunter2')
+    expect(redact(cut)).not.toContain('Ab3dEf6hIj')
+  }
 })
 
 test('redact keeps what Claude needs to debug', () => {

@@ -33,6 +33,7 @@ import {
   PHP_OPTIONS,
   phpJson,
   queuesOf,
+  clip,
   redact,
   redactData,
   refusedOptions,
@@ -101,6 +102,31 @@ const DESTRUCTIVE = [
  * `--env` points artisan at another environment's database, `--prune` deletes migration files, `--seed` runs seeders.
  */
 const DESTRUCTIVE_OPTIONS = ['--force', '-f', '--env', '--prune', '--seed', '--seeder']
+
+/**
+ * Artisan commands Claude's tool runs only once the person says yes, with what each does: they reach past this
+ * folder's files into the database, the queue or the cache, which may be shared or not on this machine at all.
+ * APP_ENV saying `local` doesn't make that safe, so the question shows what the mod knows of where they land.
+ */
+const IMPACTFUL: Record<string, string> = {
+  migrate: 'changes the database schema',
+  'migrate:install': 'creates the migrations table in the database',
+  'queue:retry': 'runs failed jobs again, with whatever they do (emails, payments, API calls)',
+  'queue:retry-batch': 'runs a batch of failed jobs again, with whatever they do (emails, payments, API calls)',
+  'queue:work': 'runs queued jobs, with whatever they do (emails, payments, API calls)',
+  'queue:listen': 'runs queued jobs, with whatever they do (emails, payments, API calls)',
+  horizon: 'runs queued jobs, with whatever they do (emails, payments, API calls)',
+  'queue:restart': 'tells every worker that shares this cache to restart, including any elsewhere',
+  'horizon:terminate': 'stops Horizon wherever it runs on this cache',
+  'horizon:pause': 'pauses Horizon wherever it runs on this cache',
+  'horizon:continue': 'resumes Horizon wherever it runs on this cache',
+  'schedule:run': 'runs the scheduled tasks that are due, with whatever they do',
+  'schedule:test': 'runs a scheduled task, with whatever it does',
+  'schedule:work': 'runs the scheduled tasks every minute, with whatever they do',
+  'cache:clear': 'empties the application cache, which other apps or machines may share',
+  'cache:forget': 'removes an item from the application cache, which other apps or machines may share',
+  'optimize:clear': 'clears every cache, the application cache (which may be shared) included',
+}
 
 /** Artisan commands Claude's tool refuses because they print secrets: config values (passwords, APP_KEY) or the .env encryption key. */
 const CONFIDENTIAL = ['config:show', 'env:encrypt', 'env:decrypt']
@@ -453,7 +479,7 @@ function formatRun(run: LastRun): string {
  * Whether artisan `argv` is safe to run for Claude. Artisan resolves the name itself (`help <name>`), so
  * abbreviations and odd casing can't slip past DESTRUCTIVE; a name it can't resolve comes back as `error`.
  */
-async function checkArtisan($: Api, argv: string[]): Promise<{ refused?: string; error?: string }> {
+async function checkArtisan($: Api, argv: string[]): Promise<{ refused?: string; error?: string; impact?: string }> {
   const options = refusedOptions(argv, DESTRUCTIVE_OPTIONS)
   if (options.length) return { refused: `${options.join(' ')} can destroy data or point at another environment` }
   const { resolved, error } = await resolveArtisan($, argv)
@@ -463,7 +489,51 @@ async function checkArtisan($: Api, argv: string[]): Promise<{ refused?: string;
   if (DESTRUCTIVE.includes(resolved)) {
     return { refused: resolved === 'tinker' ? 'tinker runs arbitrary PHP' : `${resolved} can destroy data` }
   }
-  return {}
+  return { impact: IMPACTFUL[resolved] }
+}
+
+/** What Claude gets when the person says no to running something: not to try again, and how they'd run it. */
+const NOT_RUN = "The user chose not to run this. Don't retry it; if it's needed, ask them to run it themselves (e.g. with /lara-artisan)."
+
+/**
+ * Ask the person before Claude, or a command they didn't type, runs something IMPACTFUL. Shows what it does and
+ * where it lands as far as the mod knows (APP_ENV, and which of the app's servers are on this machine: driver and
+ * port, never a host or user). Dismissed, or nobody there to answer (`claude -p`), is no.
+ */
+async function mayRun($: Api, what: string, effect: string): Promise<boolean> {
+  const local = connections.map(c => `${c.use} ${c.driver}:${c.port}`)
+  const where = local.length ? `Servers on this machine it connects to: ${local.join(', ')}.` : 'lara-cc found none of its servers on this machine (it may use SQLite, files or a server elsewhere).'
+  const env = about?.environment?.environment
+  const question =
+    `Claude (or a command you didn't type) wants to run ${what}, which ${effect}. ` +
+    `APP_ENV is ${typeof env === 'string' ? env : 'unknown'}; ${where} Run it?`
+  const answer = await $.ui.ask(question, { header: 'lara-cc', options: ['Run it', "Don't run"] }).catch(() => "Don't run")
+  return answer === 'Run it'
+}
+
+/** For a service start: what the process does, when it's one that needs asking (queue worker, Horizon, scheduler; not Vite). */
+function startImpact(name: string): string | undefined {
+  const argv = services[name]?.argv ?? []
+  return argv[1] === 'artisan' ? IMPACTFUL[argv[2] ?? ''] : undefined
+}
+
+/**
+ * serviceAction for anyone but the person typing or pressing: a start (or a restart that starts) of a process
+ * that runs jobs or tasks asks first. Stopping, and restarting what already runs, are left to Claude, so it can
+ * restart the worker after changing job code.
+ */
+async function guardedServiceAction($: Api, name: string, action: string): Promise<string> {
+  const starts = !services[name]?.run && (action === 'start' || action === 'restart')
+  const impact = starts ? startImpact(name) : undefined
+  if (impact && !(await mayRun($, (services[name]?.argv ?? []).join(' '), impact))) return NOT_RUN
+  return serviceAction($, name, action)
+}
+
+/** retryFailed for anyone but the person: asks first, naming how many jobs `all` is. */
+async function guardedRetry($: Api, id: string): Promise<string> {
+  const what = id === 'all' ? `queue:retry all (${snapshot ? plural(snapshot.failedTotal, 'failed job') : 'every failed job'})` : `queue:retry ${id}`
+  if (!(await mayRun($, what, IMPACTFUL['queue:retry']!))) return NOT_RUN
+  return retryFailed($, id)
 }
 
 /** Typed by the person (at the terminal or through Remote Control), not relayed from another session, channel or plugin. */
@@ -475,7 +545,8 @@ async function resolveArtisan($: Api, argv: string[]): Promise<{ resolved?: stri
   const resolved = r.exitCode === 0 ? helpName(r.stdout) : undefined
   if (resolved) return { resolved }
   const output = stripAnsi([r.stdout, r.stderr].filter(Boolean).join('\n')).trim()
-  return { error: `✗ artisan could not resolve "${name}"\n${tail(output, 2000)}` }
+  // Goes to Claude: the app failing to boot can print config, hosts and users
+  return { error: `✗ artisan could not resolve "${name}"\n${tail(redact(output), 2000)}` }
 }
 
 function fromUser(origin: { kind: string } | undefined): boolean {
@@ -633,7 +704,7 @@ async function refreshQueue($: Api) {
       snapshot = parsed
       snapshotError = parsed.error ?? ''
     } else {
-      snapshotError = stripAnsi(r.stderr || r.stdout).trim().split('\n')[0]?.slice(0, 300) || 'Could not read the queue state.'
+      snapshotError = clip(stripAnsi(r.stderr || r.stdout).trim().split('\n')[0] ?? '', 300) || 'Could not read the queue state.'
     }
   } catch (err) {
     if (project !== projectRun) return
@@ -683,9 +754,11 @@ function formatFailed(list: FailedJob[], withTrace: number): string {
   if (!list.length) return 'No failed jobs.'
   return list
     .map((f, i) => {
-      const rest = i < withTrace ? f.exception.split('\n').slice(1, 13).filter(l => l.trim()) : []
+      // Redacted whole, before the headline is cut to length
+      const exception = redact(f.exception)
+      const rest = i < withTrace ? exception.split('\n').slice(1, 13).filter(l => l.trim()) : []
       const trace = rest.length ? '\n' + rest.map(l => '    ' + l).join('\n') : ''
-      return `- ${f.id}  ${f.job}  (queue ${f.queue}, failed ${f.failedAt})\n` + redact(`  ${exceptionHeadline(f.exception)}${trace}`)
+      return `- ${f.id}  ${f.job}  (queue ${f.queue}, failed ${f.failedAt})\n  ${exceptionHeadline(exception)}${trace}`
     })
     .join('\n')
 }
@@ -896,7 +969,7 @@ function failureReason(output: string): string {
     .map(l => l.trim())
     .filter(l => l && !/^(PHP )?(Deprecated|Warning|Notice):/i.test(l))
   const [first = '', second] = lines
-  return (/^[\w\\]+$/.test(first) && second ? `${first}: ${second}` : first).slice(0, 300)
+  return clip(/^[\w\\]+$/.test(first) && second ? `${first}: ${second}` : first, 300)
 }
 
 /** Put the focus ring on the selected route, so the arrows browse the list and Enter opens one straight away. */
@@ -1490,8 +1563,9 @@ async function detectProject($: Api) {
 
 // ─── The mod ───────────────────────────────────────────────────────────────
 
-const commandFailed = (_$: Api, _e: unknown, next: { error: { message?: string } }) => ({ text: 'lara-cc: ' + (next.error.message ?? 'failed') })
-const toolFailed = (_$: Api, _e: unknown, next: { error: { message?: string } }) => ({ result: 'lara-cc: ' + (next.error.message ?? 'failed') })
+// An error's message can quote what failed (a command's output, a path with a user name), so it's redacted too
+const commandFailed = (_$: Api, _e: unknown, next: { error: { message?: string } }) => ({ text: 'lara-cc: ' + redact(next.error.message ?? 'failed') })
+const toolFailed = (_$: Api, _e: unknown, next: { error: { message?: string } }) => ({ result: 'lara-cc: ' + redact(next.error.message ?? 'failed') })
 
 const TABS: Tab[] = ['services', 'queue', 'log', 'tests', 'routes', 'commands', 'about']
 
@@ -1622,6 +1696,7 @@ export const register: Register = on => {
       const check = await checkArtisan($, splitArgs(e.args))
       if (check.refused) return { text: `Refused: ${check.refused}. Only commands you type yourself skip this check.` }
       if (check.error) return { text: check.error }
+      if (check.impact && !(await mayRun($, `php artisan ${e.args.trim()}`, check.impact))) return { text: NOT_RUN }
     } else {
       // Typed by the person, but the output still lands in the conversation, where Claude reads it
       const { resolved } = await resolveArtisan($, splitArgs(e.args))
@@ -1641,14 +1716,17 @@ export const register: Register = on => {
       if (snapshot?.failed.length && !(await mayShare($, `${plural(snapshot.failedTotal, 'failed job')} with their exceptions`))) return { text: NOT_SHARED }
       return { text: snapshot ? `${plural(snapshot.failedTotal, 'failed job')}:\n` + formatFailed(snapshot.failed, 3) : redact(snapshotError) }
     }
-    if (action === 'retry') return { text: id ? await retryFailed($, id) : 'Usage: /lara-queue retry <id|all>' }
+    const typed = fromUser(e.origin)
+    if (action === 'retry') return { text: id ? await (typed ? retryFailed($, id) : guardedRetry($, id)) : 'Usage: /lara-queue retry <id|all>' }
     if (action === 'status') await refreshQueue($)
-    return { text: await serviceAction($, 'queue', action) }
+    return { text: await (typed ? serviceAction($, 'queue', action) : guardedServiceAction($, 'queue', action)) }
   }).catch(commandFailed)
 
   on('command.run', { command: ['lara-vite', 'lara-schedule'] }, async ($, e) => {
     if (!isLaravel) return { text: notLaravel() }
-    return { text: await serviceAction($, e.command.replace('lara-', ''), e.args.trim() || 'status') }
+    const name = e.command.replace('lara-', '')
+    const action = e.args.trim() || 'status'
+    return { text: await (fromUser(e.origin) ? serviceAction($, name, action) : guardedServiceAction($, name, action)) }
   }).catch(commandFailed)
 
   on('command.run', { command: 'lara-logs' }, async ($, e) => {
@@ -1681,11 +1759,13 @@ export const register: Register = on => {
 
   on('command.run', { command: 'lara-npm' }, async ($, e) => {
     const script = e.args.trim() || 'build'
+    if (!fromUser(e.origin) && !(await mayRun($, `${pm} run ${script}`, 'runs a package.json script, which can run any command'))) return { text: NOT_RUN }
     return { text: formatRun(await runCommand($, `${pm} run ${script}`, [pm, 'run', ...splitArgs(script)])) }
   }).catch(commandFailed)
 
   on('command.run', { command: 'lara-composer' }, async ($, e) => {
     if (!e.args.trim()) return { text: 'Usage: /lara-composer <args>, e.g. /lara-composer require laravel/pail' }
+    if (!fromUser(e.origin) && !(await mayRun($, `composer ${e.args.trim()}`, 'can install or change packages and run their scripts'))) return { text: NOT_RUN }
     return { text: formatRun(await runCommand($, 'composer ' + e.args, ['composer', ...splitArgs(e.args), '--no-interaction'])) }
   }).catch(commandFailed)
 
@@ -1699,6 +1779,7 @@ export const register: Register = on => {
       return { result: `Refused: ${check.refused}. Ask the user to run it themselves with /lara-artisan ${command}` }
     }
     if (check.error) return { result: check.error }
+    if (check.impact && !(await mayRun($, `php artisan ${command}`, check.impact))) return { result: NOT_RUN }
     const run = await runCommand($, 'artisan ' + command, ['php', 'artisan', ...splitArgs(command), '--no-interaction'], 300_000)
     return { result: formatRun(run) }
   }).catch(toolFailed)
@@ -1706,7 +1787,7 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__lara-cc__service' }, async ($, e) => {
     if (!isLaravel) return { result: notLaravel() }
     const args = e as unknown as { name?: string; action?: string }
-    return { result: await serviceAction($, String(args.name), String(args.action ?? 'status')) }
+    return { result: await guardedServiceAction($, String(args.name), String(args.action ?? 'status')) }
   }).catch(toolFailed)
 
   on('tool.call', { tool: 'mcp__lara-cc__logs' }, async ($, e) => {
@@ -1722,7 +1803,7 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__lara-cc__queue' }, async ($, e) => {
     if (!isLaravel) return { result: notLaravel() }
     const args = e as unknown as { action?: string; id?: string }
-    if (args.action === 'retry') return { result: args.id ? await retryFailed($, String(args.id)) : 'Give the failed job id, or "all".' }
+    if (args.action === 'retry') return { result: args.id ? await guardedRetry($, String(args.id)) : 'Give the failed job id, or "all".' }
     await refreshQueue($)
     if (args.action === 'failed') {
       if (snapshot?.failed.length && !(await mayShare($, `${plural(snapshot.failedTotal, 'failed job')} with their exceptions`))) return { result: NOT_SHARED }

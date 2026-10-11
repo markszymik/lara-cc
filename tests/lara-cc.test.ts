@@ -21,7 +21,9 @@ import { LOG } from './fixtures'
  * and `spawned` leave them out, so they read as typed); `dir`: the session's folder (default /app); `nc`: nc is
  * missing, or the exit code it gives every port; `hold`: spawned processes whose argv has one of these keep running
  * until stopped; `aboutGate`: `artisan about` answers once it resolves, with the env at the time it was asked;
- * `toasts`: the toasts shown.
+ * `toasts`: the toasts shown; `says`: printed by artisan commands, held processes and a name artisan can't resolve,
+ * on top of what they print anyway; `snapshot` as a string: what the queue snapshot prints instead of JSON; `run`: the answer to "Claude wants to run…" (default Run it). `share` or `run` null:
+ * nobody is there to answer (`claude -p`), so the question fails.
  */
 type Fake = {
   history?: string
@@ -40,7 +42,9 @@ type Fake = {
   connections?: { use: string; driver: string; port: number }[]
   herdServices?: unknown[]
   closed?: number[]
-  share?: string
+  share?: string | null
+  run?: string | null
+  says?: string
   asked?: string[]
   tests?: string
   debug?: string
@@ -127,7 +131,9 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
   on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
     const question = String((e as unknown as { questions: { question: string }[] }).questions[0]?.question)
     fake.asked?.push(question)
-    return { result: { answers: { [question]: fake.answers?.shift() ?? fake.share ?? 'Send redacted' } } } as never
+    const answer = question.startsWith('Claude (or a command') ? (fake.run === undefined ? 'Run it' : fake.run) : (fake.answers?.shift() ?? (fake.share === undefined ? 'Send redacted' : fake.share))
+    if (answer === null) throw new Error('nobody to ask')
+    return { result: { answers: { [question]: answer } } } as never
   })
   on('session.cwd', () => ({ value: fake.dir ?? '/app' }))
   on('fs.list', () => ({ value: [] }))
@@ -139,7 +145,7 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
     fake.spawned?.push(plain(e.argv))
     if (e.argv[0] === 'tail' && fake.live) yield { stream: 'stdout' as const, text: fake.live }
     if (fake.hold?.some(word => e.argv.includes(word))) {
-      yield { stream: 'stdout' as const, text: 'started\n' }
+      yield { stream: 'stdout' as const, text: 'started\n' + (fake.says ? fake.says + '\n' : '') }
       // Runs until the mod closes the stream
       await new Promise<void>(resolve => next.signal.addEventListener('abort', () => resolve()))
       return { value: { code: null, signal: 'SIGTERM' as const } }
@@ -189,14 +195,14 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
     if (argv.join(' ') === 'uname -s') return ok('Darwin\n')
     // An editor whose link macOS can't open (not installed)
     if (argv[0] === 'open' && fake.noEditor && argv[1]?.includes('://')) return missing
-    if (argv[0] === 'php' && argv[1] === '-r') return ok(fake.snapshot ? JSON.stringify(fake.snapshot) : 'no snapshot')
+    if (argv[0] === 'php' && argv[1] === '-r') return ok(typeof fake.snapshot === 'string' ? fake.snapshot : fake.snapshot ? JSON.stringify(fake.snapshot) : 'no snapshot')
     // `artisan help <name>` resolves abbreviations and case the way Symfony does
     if (argv[2] === 'help') {
       const name = HELP[argv[3]!.toLowerCase()]
-      if (!name) return { value: { exitCode: 1, stdout: `ERROR  Command "${argv[3]}" is not defined.`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      if (!name) return { value: { exitCode: 1, stdout: `ERROR  Command "${argv[3]}" is not defined.\n${fake.says ?? ''}`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
       return ok(JSON.stringify({ name, description: '' }))
     }
-    return { value: { exitCode: 0, stdout: '\u001b[32mDONE\u001b[39m ' + argv.join(' '), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    return { value: { exitCode: 0, stdout: '\u001b[32mDONE\u001b[39m ' + argv.join(' ') + (fake.says ? '\n' + fake.says : ''), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   return clock
 }
@@ -788,6 +794,186 @@ test('a session that starts again in the same folder keeps its worker, its outpu
   expect(JSON.stringify(await pane.drawn())).toContain('artisan make:model Post')
   answerAgain()
   await clock.settle()
+})
+
+/** Secrets of several kinds, and the parts of them that must never reach Claude. */
+const LEAKY = 'password=hunter2 Authorization: Bearer abcdef123456 mysql://forge:s3cr3t@db.internal:3306 sk_live_51HxYzAbCdEfGhIjKl'
+const LEAKED = ['hunter2', 'abcdef123456', 's3cr3t', 'forge', '51HxYzAbCdEfGh']
+
+test('representative secrets reach Claude through no lara-cc route: tools, commands and ask Claude buttons', async ($, on) => {
+  const ran: string[][] = []
+  const sent: string[] = []
+  const history = `[2026-10-11 09:00:00] local.ERROR: Login failed ${LEAKY} {"exception":"x"}\n`
+  const exception = `RuntimeException: ${LEAKY} in /app/app/Jobs/Charge.php:12\n#0 /app/app/Jobs/Charge.php(3): App\\Jobs\\Charge->pay('hunter2')`
+  const snapshot = { connection: 'redis', sizes: { default: 0 }, failedTotal: 1, failed: [{ id: 'f-1', queue: 'default', job: 'App\\Jobs\\Charge', failedAt: '2026-10-11 09:00:01', exception }] }
+  const clock = fakeProject(on, ran, { history, snapshot, hold: ['queue:work'], says: LEAKY, tests: FAILING.replace('jane@example.com', LEAKY) })
+  on('ui.open', () => ({ value: undefined }))
+  on('prompt.submit', ($, e) => {
+    sent.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  const outputs: Record<string, unknown> = {
+    'logs tool': await $.tool.call({ tool: 'mcp__lara-cc__logs' }),
+    '/lara-logs': await $.command.run({ command: 'lara-logs', args: 'errors' }),
+    'queue tool, failed': await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'failed' }),
+    '/lara-queue failed': await $.command.run({ command: 'lara-queue', args: 'failed' }),
+    'artisan tool output': await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'make:model Post' }),
+    "artisan tool, a name artisan can't resolve": await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'nosuch:thing' }),
+    '/lara-artisan output': await $.command.run({ command: 'lara-artisan', args: 'make:model Post', origin: { kind: 'composer' } } as never),
+    '/lara-test': await $.command.run({ command: 'lara-test', args: '' }),
+  }
+  await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
+  await clock.settle()
+  outputs['service tool, logs'] = await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'logs' })
+
+  // The ask Claude buttons send the person's message: the log error, the failed job, the failing test
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-log' })
+  await pane.press({ key: 'ask-error' })
+  await pane.press({ key: 'tab-queue' })
+  await pane.press({ key: 'ask-f-1' })
+  await pane.press({ key: 'tab-tests' })
+  await pane.press({ key: 'ask-test-0' })
+  await clock.settle()
+  expect(sent.length).toBe(3)
+  sent.forEach((text, i) => (outputs[`ask Claude ${i + 1}`] = text))
+
+  for (const [route, output] of Object.entries(outputs)) {
+    const text = JSON.stringify(output)
+    for (const secret of LEAKED) expect({ route, leaked: text.includes(secret) ? secret : undefined }).toEqual({ route, leaked: undefined })
+  }
+  // Still what Claude needs: the error and where
+  expect(JSON.stringify(outputs['logs tool'])).toContain('Login failed')
+  expect(JSON.stringify(outputs['queue tool, failed'])).toContain('RuntimeException')
+})
+
+test("the queue state's error reaches Claude redacted", async ($, on) => {
+  const ran: string[][] = []
+  fakeProject(on, ran, { snapshot: `PDOException: could not connect to ${LEAKY}` })
+  await $.session.start({ cwd: '/app' })
+
+  const status = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'status' }))
+  expect(status).toContain('PDOException')
+  for (const secret of LEAKED) expect(status).not.toContain(secret)
+})
+
+test('with nobody to answer (claude -p), logs, failed jobs and Boost logs are not sent', async ($, on) => {
+  const ran: string[][] = []
+  const history = `[2026-10-11 09:00:00] local.ERROR: Login failed ${LEAKY} {"exception":"x"}\n`
+  const snapshot = { connection: 'redis', sizes: {}, failedTotal: 1, failed: [{ id: 'f-1', queue: 'default', job: 'App\\Jobs\\Charge', failedAt: 'x', exception: 'RuntimeException: boom' }] }
+  const clock = fakeProject(on, ran, { history, snapshot, share: null, files: { 'composer.json': '{"require-dev":{"laravel/boost":"^1.0"}}' } })
+  let boostRan = false
+  on('tool.call', { tool: 'mcp__laravel-boost__last-error' }, () => {
+    boostRan = true
+    return { result: 'Login failed' } as never
+  })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  for (const output of [
+    await $.tool.call({ tool: 'mcp__lara-cc__logs' }),
+    await $.command.run({ command: 'lara-logs', args: '' }),
+    await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'failed' }),
+    await $.tool.call({ tool: 'mcp__laravel-boost__last-error' } as never),
+  ]) {
+    const text = JSON.stringify(output)
+    expect(text).toContain('chose not to send')
+    expect(text).not.toContain('Login failed')
+    expect(text).not.toContain('RuntimeException')
+  }
+  expect(boostRan).toBe(false)
+})
+
+test("Claude's artisan tool asks before commands that reach past the folder, saying where they land, and runs nothing on no", async ($, on) => {
+  const ran: string[][] = []
+  const asked: string[] = []
+  const connections = [{ use: 'database', driver: 'mysql', port: 3306 }]
+  const fake: Fake = { asked, connections, run: "Don't run" }
+  const clock = fakeProject(on, ran, fake)
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  const refused = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'migrate' }))
+  expect(refused).toContain('chose not to run')
+  expect(ran.some(argv => argv.join(' ').startsWith('php artisan migrate --no-interaction'))).toBe(false)
+  expect(asked.at(-1)).toContain('php artisan migrate, which changes the database schema')
+  expect(asked.at(-1)).toContain('APP_ENV is local')
+  expect(asked.at(-1)).toContain('database mysql:3306')
+
+  // Nobody there to answer is no too
+  fake.run = null
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'migrate' })
+  expect(ran.some(argv => argv.join(' ').startsWith('php artisan migrate --no-interaction'))).toBe(false)
+
+  fake.run = 'Run it'
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'migrate' })
+  expect(ran.some(argv => argv.join(' ').startsWith('php artisan migrate --no-interaction'))).toBe(true)
+
+  // Files in the folder only: no question
+  const before = asked.length
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'make:model Post' })
+  expect(asked.length).toBe(before)
+})
+
+test('retrying failed jobs and starting a worker ask when Claude does it, not when the person types or presses', async ($, on) => {
+  const ran: string[][] = []
+  const spawned: string[][] = []
+  const asked: string[] = []
+  const snapshot = { connection: 'redis', sizes: {}, failedTotal: 7, failed: [] }
+  const fake: Fake = { asked, snapshot, spawned, run: "Don't run" }
+  fakeProject(on, ran, fake)
+  await $.session.start({ cwd: '/app' })
+  const retries = () => ran.filter(argv => argv[2] === 'queue:retry').length
+
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'retry', id: 'all' }))).toContain('chose not to run')
+  expect(asked.at(-1)).toContain('queue:retry all (7 failed jobs)')
+  await $.command.run({ command: 'lara-queue', args: 'retry all' })
+  expect(retries()).toBe(0)
+
+  // Typed by the person: no question
+  const before = asked.length
+  await $.command.run({ command: 'lara-queue', args: 'retry all', origin: { kind: 'composer' } } as never)
+  expect(retries()).toBe(1)
+  expect(asked.length).toBe(before)
+
+  // The worker and the scheduler run jobs and tasks; Vite doesn't
+  await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
+  await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'schedule', action: 'restart' })
+  expect(spawned.some(argv => argv.includes('queue:work') || argv.includes('schedule:work'))).toBe(false)
+  await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'vite', action: 'start' })
+  expect(spawned.some(argv => argv.includes('dev'))).toBe(true)
+})
+
+test('restarting a worker the person started needs no question, so Claude can reload job code', async ($, on) => {
+  const ran: string[][] = []
+  const spawned: string[][] = []
+  const asked: string[] = []
+  fakeProject(on, ran, { asked, spawned, hold: ['queue:work'], run: "Don't run" })
+  await $.session.start({ cwd: '/app' })
+  await $.command.run({ command: 'lara-queue', args: 'start', origin: { kind: 'composer' } } as never)
+
+  await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'restart' })
+  expect(spawned.filter(argv => argv.includes('queue:work')).length).toBe(2)
+  expect(asked.length).toBe(0)
+})
+
+test('/lara-composer and /lara-npm ask when the person did not type them', async ($, on) => {
+  const ran: string[][] = []
+  const asked: string[] = []
+  fakeProject(on, ran, { asked, run: "Don't run" })
+  await $.session.start({ cwd: '/app' })
+
+  expect((await $.command.run({ command: 'lara-composer', args: 'require evil/pkg' })).text).toContain('chose not to run')
+  expect((await $.command.run({ command: 'lara-npm', args: 'build' })).text).toContain('chose not to run')
+  expect(ran.some(argv => argv.includes('evil/pkg') || argv.join(' ') === 'pnpm run build')).toBe(false)
+  expect(asked.length).toBe(2)
+
+  await $.command.run({ command: 'lara-composer', args: 'require laravel/pail', origin: { kind: 'composer' } } as never)
+  expect(ran.some(argv => argv.includes('laravel/pail'))).toBe(true)
+  expect(asked.length).toBe(2)
 })
 
 async function mountPane($: Engine) {

@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-11
+
+### Added
+
+- README: a table of what Claude can do on its own, what asks you and what's refused, and suggested Claude Code deny rules for the Bash and Read access lara-cc's checks don't cover.
+
+### Changed
+
+- Claude's artisan tool asks you before commands that reach past the project folder into the database, queue or cache (`migrate`, `queue:retry`/`work`/`restart`, `schedule:*`, `cache:clear`, `optimize:clear`, Horizon controls). The question shows `APP_ENV` and which of the app's servers are on this machine; a no, or nobody there to answer, runs nothing.
+- Retrying failed jobs (one or all) and starting the queue worker, Horizon or the scheduler ask you first when Claude does it, or when a slash command you didn't type does. Restarting a worker that's already running doesn't ask, so Claude can still reload job code.
+- `/lara-composer` and `/lara-npm` ask first when you didn't type them yourself.
+
+### Security
+
+- Redaction now also catches usernames, `APP_KEY`-style `base64:` keys with slashes, AWS key ids, Stripe and Slack keys, GitHub tokens, JWTs, lower-case auth schemes, Sentry-style DSN keys, URL passwords containing `@`, the user in database login errors, secrets in escaped JSON and in PHP-serialized queue payloads, and SQL `update … set` values.
+- Long output is cut at a line or word boundary, so a cut can no longer separate a key from its value or leave a token fragment too short to recognise; a failed job's exception is redacted before its headline is shortened.
+- What the artisan tool returns when artisan can't resolve a command, and the messages of failed lara-cc tools and commands, are redacted; they used to reach Claude as is.
+
 ## [0.10.0] - 2026-10-11
 
 ### Fixed

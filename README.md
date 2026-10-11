@@ -76,15 +76,53 @@ The checks run at start-up, after each of Claude's turns, after commands and eve
 | `/lara-npm <script>` | `npm run <script>` (defaults to `build`) |
 | `/lara-composer <args>` | Composer |
 
+A command you type runs as typed. One that reaches the mod some other way (Claude, a plugin, a relayed message) gets the same checks as Claude's tools: see [What Claude can do on its own](#what-claude-can-do-on-its-own).
+
 Type `/lar` to see them all. Processes run for the life of the session and stop when it ends. `/lara`, `/lara-logs`, `/lara-queue`, `/lara-vite` and `/lara-schedule` work while Claude is mid-turn.
 
 ## What Claude gets
 
 - **`logs` tool**: recent log entries with where they happened and the stack, so Claude can check for errors after running code or tests. Asks you first (see [Privacy](#privacy)).
-- **`queue` tool**: pending jobs, jobs run this session, failed jobs with their exceptions (asks you first), and retrying them.
-- **`artisan` tool**: runs artisan commands. Refuses anything that can destroy data or run arbitrary code: `migrate:fresh/reset/refresh/rollback`, `db:wipe`, `db:seed`, `key:generate`, `down`, `queue:flush/clear/forget`, the `prune`/`clear` commands of the queue, models, Horizon, Telescope and Pulse, `tinker`, and the `--force`, `--env`, `--prune` and `--seed` options. It also refuses `config:show`, `env:encrypt` and `env:decrypt`, which print secrets; `/lara-artisan` refuses those too, since its output goes into the conversation, so run them in your own terminal. Artisan resolves the command name first, so abbreviations like `migr:fr` are caught too. Run those yourself with `/lara-artisan`, which skips the check only when you type it (not when it's relayed from another session, a channel or a plugin).
-- **`service` tool**: start, stop, restart or read the output of the queue worker, Vite and the scheduler.
+- **`queue` tool**: pending jobs, jobs run this session, failed jobs with their exceptions (asks you first), and retrying them (asks you first).
+- **`artisan` tool**: runs artisan commands. Refuses anything that can destroy data or run arbitrary code: `migrate:fresh/reset/refresh/rollback`, `db:wipe`, `db:seed`, `key:generate`, `down`, `queue:flush/clear/forget`, the `prune`/`clear` commands of the queue, models, Horizon, Telescope and Pulse, `tinker`, and the `--force`, `--env`, `--prune` and `--seed` options. It also refuses `config:show`, `env:encrypt` and `env:decrypt`, which print secrets; `/lara-artisan` refuses those too, since its output goes into the conversation, so run them in your own terminal. Artisan resolves the command name first, so abbreviations like `migr:fr` are caught too. Run those yourself with `/lara-artisan`, which skips the check only when you type it (not when it's relayed from another session, a channel or a plugin). Commands that reach past the project folder ask you first (see below).
+- **`service` tool**: start, stop, restart or read the output of the queue worker, Vite and the scheduler. Starting the queue worker, Horizon or the scheduler asks you first.
 - **`routes` tool**: filtered route list.
+
+### What Claude can do on its own
+
+| | Examples | Asks you? |
+| --- | --- | --- |
+| Reads | routes, queue counts, process status and output | No (output redacted) |
+| Reads that can hold confidential data | log entries, failed-job exceptions, Boost's log tools, a Herd debug session | Yes, see [Privacy](#privacy) |
+| Changes inside the project folder | `make:*`, `route:cache`, `config:clear`, `view:clear`; Vite; stopping a process, or restarting one that's running (so Claude can reload the worker after changing job code) | No |
+| Reaches past the folder: the database, the queue, the cache | `migrate`, `queue:retry` (and the queue tool's retry), `queue:work`, `queue:restart`, `schedule:run`/`test`/`work`, `cache:clear`, `optimize:clear`, Horizon's `terminate`/`pause`/`continue`; starting the queue worker, Horizon or the scheduler; `/lara-composer` and `/lara-npm` when you didn't type them | Yes |
+| Can destroy data or run any code | `migrate:fresh` and the other rollbacks, `db:wipe`, `db:seed`, `tinker`, `--force`, `--env`… (listed above) | Refused |
+
+The question names the command, what it does, `APP_ENV`, and which of the app's servers lara-cc found on this machine (driver and port only), because a database or cache can be shared or not on this machine at all, and `APP_ENV=local` doesn't prove otherwise. **Don't run** sends Claude a refusal it's told not to retry. With nobody to answer (`claude -p`), the answer is no. What you press in the pane or the band, and commands you type, never ask.
+
+These checks cover lara-cc's own tools and commands only. Claude Code's Bash and Read tools are separate: Claude could still run `php artisan migrate:fresh` or read `.env` through them if your permissions allow it. To block that, add deny rules to your Claude Code settings (`.claude/settings.json` in the project, or `~/.claude/settings.json`):
+
+```json
+{
+  "permissions": {
+    "deny": [
+      "Bash(php artisan migrate:fresh:*)",
+      "Bash(php artisan migrate:refresh:*)",
+      "Bash(php artisan migrate:reset:*)",
+      "Bash(php artisan migrate:rollback:*)",
+      "Bash(php artisan db:wipe:*)",
+      "Bash(php artisan db:seed:*)",
+      "Bash(php artisan tinker:*)",
+      "Bash(php artisan config:show:*)",
+      "Bash(php artisan queue:retry:*)",
+      "Read(./.env)",
+      "Read(./.env.*)"
+    ]
+  }
+}
+```
+
+Deny rules match a command's beginning, so they're a speed bump rather than a wall (`php -r`, a script or another spelling gets past them). Keep Claude Code asking before Bash commands you haven't allowed if that matters to you.
 
 ## Privacy
 
@@ -92,7 +130,16 @@ Laravel logs and failed-job exceptions can contain confidential data: email addr
 
 They reach Claude only through the `logs` and `queue` tools, `/lara-logs`, `/lara-queue failed`, Laravel Boost's log tools, a Herd debug session's **ask Claude**, and the other **ask Claude** buttons. Each time, the mod first asks you in a dialog that explains this: **Send redacted**, **Allow this session**, or **Don't send**. If you dismiss the dialog, or nobody is there to answer (`claude -p`), nothing is sent.
 
-Before anything is sent, and in every command output that goes into the conversation (artisan, tests, npm, Composer, process output), the mod hides what looks confidential: passwords, tokens and keys by name, credentials in URLs, bearer tokens, email addresses, SQL values (the statement is kept up to `where`/`values`/`set`), stack frame arguments, and long random strings. This is best effort: it can't recognise every secret, which is why it still asks.
+Before anything is sent, and in every command output that goes into the conversation (artisan, tests, npm, Composer, process output, error messages), the mod hides what looks confidential:
+
+- passwords, tokens, keys, cookies, signatures and usernames by name, in `.env` lines, headers, query strings, PHP arrays, JSON (also JSON escaped inside a string) and PHP-serialized queue payloads
+- credentials in URLs and DSNs (a password containing `@` included), bearer and basic auth, the user in digest auth, `base64:` keys
+- tokens recognisable by their shape: AWS key ids, Stripe and Slack keys, GitHub tokens, JWTs, and other long random strings
+- email addresses, SQL values (the statement is kept up to `where`/`values`/`set`), the user named in a database login error, and stack frame arguments
+
+Long output is shortened at a line or word boundary, after redaction where it can be, so a cut never separates a key from its value or leaves a fragment of a token too short to recognise. The tests feed representative secrets through every way text reaches Claude.
+
+**Redaction is best effort, not a guarantee.** It recognises secrets by their name or shape, and can't know that an unlabelled value in your data is confidential. That's why logs and exceptions still need your yes.
 
 The route list (the Routes tab, `/lara-routes` and the `routes` tool) comes from PHP with `route:list`'s columns plus file paths, line numbers, parameter names and the name of the editor `config/app.php` sets. A route's domain stays in PHP: the tab only says a route has its own. To open a page, the mod hands PHP only the route's place in the list and the values you typed; Laravel builds the URL from `APP_URL` and PHP opens it in the browser, so the URL never reaches the mod or Claude. When the routes can't be read, the reason Claude gets is redacted.
 
