@@ -2,6 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
+import { PHP_OPTIONS } from '../hooks/parse'
 import { LOG } from './fixtures'
 
 /**
@@ -14,7 +15,10 @@ import { LOG } from './fixtures'
  * local servers the app's config names (connectionsPhp); `herdServices`: Herd's services.plist as plutil turns it into JSON; `closed`: ports
  * nothing listens on; `share`: the answer to the "send to Claude?" question (default Send redacted), whose
  * questions land in `asked`; `tests`: what `php artisan test` prints; `debug`: what Herd's debug session hands back;
- * `pending`: migrations migrate:status lists as pending, until `migrate` runs.
+ * `pending`: migrations migrate:status lists as pending, until `migrate` runs; `answers`: answers to the next
+ * questions, in turn, before `share`; `editor`: the editor Laravel's `app.editor` names; `noEditor`: its links don't open;
+ * `routesFail`: what routesPhp prints as it fails; `raw`: every command run or spawned, PHP_OPTIONS included (`ran`
+ * and `spawned` leave them out, so they read as typed).
  */
 type Fake = {
   history?: string
@@ -24,6 +28,7 @@ type Fake = {
   shellPhp?: string
   composerShim?: boolean
   spawned?: string[][]
+  raw?: string[][]
   files?: Record<string, string>
   env?: string
   exits?: Record<string, number>
@@ -37,9 +42,32 @@ type Fake = {
   tests?: string
   debug?: string
   pending?: number
+  answers?: string[]
+  editor?: string
+  noEditor?: boolean
+  routesFail?: string
 }
 
 const COMPOSER = '/opt/bin/composer'
+
+/** `argv` without PHP_OPTIONS after its PHP binary. */
+const plain = (argv: readonly string[]) => {
+  const at = argv.findIndex((a, i) => a === PHP_OPTIONS[0] && argv[i + 1] === PHP_OPTIONS[1])
+  return at < 0 ? [...argv] : [...argv.slice(0, at), ...argv.slice(at + PHP_OPTIONS.length)]
+}
+
+/**
+ * What routesPhp prints: route:list's columns, with where each route's code is. `domain` on `team` is what the
+ * mod must drop if PHP ever printed it.
+ */
+const TAB_ROUTES = [
+  { id: 0, method: 'GET|HEAD', uri: '/', name: null, action: 'Closure', file: 'routes/web.php', line: 5, params: [], onDomain: false },
+  { id: 2, method: 'POST', uri: 'api/posts', name: 'posts.store', action: 'App\\Http\\Controllers\\PostController@store', file: 'app/Http/Controllers/PostController.php', line: 20, params: [], onDomain: false },
+  { id: 1, method: 'GET|HEAD', uri: 'users', name: 'users.index', action: 'App\\Http\\Controllers\\UserController@index', file: 'app/Http/Controllers/UserController.php', line: 12, params: [], onDomain: false },
+  { id: 3, method: 'GET|HEAD', uri: 'users/{user}', name: 'users.show', action: 'App\\Http\\Controllers\\UserController@show', file: 'app/Http/Controllers/UserController.php', line: 18, params: ['user'], onDomain: false },
+  { id: 4, method: 'GET|HEAD', uri: 'team', name: null, action: 'Closure', file: 'routes/web.php', line: 9, params: ['account'], onDomain: true, domain: '{account}.example.test' },
+  { id: 5, method: 'GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS', uri: 'webhook', name: null, action: 'App\\Http\\Controllers\\WebhookController', file: 'app/Http/Controllers/WebhookController.php', line: 7, params: [], onDomain: false },
+]
 const HERD_BIN = '/Users/me/Library/Application Support/Herd/bin'
 const HERD_CLI = HERD_BIN + '/herd'
 const HERD_PLIST = '/Users/me/Library/Application Support/Herd/config/services.plist'
@@ -88,7 +116,7 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
   on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
     const question = String((e as unknown as { questions: { question: string }[] }).questions[0]?.question)
     fake.asked?.push(question)
-    return { result: { answers: { [question]: fake.share ?? 'Send redacted' } } } as never
+    return { result: { answers: { [question]: fake.answers?.shift() ?? fake.share ?? 'Send redacted' } } } as never
   })
   on('session.cwd', () => ({ value: '/app' }))
   on('fs.list', () => ({ value: [] }))
@@ -96,12 +124,14 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => $.ui.resolve(e).Box({}))
   // tail -F of the log: a quiet stream that ends at once
   on('process.spawn', async function* ($, e) {
-    fake.spawned?.push([...e.argv])
+    fake.raw?.push([...e.argv])
+    fake.spawned?.push(plain(e.argv))
     if (e.argv[0] === 'tail' && fake.live) yield { stream: 'stdout' as const, text: fake.live }
     return { value: { code: fake.exits?.[e.argv[0]!] ?? 0, signal: null } }
   })
   on('process.run', ($, e) => {
-    const argv = [...e.argv]
+    fake.raw?.push([...e.argv])
+    const argv = plain(e.argv)
     ran.push(argv)
     const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     const missing = { value: { exitCode: 1, stdout: '', stderr: 'not found', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -126,20 +156,20 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
     if (argv[0] === 'php' && argv[2]?.includes('PHP_BINARY')) return ok(`${fake.shellPhp ?? '/usr/bin/php'}\n8.4.1`)
     if (argv[1] === COMPOSER && argv[2] === '--version') return ok(fake.composerShim ? '#!/usr/bin/env bash\nexec mise x -- composer "$@"' : 'Composer version 2.10.2')
     if (argv[0] === 'php' && argv[1] === '-r' && argv[2]?.includes("'connections'")) return ok('Deprecated: x\n' + JSON.stringify({ connections: fake.connections ?? [] }))
+    if (argv[0] === 'php' && argv[1] === '-r' && argv[2]?.includes("'onDomain'")) {
+      if (fake.routesFail) return { value: { exitCode: 1, stdout: fake.routesFail, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      return ok('Deprecated: x\n' + JSON.stringify({ routes: TAB_ROUTES, editor: fake.editor ?? null }))
+    }
+    if (argv[0] === 'php' && argv[1] === '-r' && argv[2]?.includes('proc_open')) return ok('{"opened":true}')
+    if (argv.join(' ') === 'uname -s') return ok('Darwin\n')
+    // An editor whose link macOS can't open (not installed)
+    if (argv[0] === 'open' && fake.noEditor && argv[1]?.includes('://')) return missing
     if (argv[0] === 'php' && argv[1] === '-r') return ok(fake.snapshot ? JSON.stringify(fake.snapshot) : 'no snapshot')
     // `artisan help <name>` resolves abbreviations and case the way Symfony does
     if (argv[2] === 'help') {
       const name = HELP[argv[3]!.toLowerCase()]
       if (!name) return { value: { exitCode: 1, stdout: `ERROR  Command "${argv[3]}" is not defined.`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
       return ok(JSON.stringify({ name, description: '' }))
-    }
-    if (argv.join(' ') === 'php artisan route:list --json') {
-      const routes = [
-        { method: 'GET|HEAD', uri: '/', name: null, action: 'Closure' },
-        { method: 'GET|HEAD', uri: 'users', name: 'users.index', action: 'App\\Http\\Controllers\\UserController@index' },
-        { method: 'POST', uri: 'api/posts', name: 'posts.store', action: 'App\\Http\\Controllers\\PostController@store' },
-      ]
-      return { value: { exitCode: 0, stdout: JSON.stringify(routes), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     return { value: { exitCode: 0, stdout: '\u001b[32mDONE\u001b[39m ' + argv.join(' '), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
@@ -172,9 +202,25 @@ test('/lara-routes filters the route list', async ($, on) => {
   await $.session.start({ cwd: '/app' })
 
   const answer = await $.command.run({ command: 'lara-routes', args: 'posts' })
-  expect(answer.text).toContain('1 of 3 routes')
+  expect(answer.text).toContain('1 of 6 routes')
   expect(answer.text).toContain('posts.store')
   expect(answer.text).not.toContain('users.index')
+  // The same list as the Routes tab: one PHP boot, no route:list, and no route's domain
+  expect(ran.some(argv => argv.join(' ') === 'php artisan route:list --json')).toBe(false)
+  expect((await $.command.run({ command: 'lara-routes', args: '' })).text).not.toContain('example')
+})
+
+test("the routes tool redacts why the routes couldn't be read", async ($, on) => {
+  const ran: string[][] = []
+  const routesFail = 'Deprecated: f(): Implicitly nullable\n\n  Illuminate\\Database\\QueryException\n\n  SQLSTATE[HY000] [1045] Access denied for jane@example.com (password: hunter2secret)\n'
+  fakeProject(on, ran, { routesFail })
+  await $.session.start({ cwd: '/app' })
+
+  const answer = await $.tool.call({ tool: 'mcp__lara-cc__routes' } as never)
+  const text = JSON.stringify(answer)
+  expect(text).toContain('QueryException: SQLSTATE[HY000]')
+  expect(text).not.toContain('hunter2secret')
+  expect(text).not.toContain('jane@example.com')
 })
 
 test('the artisan tool refuses destructive commands', async ($, on) => {
@@ -354,8 +400,33 @@ test('with Herd as the PATH php, artisan, composer and services run on the binar
   const started = await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
   expect(spawned).toContainEqual([herd, 'artisan', 'queue:work', '--tries=1'])
   // Claude is told the binary that really runs, not `php`
-  expect(JSON.stringify(started)).toContain('php83 artisan queue:work')
+  expect(JSON.stringify(started)).toContain(`php83 ${PHP_OPTIONS.join(' ')} artisan queue:work`)
   expect(ran.some(argv => argv[0] === 'php' && argv[1] === 'artisan')).toBe(false)
+})
+
+test("every PHP the mod starts sends PHP's own warnings to stderr, so stdout holds only what it prints", async ($, on) => {
+  const herd = HERD_BIN + '/php83'
+  const ran: string[][] = []
+  const raw: string[][] = []
+  const clock = fakeProject(on, ran, { herd, shellPhp: HERD_BIN + '/php84', raw })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'migrate' })
+  await $.command.run({ command: 'lara-composer', args: 'install' })
+  await $.tool.call({ tool: 'mcp__lara-cc__routes' } as never)
+  await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
+  // Every launch of PHP: the probes, artisan, the php -r snippets, Composer through PHP, the worker
+  const php = raw.filter(argv => argv[0] === 'php' || argv[0] === herd || (argv[0] === 'herd' && argv[1] === 'php'))
+  expect(php.some(argv => argv.includes('-r'))).toBe(true)
+  expect(php.some(argv => argv.includes(COMPOSER))).toBe(true)
+  expect(php.some(argv => argv.includes('queue:work'))).toBe(true)
+  for (const argv of php) {
+    // Composer's version check only decides how to run Composer
+    if (argv[2] === '--version') continue
+    const at = argv[0] === 'herd' ? 2 : 1
+    expect(argv.slice(at, at + PHP_OPTIONS.length)).toEqual(PHP_OPTIONS)
+  }
 })
 
 test('with Herd installed but another php on PATH, the PATH php stays', async ($, on) => {
@@ -791,4 +862,137 @@ test('the band migrate fix runs migrate and counts the pending migrations again'
   await clock.settle()
   expect(ran).toContainEqual(['php', 'artisan', 'migrate', '--no-interaction'])
   expect(JSON.stringify(await band.drawn())).not.toContain('pending migration')
+})
+
+test('the Routes tab: rows are buttons the arrows walk, and Enter opens the code or the page, asking which', async ($, on) => {
+  const ran: string[][] = []
+  const fake: Fake = { answers: [], asked: [], editor: 'phpstorm' }
+  const clock = fakeProject(on, ran, fake)
+  on('ui.open', () => ({ value: undefined }))
+  // The engine's end of the focus ring: the move lands
+  on('ui.focus', () => ({}))
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-routes' })
+  await clock.settle()
+  const rows = async () => (await pane.findAll({ type: 'Button' })).filter(b => /^route-\d+$/.test(String(b.key)))
+  expect(await rows()).toHaveLength(6)
+  const drawn = JSON.stringify(await pane.drawn())
+  expect(drawn).toContain('users.index')
+  // One PHP boot for the list and where the code is; a route's domain never reaches the mod
+  expect(ran.some(argv => argv.join(' ') === 'php artisan route:list --json')).toBe(false)
+  expect(drawn).not.toContain('example')
+
+  // GET /users: asked, then the file opens at its line in the editor the app names
+  fake.answers!.push('Open UserController.php:12')
+  await pane.press({ key: 'route-2' })
+  expect(fake.asked).toContain('GET /users: open its code or its page?')
+  expect(ran).toContainEqual(['open', 'phpstorm://open?file=/app/app/Http/Controllers/UserController.php&line=12'])
+
+  // ...or the page: PHP finds the route by its id and builds the URL; the mod hands over no URL
+  fake.answers!.push('Open in browser')
+  await pane.press({ key: 'route-2' })
+  expect(ran.find(argv => argv[2]?.includes('proc_open'))!.slice(3)).toEqual(['--', '1', 'GET|HEAD', 'users', '{}'])
+
+  // A parameter's value is asked for; Cancel, or no value, opens nothing
+  fake.answers!.push('Open in browser', '42')
+  await pane.press({ key: 'route-3' })
+  expect(fake.asked).toContain('Value for {user} in GET /users/{user}?')
+  expect(ran.filter(argv => argv[2]?.includes('proc_open')).at(-1)!.slice(3)).toEqual(['--', '3', 'GET|HEAD', 'users/{user}', '{"user":"42"}'])
+  const opened = ran.length
+  fake.answers!.push('Open in browser', 'Cancel', 'Open in browser', '  ')
+  await pane.press({ key: 'route-3' })
+  await pane.press({ key: 'route-3' })
+  expect(ran.slice(opened).some(argv => argv[2]?.includes('proc_open'))).toBe(false)
+
+  // POST has no page, so Enter opens the file without asking
+  const questions = fake.asked!.length
+  await pane.press({ key: 'route-1' })
+  expect(fake.asked).toHaveLength(questions)
+  expect(ran).toContainEqual(['open', 'phpstorm://open?file=/app/app/Http/Controllers/PostController.php&line=20'])
+
+  // An arrow press landing the ring on a row selects it: the line under the list says where Enter goes
+  await $.ui.focus({ component: 'Pane', requestId: 'lara', plugin: 'lara-cc', element: 'route-1', origin: { kind: 'person' } } as never)
+  expect(JSON.stringify(await pane.drawn())).toContain('→ app/Http/Controllers/PostController.php:20')
+  // Where the arrows scroll the pane instead, the selection moves with them; End goes to the last route
+  const scroll = (by: number) => $.ui.scroll({ component: 'Pane', requestId: 'lara', offset: 0, by, bodyRows: 30, contentRows: 14, origin: { kind: 'person' } } as never)
+  await scroll(3)
+  expect(JSON.stringify(await pane.drawn())).toContain('(on its own domain)')
+  await scroll(14)
+  expect(JSON.stringify(await pane.drawn())).toContain('→ app/Http/Controllers/WebhookController.php:7')
+
+  // The filter narrows the rows, matching the method as shown
+  await pane.input({ key: 'route-filter', text: 'posts', kind: 'change' })
+  expect(await rows()).toHaveLength(1)
+  await pane.input({ key: 'route-filter', text: 'any', kind: 'change' })
+  expect(await rows()).toHaveLength(1)
+  await pane.input({ key: 'route-filter', text: 'head', kind: 'change' })
+  expect(await rows()).toHaveLength(0)
+})
+
+test('Routes tab rows fit a narrow, short pane: one line each, and only as many as fit', async ($, on) => {
+  const ran: string[][] = []
+  const clock = fakeProject(on, ran)
+  on('ui.open', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  const pane = await $.ui.mount({
+    plugin: 'lara-cc',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'lara',
+    props: { title: 'lara-cc', isFocused: true, bodyColumns: 36, placement: 'dock', scroll: { offset: 0, bodyRows: 12 } } as never,
+  })
+  await pane.press({ key: 'tab-routes' })
+  await clock.settle()
+  // A row's text is its Text children, in order
+  const textOf = (node: unknown): string =>
+    typeof node === 'string' ? node : ((node as { children?: unknown[] })?.children ?? []).map(textOf).join('')
+  const found: { props?: { key?: string } }[] = []
+  const walk = (node: unknown) => {
+    if (!node || typeof node !== 'object') return
+    const el = node as { type?: string; props?: { key?: string }; children?: unknown[] }
+    if (el.type === 'Button' && /^route-\d+$/.test(String(el.props?.key))) found.push(el)
+    for (const child of el.children ?? []) walk(child)
+  }
+  walk(await pane.drawn())
+  expect(found.length).toBeGreaterThan(0)
+  // 12 rows: the header (3 at 36 columns), a blank, the filter, the summary (3), the selected route's line, a spare
+  expect(found.length).toBeLessThanOrEqual(12 - 10)
+  for (const row of found) expect(textOf(row).length).toBeLessThanOrEqual(36)
+})
+
+test('without an editor, a route file opens as a plain file', async ($, on) => {
+  const ran: string[][] = []
+  const clock = fakeProject(on, ran, { answers: ['Open UserController.php:12'] })
+  on('ui.open', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-routes' })
+  await clock.settle()
+
+  // No editor anywhere: macOS opens the file with whatever opens .php files
+  await pane.press({ key: 'route-2' })
+  expect(ran.filter(argv => argv[0] === 'open')).toEqual([['open', '/app/app/Http/Controllers/UserController.php']])
+})
+
+test("an editor link that doesn't open falls back to the plain file", async ($, on) => {
+  const ran: string[][] = []
+  const clock = fakeProject(on, ran, { answers: ['Open UserController.php:12'], editor: 'phpstorm', noEditor: true })
+  on('ui.open', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-routes' })
+  await clock.settle()
+
+  await pane.press({ key: 'route-2' })
+  expect(ran.filter(argv => argv[0] === 'open').map(argv => argv[1])).toEqual([
+    'phpstorm://open?file=/app/app/Http/Controllers/UserController.php&line=12',
+    '/app/app/Http/Controllers/UserController.php',
+  ])
 })

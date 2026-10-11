@@ -6,6 +6,7 @@ import {
   composerDrift,
   connectionsPhp,
   durationMs,
+  editorHref,
   exceptionHeadline,
   feedLog,
   formatEntry,
@@ -17,25 +18,34 @@ import {
   isTestCommand,
   isWarning,
   localHotUrl,
+  methodLabel,
   newLogState,
   npmDrift,
+  openPagePhp,
   origin,
+  pageNotOpened,
   parseConnections,
   parseDebugCapture,
+  parseRoutes,
   parseSnapshot,
   parseTestRun,
   parseWorkerLine,
+  PHP_OPTIONS,
+  phpJson,
   queuesOf,
   redact,
   redactData,
   refusedOptions,
+  routesPhp,
+  routeWindow,
   shortClass,
   snapshotPhp,
   splitArgs,
   stripAnsi,
   tail,
+  terminalEditor,
 } from './parse'
-import type { AppConnection, FailedJob, HerdService, LogEntry, QueueSnapshot, TestFailure, TestRun } from './parse'
+import type { AppConnection, FailedJob, HerdService, LogEntry, QueueSnapshot, TabRoute, TestFailure, TestRun } from './parse'
 
 /**
  * lara-cc: an unofficial Claude Code mod for Laravel apps. Not affiliated with or endorsed by Laravel LLC or Anthropic.
@@ -115,7 +125,6 @@ type Run = { stream: HookStream<ProcessSpawnChunk, ProcessSpawnResult>; done: Pr
 /** `crashed`: the exit code of a run that ended on its own with an error; `seen` once the Services tab showed it. */
 type Service = { name: string; label: string; argv: string[]; run?: Run; lines: string[]; startedAt?: number; partial: string; crashed?: { code: number; seen: boolean } }
 type LastRun = { label: string; isRunning: boolean; exitCode?: number; output: string }
-type Route = { method: string; uri: string; name: string | null; action: string }
 type Job = { job: string; time: string; status: 'running' | 'done' | 'failed'; ms?: number }
 type Settings = {
   autoRestartQueue: boolean
@@ -151,8 +160,20 @@ let lastToastAt = 0
 let restartTimer: { cancel: () => void } | undefined
 let lastRun: LastRun | undefined
 let about: Record<string, Record<string, unknown>> | undefined
-let routes: Route[] | undefined
 let routeFilter = ''
+// The routes (with where each route's code is), the load while one runs, and why the last one failed
+let routeList: TabRoute[] | undefined
+let routesLoading: Promise<void> | undefined
+// Counts route loads, so a load for a folder the session has since left is dropped (detectProject counts one)
+let routeLoads = 0
+let routesError = ''
+// The editor Laravel's `app.editor` setting names, if the app sets one
+let appEditor = ''
+// `open` on macOS, `xdg-open` elsewhere, asked once (see openCommand)
+let opener: Promise<string> | undefined
+// The selected route on the Routes tab (an index into the filtered list), and the first row drawn
+let routeAt = 0
+let routeTop = 0
 let pendingMigrations = 0
 // Fixes running from a band or Services tab button, by label, so the button reads "running…"
 const fixing = new Set<string>()
@@ -240,11 +261,13 @@ async function openPane($: Api, on: Tab) {
   if (on === 'log') unseenErrors = 0
   if (on === 'services') for (const svc of Object.values(services)) if (svc.crashed) svc.crashed.seen = true
   if (on === 'about' && !about) void loadAbout($)
-  if (on === 'routes' && !routes) void loadRoutes($)
+  // Again after a failed load, so a fixed app shows its routes
+  if (on === 'routes' && !routeList) void loadRouteList($)
   if (on === 'queue') void refreshQueue($)
   paneOpen = true
   await $.ui.open({ id: PANE, title: 'lara-cc', focus: true, closeOnEscape: true })
   redraw($)
+  if (on === 'routes') void (routesLoading ?? Promise.resolve()).then(() => focusRoute($))
 }
 
 // ─── Settings (kept between sessions) ──────────────────────────────────────
@@ -273,8 +296,8 @@ async function toggleAutostart($: Api, name: string) {
 /** The binary and version a PHP launch (`['php']`, `['herd', 'php']`) reports, or undefined when it doesn't run or answers oddly. */
 async function probePhp($: Api, argv: string[]): Promise<{ binary: string; version: string } | undefined> {
   try {
-    const r = await $.process.run([...argv, '-r', 'echo PHP_BINARY, "\\n", PHP_VERSION;'], { timeoutMs: 15_000 })
-    // The last two lines: PHP may print warnings first
+    const r = await $.process.run([...argv, ...PHP_OPTIONS, '-r', 'echo PHP_BINARY, "\\n", PHP_VERSION;'], { timeoutMs: 15_000 })
+    // The last two lines, should something print before them
     const [binary = '', version = ''] = r.stdout.trim().split(/\r?\n/).slice(-2).map(s => s.trim())
     if (r.exitCode !== 0 || !binary.startsWith('/') || !/^\d+\.\d+\.\d+/.test(version) || !(await $.fs.exists(binary))) return undefined
     return { binary, version }
@@ -317,15 +340,15 @@ async function detectPhp($: Api) {
   const composer = await onPath($, 'composer')
   if (!composer) return
   const r = await $.process.run([herd.binary, composer, '--version', '--no-ansi'], { timeoutMs: 15_000 }).catch(() => undefined)
-  if (r?.exitCode === 0 && /^Composer version/m.test(r.stdout)) composerArgv = [herd.binary, composer]
+  if (r?.exitCode === 0 && /^Composer version/m.test(r.stdout)) composerArgv = [herd.binary, ...PHP_OPTIONS, composer]
 }
 
-/** `argv` with php, composer and Pint run on the PHP that serves this folder. */
+/** `argv` with php, composer and Pint run on the PHP that serves this folder, with PHP_OPTIONS. */
 function withPhp(argv: string[]): string[] {
   const [cmd = '', ...rest] = argv
-  if (cmd === 'php') return [phpBin, ...rest]
+  if (cmd === 'php') return [phpBin, ...PHP_OPTIONS, ...rest]
   if (cmd === 'composer') return [...composerArgv, ...rest]
-  if (cmd === 'vendor/bin/pint' && phpBin !== 'php') return [phpBin, cmd, ...rest]
+  if (cmd === 'vendor/bin/pint' && phpBin !== 'php') return [phpBin, ...PHP_OPTIONS, cmd, ...rest]
   return argv
 }
 
@@ -800,28 +823,154 @@ async function clearLog($: Api) {
 
 // ─── Project info ──────────────────────────────────────────────────────────
 
-async function loadRoutes($: Api): Promise<Route[] | string> {
+/**
+ * The routes, read with routesPhp: one PHP boot for route:list's columns and where each route's code is. Serves
+ * the Routes tab, /lara-routes and Claude's routes tool. One load at a time; one for a folder the session has
+ * left since is dropped.
+ */
+function loadRouteList($: Api): Promise<void> {
+  if (routesLoading) return routesLoading
+  const load = ++routeLoads
+  const loading = (async () => {
+    try {
+      const r = await runPhp($, ['php', '-r', routesPhp()], { timeoutMs: 60_000 })
+      if (load !== routeLoads) return
+      const parsed = parseRoutes(r.stdout)
+      if (parsed) ({ routes: routeList, editor: appEditor } = parsed)
+      routesError = parsed ? '' : failureReason([r.stderr, r.stdout].join('\n')) || 'Could not read the routes.'
+    } catch (err) {
+      if (load === routeLoads) routesError = 'Could not read the routes: ' + String(err)
+    } finally {
+      if (load === routeLoads) routesLoading = undefined
+      redraw($)
+    }
+  })()
+  routesLoading = loading
+  return loading
+}
+
+/** The routes for /lara-routes and Claude's tool, filtered; why not, redacted, when they can't be read. */
+async function routesText($: Api, filter: string): Promise<string> {
+  await loadRouteList($)
+  if (routesError || !routeList) return redact(routesError || 'Could not read the routes.')
+  const shown = filterRoutes(routeList, filter)
+  return tail(`${shown.length} of ${routeList.length} routes\n` + shown.map(formatRoute).join('\n'))
+}
+
+/**
+ * Why a PHP run failed, in a line: its first line that isn't a PHP warning, with the message after it when that
+ * line is only an exception's class (as Collision prints it).
+ */
+function failureReason(output: string): string {
+  const lines = stripAnsi(output)
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !/^(PHP )?(Deprecated|Warning|Notice):/i.test(l))
+  const [first = '', second] = lines
+  return (/^[\w\\]+$/.test(first) && second ? `${first}: ${second}` : first).slice(0, 300)
+}
+
+/** Put the focus ring on the selected route, so the arrows browse the list and Enter opens one straight away. */
+async function focusRoute($: Api) {
+  if (!paneOpen || tab !== 'routes' || !routeList || !filterRoutes(routeList, routeFilter).length) return
+  await $.ui.focus({ requestId: PANE, key: 'route-' + routeAt }).catch(() => undefined)
+}
+
+/** `GET /users/{user}`. */
+function routeLabel(r: { method: string; uri: string }): string {
+  return `${methodLabel(r.method)} ${uriText(r)}`
+}
+
+/**
+ * Enter on a route: open its code in the editor, or its page in the browser (GET routes), asking which when
+ * both apply. Only the person's press.
+ */
+async function openRoute($: Api, r: TabRoute) {
+  const file = r.file ? `Open ${r.file.split('/').pop()}:${r.line}` : undefined
+  const page = r.method.split('|').includes('GET') ? 'Open in browser' : undefined
+  const options = [file, page].filter((o): o is string => !!o)
+  if (!options.length) return $.ui.toast(`${routeLabel(r)}: no file found for its code, and only GET routes open in the browser`, { timeoutMs: 6000 })
+  const pick = options.length > 1 ? await $.ui.ask(`${routeLabel(r)}: open its code or its page?`, { header: 'Route', options }).catch(() => '') : options[0]
+  if (r.file && pick === file) await openFile($, r.file, r.line ?? 1)
+  else if (pick === page) await openPage($, r)
+}
+
+/** What opens a file or a link: `open` on macOS, `xdg-open` elsewhere (Linux has an unrelated `open`). */
+function openCommand($: Api): Promise<string> {
+  opener ??= $.process.run(['uname', '-s'], { timeoutMs: 5_000 }).then(
+    r => (r.stdout.trim() === 'Darwin' ? 'open' : 'xdg-open'),
+    () => 'open',
+  )
+  return opener
+}
+
+/**
+ * Open a route's file at its line: in the editor Laravel's `app.editor` setting names, else the one whose terminal
+ * Claude Code runs in. Without one, or when the editor's link doesn't open, in whatever opens .php files (no line).
+ */
+async function openFile($: Api, file: string, line: number) {
+  const path = file.startsWith('/') ? file : `${projectDir}/${file}`
+  const [open, bundle, program, emulator] = await Promise.all([openCommand($), $.env.get('__CFBundleIdentifier'), $.env.get('TERM_PROGRAM'), $.env.get('TERMINAL_EMULATOR')])
+  const editor = appEditor || terminalEditor(bundle, program, emulator)
+  const opens = (target: string) => $.process.run([open, target], { timeoutMs: 15_000 }).then(r => r.exitCode === 0, () => false)
+  if (editor && (await opens(editorHref(editor, path, line)))) return
+  if (!(await opens(path))) $.ui.toast(`Couldn't open ${file}`, { timeoutMs: 8000 })
+  else if (editor) $.ui.toast(`${editor} didn't open it, so ${file} opened as a file (without line ${line})`, { timeoutMs: 8000 })
+  else $.ui.toast(`Opened ${file}. To land on line ${line}, set 'editor' (e.g. phpstorm, vscode) in config/app.php`, { timeoutMs: 8000 })
+}
+
+/**
+ * Open a GET route's page in the browser, asking for each value its URL needs. PHP builds the URL with Laravel's
+ * own generator and opens it, so the URL never reaches the mod or Claude.
+ */
+async function openPage($: Api, r: TabRoute) {
+  const values: Record<string, string> = {}
+  for (const param of r.params) {
+    const value = (await $.ui.ask(`Value for {${param}} in ${routeLabel(r)}?`, { header: 'Route', options: ['1', 'Cancel'] }).catch(() => 'Cancel')).trim()
+    if (value === 'Cancel') return
+    // Empty, the URL would quietly be another route's (/users/ for /users/{user})
+    if (!value) return $.ui.toast(`{${param}} needs a value, so ${routeLabel(r)} wasn't opened`, { timeoutMs: 6000 })
+    values[param] = value
+  }
   try {
-    const r = await runPhp($, ['php', 'artisan', 'route:list', '--json'], { timeoutMs: 60_000 })
-    if (r.exitCode !== 0) return stripAnsi(r.stderr || r.stdout)
-    const list = JSON.parse(r.stdout) as Route[]
-    routes = list.map(x => ({ method: x.method, uri: x.uri, name: x.name, action: x.action }))
-    redraw($)
-    return routes
+    const run = await runPhp($, ['php', '-r', openPagePhp(), '--', String(r.id), r.method, r.uri, JSON.stringify(values)], { timeoutMs: 30_000 })
+    const why = pageNotOpened(run.stdout)
+    $.ui.toast(why ? `Couldn't open ${routeLabel(r)}: ${why}` : `Opened ${routeLabel(r)} in the browser`, { timeoutMs: 6000 })
   } catch (err) {
-    return 'Could not read routes: ' + String(err)
+    $.ui.toast(`Couldn't open ${routeLabel(r)}: ${String(err)}`, { timeoutMs: 8000 })
   }
 }
 
-function filterRoutes(list: Route[], filter: string): Route[] {
+/** The routes whose method (as shown: `ANY`, no `HEAD`), URI, name or action holds `filter`. */
+function filterRoutes(list: TabRoute[], filter: string): TabRoute[] {
   const f = filter.trim().toLowerCase()
   if (!f) return list
-  return list.filter(r => `${r.method} ${r.uri} ${r.name ?? ''} ${r.action}`.toLowerCase().includes(f))
+  return list.filter(r => `${methodLabel(r.method)} ${uriText(r)} ${r.name ?? ''} ${r.action}`.toLowerCase().includes(f))
 }
 
-function formatRoute(r: Route): string {
-  const method = r.method.replace('|HEAD', '').padEnd(9)
-  return `${method} /${r.uri.replace(/^\//, '')}${r.name ? '  ' + r.name : ''}  ${shortClass(r.action)}`
+function formatRoute(r: TabRoute): string {
+  return `${methodLabel(r.method).padEnd(9)} ${uriText(r)}${r.name ? '  ' + r.name : ''}  ${shortClass(r.action)}`
+}
+
+/** `/users/{user}`. */
+function uriText(r: { uri: string }): string {
+  return '/' + r.uri.replace(/^\//, '')
+}
+
+/** `text` cut to `n` columns with an ellipsis, and padded to `n` unless `pad` is false. */
+function fit(text: string, n: number, pad = true): string {
+  if (n <= 0) return ''
+  const cut = text.length > n ? text.slice(0, n - 1) + '…' : text
+  return pad ? cut.padEnd(n) : cut
+}
+
+/** The Routes tab's method colors; any other method (OPTIONS, ANY) is magenta. */
+const METHOD_COLORS: Record<string, string> = { GET: 'green', POST: 'yellow', PUT: 'blue', PATCH: 'blue', DELETE: 'red' }
+
+/** By the method as shown (`methodLabel`), so ANY isn't drawn as GET. */
+function methodColor(label: string): string {
+  const first = label.split('|')[0] ?? ''
+  return Object.hasOwn(METHOD_COLORS, first) ? METHOD_COLORS[first]! : 'magenta'
 }
 
 async function loadAbout($: Api) {
@@ -830,8 +979,7 @@ async function loadAbout($: Api) {
     .catch(() => undefined)
   try {
     const r = await runPhp($, ['php', 'artisan', 'about', '--json'], { timeoutMs: 60_000 })
-    // PHP may print deprecation warnings before the JSON
-    if (r.exitCode === 0) about = JSON.parse(r.stdout.slice(r.stdout.indexOf('{')))
+    if (r.exitCode === 0) about = phpJson(r.stdout) as typeof about
   } catch {
     about = undefined
   }
@@ -1205,7 +1353,14 @@ async function detectProject($: Api) {
   depsSeen = ''
   depsChecks = []
   about = undefined
-  routes = undefined
+  routeList = undefined
+  // A load still running is for the folder left behind (see loadRouteList)
+  routesLoading = undefined
+  routeLoads++
+  routesError = ''
+  appEditor = ''
+  routeAt = 0
+  routeTop = 0
   pm = 'npm'
   for (const svc of Object.values(services)) svc.crashed = undefined
   if (!isLaravel) return
@@ -1418,11 +1573,12 @@ export const register: Register = on => {
 
   on('command.run', { command: 'lara-routes' }, async ($, e) => {
     if (!isLaravel) return { text: notLaravel() }
-    const list = await loadRoutes($)
-    if (typeof list === 'string') return { text: list }
+    const text = await routesText($, e.args)
+    // The Routes tab shows the same filter
     routeFilter = e.args.trim()
-    const shown = filterRoutes(list, routeFilter)
-    return { text: tail(`${shown.length} of ${list.length} routes\n` + shown.map(formatRoute).join('\n')) }
+    routeAt = routeTop = 0
+    redraw($)
+    return { text }
   }).catch(commandFailed)
 
   on('command.run', { command: 'lara-npm' }, async ($, e) => {
@@ -1480,11 +1636,7 @@ export const register: Register = on => {
 
   on('tool.call', { tool: 'mcp__lara-cc__routes' }, async ($, e) => {
     if (!isLaravel) return { result: notLaravel() }
-    const list = await loadRoutes($)
-    if (typeof list === 'string') return { result: list }
-    const filter = String((e as unknown as { filter?: string }).filter ?? '')
-    const shown = filterRoutes(list, filter)
-    return { result: tail(`${shown.length} of ${list.length} routes\n` + shown.map(formatRoute).join('\n')) }
+    return { result: await routesText($, String((e as unknown as { filter?: string }).filter ?? '')) }
   }).catch(toolFailed)
 
   // ── Tests Claude runs itself: the result shows in the band and the Tests tab ──
@@ -1570,6 +1722,29 @@ export const register: Register = on => {
   on('ui.close', ($, e, next) => {
     if (e.id === PANE) paneOpen = false
     return next(e)
+  })
+
+  // The Routes tab draws only the rows that fit, so the arrows walk them; the window follows the focus ring
+  on('ui.focus', { requestId: PANE }, ($, e, next) => {
+    const row = /^route-(\d+)$/.exec(e.element ?? '')
+    if (row) {
+      routeAt = Number(row[1])
+      redraw($)
+    }
+    return next(e)
+  })
+
+  // Where the arrows scroll the pane instead, and for the wheel and page keys, they move the selected route
+  on('ui.scroll', { requestId: PANE }, ($, e, next) => {
+    const count = tab === 'routes' && routeList ? filterRoutes(routeList, routeFilter).length : 0
+    // A pane too short for what it drew scrolls as usual, so nothing is out of reach
+    if (!count || e.contentRows > e.bodyRows) return next(e)
+    // Home and End ask for the drawing's whole height, the page keys for the window's
+    const isEnd = Math.abs(e.by) === e.contentRows && e.contentRows !== e.bodyRows
+    routeAt = isEnd ? (e.by < 0 ? 0 : count - 1) : Math.max(0, Math.min(count - 1, routeAt + e.by))
+    redraw($)
+    void $.ui.focus({ requestId: PANE, key: 'route-' + routeAt }).catch(() => undefined)
+    return {}
   })
 
   // ── The band above the prompt: one line, only when there's something to show ──
@@ -1660,17 +1835,22 @@ export const register: Register = on => {
 
     const errorBadge = unseenErrors ? ` (${unseenErrors})` : ''
     const failedBadge = snapshot?.failedTotal ? ` (${snapshot.failedTotal})` : ''
+    const tabs: [Tab, string, string][] = [
+      ['services', 'Services', 's'],
+      ['queue', 'Queue' + failedBadge, 'q'],
+      ['log', 'Log' + errorBadge, 'l'],
+      ['tests', 'Tests' + (lastTest?.failed ? ` (${lastTest.failed})` : ''), 't'],
+      ['routes', 'Routes', 'r'],
+      ['commands', 'Commands', 'c'],
+      ['about', 'About', 'a'],
+    ]
     const header = (
       <Box flexDirection="row" columnGap={2} flexWrap="wrap">
-        {tabButton('services', 'Services', 's')}
-        {tabButton('queue', 'Queue' + failedBadge, 'q')}
-        {tabButton('log', 'Log' + errorBadge, 'l')}
-        {tabButton('tests', 'Tests' + (lastTest?.failed ? ` (${lastTest.failed})` : ''), 't')}
-        {tabButton('routes', 'Routes', 'r')}
-        {tabButton('commands', 'Commands', 'c')}
-        {tabButton('about', 'About', 'a')}
+        {tabs.map(([id, label, hotkey]) => tabButton(id, label, hotkey))}
       </Box>
     )
+    // Rows the header wraps to: each tab is drawn `s: Services`, two columns apart
+    const headerRows = Math.ceil(tabs.reduce((n, [, label]) => n + label.length + 5, -2) / width)
 
     const toggleButton = (key: 'autoRestartQueue' | 'pintAfterTurn' | 'showBand' | 'errorToasts', label: string) => (
       <Button key={'set-' + key} label={`${settings[key] ? '[x]' : '[ ]'} ${label}`} plain dimColor={!settings[key]} onPress={() => void toggle($, key)} />
@@ -1938,7 +2118,52 @@ export const register: Register = on => {
         </Box>
       )
     } else if (tab === 'routes') {
-      const shown = routes ? filterRoutes(routes, routeFilter) : []
+      const shown = routeList ? filterRoutes(routeList, routeFilter) : []
+      const count = !routeList
+        ? routesLoading
+          ? 'Loading routes…'
+          : 'No routes'
+        : `${shown.length} of ${plural(routeList.length, 'route')}`
+      const hint = '↑↓ browse · enter opens the code or the page'
+      const refresh = routesLoading ? 'loading…' : 'refresh'
+      // Only the rows that fit are drawn, each a Button: with nothing to scroll the arrows walk them, and the
+      // window keeps a row drawn beyond the selected one so the next press always lands. Around the list: the
+      // header, a blank row, the filter, the summary row (as wrapped), an error, the selected route's line, a spare
+      const summaryRows = Math.ceil((count.length + 13 + (shown.length ? hint.length + 2 : 0) + (Input ? 11 : 0) + refresh.length) / width)
+      const chrome = headerRows + 1 + (Input ? 1 : 0) + summaryRows + (routesError ? 1 : 0) + (shown.length ? 1 : 0) + 1
+      const routeRows = Math.max(1, (e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 30) - chrome)
+      routeAt = Math.min(routeAt, Math.max(0, shown.length - 1))
+      routeTop = routeWindow(routeAt, routeTop, routeRows, shown.length)
+      const visible = shown.slice(routeTop, routeTop + routeRows)
+      const selected = shown[routeAt]
+      // Sized to the whole filtered list, so the columns stay put while scrolling, and cut to fit the pane: a
+      // row is the marker, the method, then the URI, name and action with a gap before each
+      const widest = (of: (r: TabRoute) => string) => shown.reduce((n, r) => Math.max(n, of(r).length), 0)
+      const methodWidth = Math.min(9, Math.max(3, widest(r => methodLabel(r.method))))
+      const room = Math.max(0, width - 4 - methodWidth)
+      const uriWidth = Math.max(1, Math.min(widest(uriText), Math.floor(room * 0.5)))
+      const nameWidth = Math.min(widest(r => r.name ?? ''), Math.floor(room * 0.25))
+      const actionWidth = room - uriWidth - (nameWidth ? nameWidth + 2 : 0) - 2
+      const setFilter = (value: string) => {
+        routeFilter = value
+        routeAt = routeTop = 0
+        redraw($)
+      }
+      // The selected row is marked as well as ringed, so it shows while the focus is on the filter
+      const routeRow = (r: TabRoute, i: number) => (
+        <Button key={'route-' + i} label={routeLabel(r)} plain onPress={() => void openRoute($, r)}>
+          <Text bold>{i === routeAt ? '› ' : '  '}</Text>
+          <Text color={methodColor(methodLabel(r.method))}>{fit(methodLabel(r.method), methodWidth) + '  '}</Text>
+          {fit(uriText(r), uriWidth)
+            .split(/(\{[^}]*\})/)
+            .filter(Boolean)
+            .map(part => (
+              <Text color={part.startsWith('{') ? 'cyan' : undefined}>{part}</Text>
+            ))}
+          {nameWidth > 0 && <Text dimColor>{'  ' + fit(r.name ?? '', nameWidth)}</Text>}
+          {actionWidth > 0 && <Text dimColor>{'  ' + fit(shortClass(r.action), actionWidth, false)}</Text>}
+        </Button>
+      )
       body = (
         <Box flexDirection="column">
           {Input && (
@@ -1947,20 +2172,24 @@ export const register: Register = on => {
               label="filter"
               placeholder="uri, name or controller"
               value={routeFilter}
-              submitLabel="filter"
-              onInput={value => {
-                routeFilter = value
-                redraw($)
-              }}
+              submitLabel="browse"
+              onInput={setFilter}
               onSubmit={value => {
-                routeFilter = value
-                redraw($)
+                setFilter(value)
+                void focusRoute($)
               }}
             />
           )}
-          {!routes ? <Text dimColor>Loading routes…</Text> : <Text dimColor>{`${shown.length} of ${routes.length}`}</Text>}
-          {shown.slice(0, rows - 3).map(r => line(formatRoute(r)))}
-          <Button key="routes-refresh" label="refresh" plain dimColor onPress={() => void loadRoutes($)} />
+          <Box flexDirection="row" columnGap={2} flexWrap="wrap">
+            <Text dimColor>{count + (shown.length > visible.length ? `  (${routeTop + 1}–${routeTop + visible.length})` : '')}</Text>
+            {shown.length > 0 && <Text dimColor>{hint}</Text>}
+            {Input && <Button key="route-find" label="filter" hotkey="f" plain dimColor onPress={() => void $.ui.focus({ requestId: PANE, key: 'route-filter' }).catch(() => undefined)} />}
+            <Button key="routes-refresh" label={refresh} plain dimColor onPress={() => void loadRouteList($)} />
+          </Box>
+          {!!routesError && line(routesError, false, 'red')}
+          {routeList && !shown.length && <Text dimColor>{`No routes match "${routeFilter}".`}</Text>}
+          {visible.map((r, i) => routeRow(r, routeTop + i))}
+          {selected && line(`→ ${selected.file ? `${selected.file}:${selected.line}  ` : ''}${selected.action}${selected.onDomain ? '  (on its own domain)' : ''}`, true)}
         </Box>
       )
     } else {

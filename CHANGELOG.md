@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-11
+
+### Added
+
+- Browse routes with the arrow keys on the Routes tab; Enter asks whether to open the route's code (controller method, closure or view, at its line, in the editor Laravel's `editor` setting or your terminal names) or its page in the browser, asking for any URL parameter without a default. Laravel's own URL generator builds the URL from `APP_URL` and PHP opens it, so the URL, and a route's domain, never reach the mod or Claude.
+
+### Changed
+
+- The Routes tab draws routes in aligned columns with coloured methods and highlighted `{parameters}`, shows where the selected route's code is, says why loading failed instead of loading forever (and tries again when you come back to the tab), fits narrow and short panes, and `f` jumps to the filter. The filter matches the method as shown (`ANY`, no `HEAD`).
+- `/lara-routes` and Claude's `routes` tool read the same list as the Routes tab, from one PHP boot instead of `route:list`, and `/lara-routes <filter>` filters the open tab too.
+
+### Fixed
+
+- Every PHP the mod starts sends PHP's own warnings to stderr, so a package that warns on a newer PHP no longer breaks what the mod reads from PHP's output (routes, queue state, the About tab, the artisan tool's command check), whether the warning comes before the output or at shutdown.
+
+### Security
+
+- When the routes can't be read, the reason Claude's `routes` tool and `/lara-routes` return is redacted; it used to be PHP's raw output, which can name database hosts and users.
+
 ## [0.8.0] - 2026-10-10
 
 ### Added

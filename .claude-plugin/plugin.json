@@ -1,7 +1,7 @@
 {
   "name": "lara-cc",
   "displayName": "lara-cc",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Unofficial Claude Code mod for Laravel apps (not affiliated with Laravel LLC): live log and queue monitoring, managed queue/Vite/scheduler, artisan, routes, tests and tools Claude can call",
   "author": {
     "name": "Mark Szymik",

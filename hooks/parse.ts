@@ -42,14 +42,33 @@ export function refusedOptions(argv: string[], refused: string[]): string[] {
   })
 }
 
-/** The command name in `artisan help <name> --format=json` output, which may follow PHP warnings. */
-export function helpName(stdout: string): string | undefined {
+/**
+ * Options for every PHP the mod starts: PHP's own warnings and errors go to stderr, so stdout carries only what
+ * the command prints. Laravel turns them off itself once booted; this covers what comes before (autoloading, a
+ * package that warns on a newer PHP) and after (shutdown).
+ */
+export const PHP_OPTIONS = ['-d', 'display_errors=stderr']
+
+/**
+ * The JSON object PHP printed, from `marker` (`{"routes"`) to the last `}`, so what app code prints around it
+ * (an `echo` in a service provider, a stray `dump()`) is skipped. Undefined when there's none.
+ */
+export function phpJson(stdout: string, marker = '{'): Record<string, unknown> | undefined {
+  const start = stdout.indexOf(marker)
+  const end = stdout.lastIndexOf('}')
+  if (start < 0 || end < start) return undefined
   try {
-    const name = (JSON.parse(stdout.slice(stdout.indexOf('{'))) as { name?: unknown }).name
-    return typeof name === 'string' ? name : undefined
+    const value: unknown = JSON.parse(stdout.slice(start, end + 1))
+    return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined
   } catch {
     return undefined
   }
+}
+
+/** The command name in `artisan help <name> --format=json` output. */
+export function helpName(stdout: string): string | undefined {
+  const name = phpJson(stdout)?.name
+  return typeof name === 'string' ? name : undefined
 }
 
 export function tail(text: string, max = 8000): string {
@@ -204,15 +223,9 @@ echo json_encode($out);
 `
 }
 
-/** Read the JSON from the snapshot's output, skipping any PHP warnings printed before it. */
+/** Read the JSON from the snapshot's output. */
 export function parseSnapshot(stdout: string): QueueSnapshot | undefined {
-  const start = stdout.indexOf('{"connection"')
-  if (start < 0) return undefined
-  try {
-    return JSON.parse(stdout.slice(start)) as QueueSnapshot
-  } catch {
-    return undefined
-  }
+  return phpJson(stdout, '{"connection"') as QueueSnapshot | undefined
 }
 
 /** First line of a stored exception, e.g. `RuntimeException: Payment gateway down in /app/...:12`. */
@@ -344,16 +357,9 @@ echo json_encode(['connections' => $out]);
 
 export type AppConnection = { use: string; driver: string; port: number }
 
-/** Read connectionsPhp's JSON, skipping any PHP warnings printed before it; undefined when there's none. */
+/** Read connectionsPhp's JSON; undefined when there's none. */
 export function parseConnections(stdout: string): AppConnection[] | undefined {
-  const start = stdout.indexOf('{"connections"')
-  if (start < 0) return undefined
-  let list: unknown
-  try {
-    list = (JSON.parse(stdout.slice(start)) as { connections?: unknown }).connections
-  } catch {
-    return undefined
-  }
+  const list = phpJson(stdout, '{"connections"')?.connections
   if (!Array.isArray(list)) return undefined
   return list.flatMap((c: Record<string, unknown>) =>
     typeof c?.use === 'string' && typeof c.driver === 'string' && Number.isInteger(c.port) ? [{ use: c.use, driver: c.driver, port: c.port as number }] : [],
@@ -387,6 +393,220 @@ export function herdNeeds<T extends HerdService>(connections: AppConnection[], i
     out.set(service, entry)
   }
   return [...out.values()]
+}
+
+// ─── Routes: the Routes tab's list, where each route's code is, and its page ──
+
+/**
+ * A route as the Routes tab shows it: route:list's columns, where its code is (the controller method, closure or
+ * view; relative to the project when inside it), and the parameters its URL needs a value for (required, with no
+ * default). `id` is its place in the router, for openPagePhp. No domain: a route on its own domain only says so,
+ * and its host stays in PHP.
+ */
+export type TabRoute = {
+  id: number
+  method: string
+  uri: string
+  name: string | null
+  action: string
+  file?: string
+  line?: number
+  params: string[]
+  onDomain: boolean
+}
+
+/** `GET|HEAD` → `GET`; a route that takes every method (Route::any) → `ANY`; a HEAD-only route stays `HEAD`. */
+export function methodLabel(method: string): string {
+  const list = method.split('|').filter(m => m !== 'HEAD')
+  if (!list.length) return method
+  return ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'].every(m => list.includes(m)) ? 'ANY' : list.join('|')
+}
+
+/**
+ * PHP run with `php -r` from the project root: boots the app and prints its routes sorted by URI as route:list
+ * does, each with where its code is and the parameters its URL needs a value for (route and URL::defaults fill
+ * the rest), and the editor Laravel's own `app.editor` setting names (as its error page uses it). A route's
+ * domain doesn't leave PHP: only whether it has one.
+ */
+export function routesPhp(): string {
+  return `
+require 'vendor/autoload.php';
+$app = require 'bootstrap/app.php';
+$app->make(Illuminate\\Contracts\\Console\\Kernel::class)->bootstrap();
+$where = function ($route) {
+  $controller = $route->getAction('controller');
+  if (!is_string($controller)) {
+    // A closure; one from the route cache is serialized and has no file to show
+    $uses = $route->getAction('uses');
+    if (!$uses instanceof Closure) return null;
+    $f = new ReflectionFunction($uses);
+    return [$f->getFileName(), $f->getStartLine()];
+  }
+  [$class, $method] = array_pad(explode('@', ltrim($controller, '\\\\'), 2), 2, '__invoke');
+  if ($class === Illuminate\\Routing\\ViewController::class) return [view()->getFinder()->find((string) ($route->defaults['view'] ?? '')), 1];
+  // Route::redirect has no code of its own to show
+  if ($class === Illuminate\\Routing\\RedirectController::class) return null;
+  $c = new ReflectionClass($class);
+  $m = $c->hasMethod($method) ? $c->getMethod($method) : null;
+  // A method the class inherits (a Livewire page's __invoke) shows the class itself
+  return $m && $m->getDeclaringClass()->getName() === $c->getName() ? [$m->getFileName(), $m->getStartLine()] : [$c->getFileName(), $c->getStartLine()];
+};
+$base = base_path() . DIRECTORY_SEPARATOR;
+$urlDefaults = url()->getDefaultParameters();
+$out = [];
+foreach (array_values(app('router')->getRoutes()->getRoutes()) as $id => $route) {
+  try { $at = $where($route); } catch (Throwable $e) { $at = null; }
+  $file = $at && is_string($at[0]) ? (str_starts_with($at[0], $base) ? substr($at[0], strlen($base)) : $at[0]) : null;
+  preg_match_all('/\\{(\\w+)\\}/', $route->getDomain() . '/' . $route->uri(), $params);
+  $out[] = [
+    'id' => $id, 'method' => implode('|', $route->methods()), 'uri' => $route->uri(), 'name' => $route->getName(),
+    'action' => preg_replace('/@__invoke$/', '', ltrim($route->getActionName(), '\\\\')),
+    'file' => $file, 'line' => $file ? (int) $at[1] : null, 'onDomain' => $route->getDomain() !== null,
+    'params' => array_values(array_diff($params[1], array_keys($route->defaults + $urlDefaults))),
+  ];
+}
+usort($out, fn ($a, $b) => strcmp($a['uri'], $b['uri']));
+// A custom href can name a remote host, so only an editor's name is kept
+$editor = config('app.editor');
+if (is_array($editor)) $editor = $editor['name'] ?? null;
+echo json_encode(['routes' => $out, 'editor' => is_string($editor) && preg_match('/^[\\w-]+$/', $editor) ? $editor : null]);
+`
+}
+
+/** Read routesPhp's JSON, dropping odd entries; undefined when there's none. */
+export function parseRoutes(stdout: string): { routes: TabRoute[]; editor: string } | undefined {
+  const parsed = phpJson(stdout, '{"routes"')
+  if (!parsed || !Array.isArray(parsed.routes)) return undefined
+  const routes = (parsed.routes as Record<string, unknown>[]).flatMap((r): TabRoute[] => {
+    const { id, method, uri, name, action, file, line, params } = r ?? {}
+    if (!Number.isInteger(id) || typeof method !== 'string' || typeof uri !== 'string' || typeof action !== 'string') return []
+    const hasFile = typeof file === 'string' && file !== '' && !/[\0-\x1f]/.test(file) && Number.isInteger(line) && (line as number) >= 1
+    return [{
+      id: id as number,
+      method,
+      uri,
+      name: typeof name === 'string' ? name : null,
+      action,
+      ...(hasFile ? { file: file as string, line: line as number } : {}),
+      params: Array.isArray(params) ? params.filter((p): p is string => typeof p === 'string' && /^\w+$/.test(p)) : [],
+      onDomain: r.onDomain === true,
+    }]
+  })
+  return { routes, editor: typeof parsed.editor === 'string' && /^[\w-]+$/.test(parsed.editor) ? parsed.editor : '' }
+}
+
+/**
+ * PHP run as `php -r <this> -- <id> <method> <uri> <values JSON>`: finds the route (checking it is still the one
+ * the tab showed), has Laravel's own URL generator build its URL from APP_URL with the values, and opens it in
+ * the browser, so the URL never leaves PHP. Only http(s) URLs are opened. Prints `{"opened":true}`, or `false`
+ * with a fixed reason.
+ */
+export function openPagePhp(): string {
+  return `
+require 'vendor/autoload.php';
+$app = require 'bootstrap/app.php';
+$app->make(Illuminate\\Contracts\\Console\\Kernel::class)->bootstrap();
+[, $id, $method, $uri, $values] = $argv + ['', '', '', '', '{}'];
+$route = array_values(app('router')->getRoutes()->getRoutes())[(int) $id] ?? null;
+$answer = ['opened' => false, 'why' => 'the routes changed; refresh the Routes tab'];
+if ($route && implode('|', $route->methods()) === $method && $route->uri() === $uri) {
+  try {
+    // The values typed, then the route's own defaults (the generator applies URL::defaults itself)
+    $names = array_flip($route->parameterNames());
+    $url = url()->toRoute($route, array_intersect_key(json_decode($values, true) ?: [], $names) + array_intersect_key($route->defaults, $names), true);
+    if (!preg_match('#^https?://#', $url)) {
+      $answer['why'] = 'APP_URL is not an http(s) URL';
+    } else {
+      // Nothing the opener prints, which could name the URL, comes back
+      $quiet = ['file', '/dev/null', 'w'];
+      $p = proc_open([PHP_OS_FAMILY === 'Darwin' ? 'open' : 'xdg-open', $url], [['file', '/dev/null', 'r'], $quiet, $quiet], $pipes);
+      $answer = is_resource($p) && proc_close($p) === 0 ? ['opened' => true] : ['opened' => false, 'why' => 'the browser could not be opened'];
+    }
+  } catch (Illuminate\\Routing\\Exceptions\\UrlGenerationException $e) {
+    $answer['why'] = 'a value the URL needs is missing';
+  } catch (Throwable $e) {
+    $answer['why'] = 'Laravel could not build the URL';
+  }
+}
+echo json_encode($answer);
+`
+}
+
+/** Read openPagePhp's answer: `''` when opened, else why not. */
+export function pageNotOpened(stdout: string): string {
+  const answer = phpJson(stdout, '{"opened"')
+  if (answer?.opened === true) return ''
+  return typeof answer?.why === 'string' ? answer.why : 'PHP could not build the URL'
+}
+
+/** Editor links by Laravel's names for them (its error page's `app.editor`), `{file}` an absolute path. */
+const EDITOR_HREFS: Record<string, string> = {
+  antigravity: 'antigravity://file{file}:{line}',
+  atom: 'atom://core/open/file?filename={file}&line={line}',
+  cursor: 'cursor://file{file}:{line}',
+  emacs: 'emacs://open?url=file://{file}&line={line}',
+  fleet: 'fleet://open?file={file}&line={line}',
+  idea: 'idea://open?file={file}&line={line}',
+  kiro: 'kiro://file{file}:{line}',
+  macvim: 'mvim://open/?url=file://{file}&line={line}',
+  neovim: 'nvim://open?url=file://{file}&line={line}',
+  netbeans: 'netbeans://open/?f={file}:{line}',
+  nova: 'nova://core/open/file?filename={file}&line={line}',
+  phpstorm: 'phpstorm://open?file={file}&line={line}',
+  sublime: 'subl://open?url=file://{file}&line={line}',
+  textmate: 'txmt://open?url=file://{file}&line={line}',
+  trae: 'trae://file{file}:{line}',
+  vscode: 'vscode://file{file}:{line}',
+  'vscode-insiders': 'vscode-insiders://file{file}:{line}',
+  'vscode-insiders-remote': 'vscode-insiders://vscode-remote{file}:{line}',
+  'vscode-remote': 'vscode://vscode-remote{file}:{line}',
+  vscodium: 'vscodium://file{file}:{line}',
+  windsurf: 'windsurf://file{file}:{line}',
+  xdebug: 'xdebug://{file}@{line}',
+  zed: 'zed://file{file}:{line}',
+}
+
+/** The link that opens `file` (absolute) at `line` in `editor`; an unknown name gets Laravel's `<name>://open?file=…` form. */
+export function editorHref(editor: string, file: string, line: number): string {
+  const href = Object.hasOwn(EDITOR_HREFS, editor) ? EDITOR_HREFS[editor]! : `${editor}://open?file={file}&line={line}`
+  return href.replace('{file}', file.split('/').map(encodeURIComponent).join('/')).replace('{line}', String(line))
+}
+
+/** macOS bundle ids of editors with a terminal, by Laravel's name for the editor. */
+const EDITOR_APPS: Record<string, string> = {
+  'com.microsoft.VSCode': 'vscode',
+  'com.microsoft.VSCodeInsiders': 'vscode-insiders',
+  'com.vscodium': 'vscodium',
+  'com.todesktop.230313mzl4w4u92': 'cursor',
+  'com.exafunction.windsurf': 'windsurf',
+  'dev.zed.Zed': 'zed',
+  'com.jetbrains.PhpStorm': 'phpstorm',
+  'com.jetbrains.intellij': 'idea',
+  'com.sublimetext.4': 'sublime',
+  'com.panic.Nova': 'nova',
+}
+
+/**
+ * The editor whose built-in terminal Claude Code runs in: by the app's bundle id (`__CFBundleIdentifier`), else
+ * `TERMINAL_EMULATOR` (JetBrains) or `TERM_PROGRAM` (VS Code and its forks say `vscode`); '' in any other terminal.
+ */
+export function terminalEditor(bundle?: string, program?: string, emulator?: string): string {
+  if (bundle && Object.hasOwn(EDITOR_APPS, bundle)) return EDITOR_APPS[bundle]!
+  if (emulator?.startsWith('JetBrains')) return 'phpstorm'
+  if (program === 'vscode' || program === 'zed') return program
+  return ''
+}
+
+/**
+ * The first row of the Routes tab's window, so the selected row `at` has a row drawn on each side (unless at an
+ * end of the list, or the window is under 3 rows): the next arrow press always lands on a drawn row, and the
+ * window follows it.
+ */
+export function routeWindow(at: number, top: number, rows: number, count: number): number {
+  const margin = rows >= 3 ? 1 : 0
+  let next = Math.min(top, at - margin)
+  next = Math.max(next, at - rows + 1 + margin)
+  return Math.max(0, Math.min(next, count - rows))
 }
 
 // ─── Redaction: what goes to Claude ────────────────────────────────────────

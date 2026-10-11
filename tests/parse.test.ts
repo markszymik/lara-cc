@@ -4,6 +4,7 @@ import {
   artisanCommandName,
   composerDrift,
   durationMs,
+  editorHref,
   exceptionHeadline,
   feedLog,
   formatEntry,
@@ -14,20 +15,27 @@ import {
   isError,
   isTestCommand,
   localHotUrl,
+  methodLabel,
   newLogState,
   npmDrift,
   origin,
+  pageNotOpened,
   parseConnections,
   parseDebugCapture,
+  parseRoutes,
   parseSnapshot,
   parseTestRun,
   parseWorkerLine,
+  phpJson,
   redact,
   redactData,
   projectPath,
   queuesOf,
   refusedOptions,
+  routesPhp,
+  routeWindow,
   shortClass,
+  terminalEditor,
 } from '../hooks/parse'
 import { LOG } from './fixtures'
 
@@ -308,4 +316,87 @@ test('redactData withholds bindings, headers and secrets, and redacts every stri
     http: [{ url: 'https://api.test', headers: '[redacted]', api_key: '[redacted]' }],
     note: 'mail [email]',
   })
+})
+
+test('methodLabel drops HEAD, and says ANY only for a route that takes every method', () => {
+  expect(methodLabel('GET|HEAD')).toBe('GET')
+  expect(methodLabel('PUT|PATCH')).toBe('PUT|PATCH')
+  expect(methodLabel('GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS')).toBe('ANY')
+  expect(methodLabel('GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS|QUERY')).toBe('ANY')
+  expect(methodLabel('GET|HEAD|POST|PUT|PATCH|DELETE')).toBe('GET|POST|PUT|PATCH|DELETE')
+  expect(methodLabel('HEAD')).toBe('HEAD')
+})
+
+test("routesPhp keeps a route's domain in PHP, saying only whether it has one", () => {
+  expect(routesPhp()).toContain("'onDomain' => $route->getDomain() !== null")
+  expect(routesPhp()).not.toMatch(/'domain'\s*=>/)
+})
+
+test('parseRoutes reads the JSON after PHP warnings, keeps a file only with its line, and drops odd entries', () => {
+  const routes = [
+    { id: 1, method: 'GET|HEAD', uri: 'users', name: 'users.index', action: 'App\\Http\\Controllers\\UserController@index', file: 'app/Http/Controllers/UserController.php', line: 12, params: [], onDomain: false },
+    { id: 2, method: 'GET|HEAD', uri: 'old', name: null, action: 'Illuminate\\Routing\\RedirectController', file: null, line: null, params: [], onDomain: false },
+    { id: 3, method: 'GET|HEAD', uri: 'x', name: null, action: 'Closure', file: 'x\u001b[2J.php', line: 3, params: ['ok', 'not ok'], onDomain: true, domain: 'admin.example.test' },
+    { id: 'four', method: 'GET|HEAD', uri: 'y', name: null, action: 'Closure' },
+  ]
+  const parsed = parseRoutes('Deprecated: x\n' + JSON.stringify({ routes, editor: 'phpstorm' }))!
+  expect(parsed.routes).toEqual([
+    { id: 1, method: 'GET|HEAD', uri: 'users', name: 'users.index', action: 'App\\Http\\Controllers\\UserController@index', file: 'app/Http/Controllers/UserController.php', line: 12, params: [], onDomain: false },
+    { id: 2, method: 'GET|HEAD', uri: 'old', name: null, action: 'Illuminate\\Routing\\RedirectController', params: [], onDomain: false },
+    { id: 3, method: 'GET|HEAD', uri: 'x', name: null, action: 'Closure', params: ['ok'], onDomain: true },
+  ])
+  expect(parsed.editor).toBe('phpstorm')
+  // Only a plain editor name: anything else (a custom href) is dropped
+  expect(parseRoutes(JSON.stringify({ routes: [], editor: 'vscode://vscode-remote/ssh-remote+host{file}' }))!.editor).toBe('')
+  expect(parseRoutes('no json')).toBe(undefined)
+})
+
+test('pageNotOpened says why PHP did not open the page, in its own fixed words', () => {
+  expect(pageNotOpened('Deprecated: x\n{"opened":true}')).toBe('')
+  expect(pageNotOpened('{"opened":false,"why":"APP_URL is not an http(s) URL"}')).toBe('APP_URL is not an http(s) URL')
+  expect(pageNotOpened('Fatal error')).toBe('PHP could not build the URL')
+})
+
+test('editorHref links to the file at the line in Laravel-named editors, encoding the path', () => {
+  expect(editorHref('vscode', '/Users/me/My Sites/shop/app/X.php', 9)).toBe('vscode://file/Users/me/My%20Sites/shop/app/X.php:9')
+  expect(editorHref('phpstorm', '/app/a&b/X.php', 3)).toBe('phpstorm://open?file=/app/a%26b/X.php&line=3')
+  expect(editorHref('sublime', '/app/X.php', 1)).toBe('subl://open?url=file:///app/X.php&line=1')
+  expect(editorHref('atom', '/app/X.php', 4)).toBe('atom://core/open/file?filename=/app/X.php&line=4')
+  expect(editorHref('netbeans', '/app/X.php', 4)).toBe('netbeans://open/?f=/app/X.php:4')
+  expect(editorHref('myeditor', '/app/X.php', 2)).toBe('myeditor://open?file=/app/X.php&line=2')
+  // A name that is also an object property isn't taken for an editor's link
+  expect(editorHref('toString', '/app/X.php', 2)).toBe('toString://open?file=/app/X.php&line=2')
+})
+
+test('terminalEditor names the editor whose terminal Claude Code runs in, and nothing in a plain terminal', () => {
+  expect(terminalEditor('com.todesktop.230313mzl4w4u92', 'vscode')).toBe('cursor')
+  expect(terminalEditor('com.microsoft.VSCode', 'vscode')).toBe('vscode')
+  expect(terminalEditor(undefined, 'vscode')).toBe('vscode')
+  expect(terminalEditor(undefined, undefined, 'JetBrains-JediTerm')).toBe('phpstorm')
+  expect(terminalEditor('com.googlecode.iterm2', 'iTerm.app')).toBe('')
+  expect(terminalEditor('constructor')).toBe('')
+})
+
+test('routeWindow keeps a row drawn on each side of the selected one, so the next arrow lands on a drawn row', () => {
+  // 10 rows of 30: moving down from the top scrolls once the selected row reaches the last-but-one
+  expect(routeWindow(0, 0, 10, 30)).toBe(0)
+  expect(routeWindow(8, 0, 10, 30)).toBe(0)
+  expect(routeWindow(9, 0, 10, 30)).toBe(1)
+  // ...and up from the bottom, likewise at the second row
+  expect(routeWindow(11, 10, 10, 30)).toBe(10)
+  expect(routeWindow(10, 10, 10, 30)).toBe(9)
+  // The ends: the last row shows at the bottom, a short list never scrolls
+  expect(routeWindow(29, 10, 10, 30)).toBe(20)
+  expect(routeWindow(4, 3, 10, 5)).toBe(0)
+  // A window under 3 rows still shows the selected row
+  expect(routeWindow(5, 0, 1, 10)).toBe(5)
+  expect(routeWindow(5, 0, 2, 10)).toBe(4)
+})
+
+test('phpJson reads the object PHP printed, skipping what app code printed around it', () => {
+  expect(phpJson('Deprecated: x\n{"routes":[],"editor":null}\nWarning: at shutdown')).toEqual({ routes: [], editor: null })
+  expect(phpJson('hello from a provider {"x":1} {"routes":[1]}\n', '{"routes"')).toEqual({ routes: [1] })
+  expect(phpJson('[1,2]')).toBe(undefined)
+  expect(phpJson('no json')).toBe(undefined)
+  expect(phpJson('{"routes": broken', '{"routes"')).toBe(undefined)
 })
