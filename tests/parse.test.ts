@@ -27,6 +27,8 @@ import {
   parseTestRun,
   parseWorkerLine,
   phpJson,
+  aboutWithoutAddresses,
+  routeListLines,
   clip,
   tail,
   redact,
@@ -267,6 +269,8 @@ const SECRETS: [string, string, string[]][] = [
     String.raw`{"data":{"command":"O:17:\"App\\Jobs\\Charge\":2:{s:8:\"password\";s:7:\"hunter2\";s:8:\"\u0000*\u0000token\";s:6:\"tok123\";}"}}`,
     ['hunter2', 'tok123'],
   ],
+  ['URL next to a secret key in JSON', '{"REDIS_URL":"redis://127.0.0.1:6379","REDIS_PASSWORD":"p@ssw0rdTail"}', ['p@ssw0rd', 'ssw0rdTail']],
+  ['serialized value with a quote in it', 's:8:"password";s:7:"ab"cdef";s:2:"id";i:4;', ['ab"cdef', 'cdef']],
   // Multi-line errors
   ['multi-line', "Login failed\npassword: hunter2\n#0 /app/a.php(3): auth('hunter2')", ['hunter2']],
 ]
@@ -279,17 +283,50 @@ for (const [name, input, secrets] of SECRETS) {
   })
 }
 
-test('tail and clip never cut a line or word in two, so a key keeps its value and a token stays whole', () => {
+test('tail starts at a line near the cut, and keeps a long last line; clip never leaves only an ellipsis', () => {
   expect(tail('aaaa\npassword=hunter2\nbbbb', 18)).toBe('…\nbbbb')
-  // One long line: from the first word that's whole, here past the cut through `password`
-  expect(tail('x password=hunter2 Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7c', 50)).toBe('… Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7c')
+  expect(tail('x'.repeat(9000) + ' important error here\nexit 1')).toContain('important error here\nexit 1')
+  expect(tail('y'.repeat(9000)).length).toBe(8001)
   expect(tail('short', 10)).toBe('short')
   expect(clip('password: hunter2 and more', 12)).toBe('password:…')
-  expect(clip('Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7c', 20)).toBe('…')
-  for (const cut of [tail('aaaa\npassword=hunter2\nbbbb', 18), clip('token Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7c', 20)]) {
-    expect(redact(cut)).not.toContain('hunter2')
-    expect(redact(cut)).not.toContain('Ab3dEf6hIj')
-  }
+  expect(clip('/very/long/path/' + 'a'.repeat(400) + ' rest', 300)).toMatch(/^\/very\/long\/path\/a+…$/)
+  expect(clip('b'.repeat(400), 300)).toBe('b'.repeat(300) + '…')
+})
+
+test('redact stays fast on long words, which every log line and output passes through', () => {
+  const started = Date.now()
+  for (const text of ['s:9:"' + 'a'.repeat(30000) + '";', 'a'.repeat(30000), 'password'.repeat(4000)]) redact(text)
+  expect(Date.now() - started).toBeLessThan(1000)
+})
+
+test("aboutWithoutAddresses hides the app's URL and other addresses, and keeps versions and drivers", () => {
+  const text = [
+    '  Environment ......................................',
+    '  Application Name ......................... Shop',
+    '  Laravel Version .......................... 12.33.0',
+    '  PHP Version .............................. 8.3.21',
+    '  URL ...................................... shop.example.com',
+    '  Dashboard ................................ https://admin.example.com/panel',
+    '  Domain ................................... admin.example.com',
+    '  Database ................................. mysql',
+    '  Timezone ................................. Europe/Warsaw',
+  ].join('\n')
+  const out = aboutWithoutAddresses(text)
+  expect(out).not.toContain('example.com')
+  for (const kept of ['Shop', '12.33.0', '8.3.21', 'mysql', 'Europe/Warsaw']) expect(out).toContain(kept)
+  const json = aboutWithoutAddresses('{"environment":{"application_name":"Shop","url":"shop.example.com","php_version":"8.3.21"},"x":{"panel":"admin.example.com"}}')
+  expect(json).not.toContain('example.com')
+  expect(json).toContain('8.3.21')
+})
+
+test("routeListLines lists route:list's JSON without domains, and nothing for other output", () => {
+  const json = JSON.stringify([
+    { domain: null, method: 'GET|HEAD', uri: 'users', name: 'users.index', action: 'App\\Http\\Controllers\\UserController@index', middleware: ['web'] },
+    { domain: '{account}.example.com', method: 'GET|HEAD', uri: 'team', name: null, action: 'Closure', middleware: [] },
+  ])
+  const lines = routeListLines('Deprecated: x\n' + json)!
+  expect(lines).toEqual(['GET       users  users.index  UserController@index', 'GET       team  (own domain)  Closure'])
+  expect(routeListLines("  ERROR  Your application doesn't have any routes.")).toBeUndefined()
 })
 
 test('redact keeps what Claude needs to debug', () => {
@@ -299,6 +336,11 @@ test('redact keeps what Claude needs to debug', () => {
     'database/migrations/2024_01_01_000000_create_users_table.php',
     'The password field is required.',
     'Illuminate\\Database\\QueryException',
+    'CSRF token mismatch.',
+    'Basic authentication failed',
+    'The token has expired.',
+    'Token Mismatch',
+    'Bearer token missing from the request',
   ]
   for (const line of kept) expect(redact(line)).toBe(line)
 })

@@ -33,8 +33,10 @@ import {
   PHP_OPTIONS,
   phpJson,
   queuesOf,
+  aboutWithoutAddresses,
   clip,
   redact,
+  routeListLines,
   redactData,
   refusedOptions,
   routesPhp,
@@ -128,8 +130,23 @@ const IMPACTFUL: Record<string, string> = {
   'optimize:clear': 'clears every cache, the application cache (which may be shared) included',
 }
 
+/**
+ * Artisan commands that only read, or write within the project folder (generated code, Laravel's own cache
+ * files): Claude's tool runs these without asking. Anything else asks, with IMPACTFUL's reason when it has
+ * one, since a command lara-cc doesn't know (a package's, a new one) may reach the database, queue, cache or network.
+ */
+const CONTAINED =
+  /^(make:\S+|about|list|help|env|inspire|test|optimize|clear-compiled|package:discover|storage:link|(route|event):(list|cache|clear)|(config|view):(cache|clear)|(config|lang|stub|vendor):publish|model:show|db:(table|monitor)|schema:dump|migrate:status|schedule:list|channel:list|queue:(failed|monitor)|ide-helper:\S+)$/
+
 /** Artisan commands Claude's tool refuses because they print secrets: config values (passwords, APP_KEY) or the .env encryption key. */
-const CONFIDENTIAL = ['config:show', 'env:encrypt', 'env:decrypt']
+const CONFIDENTIAL = ['env:encrypt', 'env:decrypt']
+
+/**
+ * Artisan commands whose output is confidential (config values, the database's host and user) but only shows
+ * information: they run for the person, with the output in the pane's Commands tab and never in the conversation.
+ * Claude asking for one asks the person first (see showToPerson).
+ */
+const SHOWN_TO_PERSON = ['config:show', 'db:show']
 
 /** Laravel Boost's MCP tools that read logs: asked for and redacted like lara-cc's logs tool. */
 const BOOST_LOG_TOOLS = /^mcp__laravel-boost__(read-log-entries|last-error|browser-logs)$/
@@ -150,7 +167,8 @@ type Tab = 'services' | 'queue' | 'log' | 'tests' | 'routes' | 'commands' | 'abo
 type Run = { stream: HookStream<ProcessSpawnChunk, ProcessSpawnResult>; done: Promise<void> }
 /** `crashed`: the exit code of a run that ended on its own with an error; `seen` once the Services tab showed it. */
 type Service = { name: string; label: string; argv: string[]; run?: Run; lines: string[]; startedAt?: number; partial: string; crashed?: { code: number; seen: boolean } }
-type LastRun = { label: string; isRunning: boolean; exitCode?: number; output: string }
+/** `output`: for the Commands tab; `shared`: for Claude, the whole output redacted first and only then cut. */
+type LastRun = { label: string; isRunning: boolean; exitCode?: number; output: string; shared?: string }
 type Job = { job: string; time: string; status: 'running' | 'done' | 'failed'; ms?: number }
 type Settings = {
   autoRestartQueue: boolean
@@ -404,7 +422,7 @@ async function runCommand($: Api, label: string, argv: string[], timeoutMs = 600
   try {
     const r = await runPhp($, argv, { timeoutMs })
     const output = stripAnsi([r.stdout, r.stderr].filter(Boolean).join('\n')).trim()
-    run = { label, isRunning: false, exitCode: r.exitCode, output: tail(output) }
+    run = { label, isRunning: false, exitCode: r.exitCode, output: tail(output), shared: tail(redact(output)) }
     if (isTests && project === projectRun) noteTestRun($, label, output)
   } catch (err) {
     run = { label, isRunning: false, exitCode: -1, output: 'Could not run `' + argv.join(' ') + '`: ' + String(err) }
@@ -471,25 +489,52 @@ function askAboutTests($: Api, failures: TestFailure[]) {
 
 /** A run's result for Claude (tool results and command output in the transcript), with secrets redacted. */
 function formatRun(run: LastRun): string {
-  const head = run.exitCode === 0 ? `✓ ${run.label}` : `✗ ${run.label} (exit ${run.exitCode})`
-  return redact(run.output ? `${head}\n${run.output}` : head)
+  const head = redact(run.exitCode === 0 ? `✓ ${run.label}` : `✗ ${run.label} (exit ${run.exitCode})`)
+  const body = run.shared ?? redact(run.output)
+  return body ? `${head}\n${body}` : head
 }
 
 /**
  * Whether artisan `argv` is safe to run for Claude. Artisan resolves the name itself (`help <name>`), so
  * abbreviations and odd casing can't slip past DESTRUCTIVE; a name it can't resolve comes back as `error`.
  */
-async function checkArtisan($: Api, argv: string[]): Promise<{ refused?: string; error?: string; impact?: string }> {
+async function checkArtisan(
+  $: Api,
+  argv: string[],
+): Promise<{ resolved?: string; refused?: string; error?: string; impact?: string; shownToPerson?: true }> {
   const options = refusedOptions(argv, DESTRUCTIVE_OPTIONS)
   if (options.length) return { refused: `${options.join(' ')} can destroy data or point at another environment` }
   const { resolved, error } = await resolveArtisan($, argv)
   if (error) return { error }
   if (!resolved) return {}
-  if (CONFIDENTIAL.includes(resolved)) return { refused: `${resolved} prints configuration secrets (passwords, keys)` }
+  if (SHOWN_TO_PERSON.includes(resolved)) return { resolved, shownToPerson: true }
+  if (CONFIDENTIAL.includes(resolved)) return { resolved, refused: `${resolved} prints configuration secrets (passwords, keys)` }
   if (DESTRUCTIVE.includes(resolved)) {
-    return { refused: resolved === 'tinker' ? 'tinker runs arbitrary PHP' : `${resolved} can destroy data` }
+    return { resolved, refused: resolved === 'tinker' ? 'tinker runs arbitrary PHP' : `${resolved} can destroy data` }
   }
-  return { impact: IMPACTFUL[resolved] }
+  if (CONTAINED.test(resolved)) return { resolved }
+  return {
+    resolved,
+    impact: IMPACTFUL[resolved] ?? "isn't one lara-cc knows to stay inside the project folder, so it may reach the database, queue, cache or network",
+  }
+}
+
+/**
+ * Run artisan for the conversation (Claude's tool, /lara-artisan): the output, redacted, with what two everyday
+ * commands print as a matter of course taken out: `about`'s app URL, and route:list's domains (it runs with
+ * --json so the domain is a field to drop, whatever options were asked for).
+ */
+async function artisanForConversation($: Api, args: string, resolved: string | undefined, timeoutMs?: number): Promise<string> {
+  const argv = splitArgs(args)
+  if (resolved === 'route:list') {
+    const r = await runPhp($, ['php', 'artisan', ...argv.filter(a => a !== '--json'), '--json', '--no-interaction'], { timeoutMs: 120_000 })
+    const lines = routeListLines(r.stdout)
+    if (lines) return tail(`✓ artisan ${redact(args)} (domains left out)\n` + lines.join('\n'))
+    // Not the JSON: an app without routes, or an error, said in a line that names no domain
+    return `✗ artisan ${redact(args)}\n` + failureReason(r.stdout + '\n' + r.stderr)
+  }
+  const run = await runCommand($, 'artisan ' + args, ['php', 'artisan', ...argv, '--no-interaction'], timeoutMs)
+  return resolved === 'about' ? aboutWithoutAddresses(formatRun(run)) : formatRun(run)
 }
 
 /** What Claude gets when the person says no to running something: not to try again, and how they'd run it. */
@@ -501,14 +546,38 @@ const NOT_RUN = "The user chose not to run this. Don't retry it; if it's needed,
  * port, never a host or user). Dismissed, or nobody there to answer (`claude -p`), is no.
  */
 async function mayRun($: Api, what: string, effect: string): Promise<boolean> {
-  const local = connections.map(c => `${c.use} ${c.driver}:${c.port}`)
-  const where = local.length ? `Servers on this machine it connects to: ${local.join(', ')}.` : 'lara-cc found none of its servers on this machine (it may use SQLite, files or a server elsewhere).'
+  const project = projectRun
+  // `about` and the servers are read together, a moment after start; until then, say so rather than "none found"
   const env = about?.environment?.environment
-  const question =
-    `Claude (or a command you didn't type) wants to run ${what}, which ${effect}. ` +
-    `APP_ENV is ${typeof env === 'string' ? env : 'unknown'}; ${where} Run it?`
+  const local = connections.map(c => `${c.use} ${c.driver}:${c.port}`)
+  const where = !about
+    ? "lara-cc doesn't know APP_ENV or the app's servers (not read yet, or `artisan about` failed)."
+    : `APP_ENV is ${typeof env === 'string' ? env : 'unknown'}; ` +
+      (local.length ? `servers on this machine it connects to: ${local.join(', ')}.` : 'lara-cc found none of its servers on this machine (it may use SQLite, files or a server elsewhere).')
+  const question = `Claude (or a command you didn't type) wants to run ${what}, which ${effect}. ${where} Run it?`
   const answer = await $.ui.ask(question, { header: 'lara-cc', options: ['Run it', "Don't run"] }).catch(() => "Don't run")
-  return answer === 'Run it'
+  // A yes is for the folder the question was about
+  return answer === 'Run it' && project === projectRun
+}
+
+/**
+ * Run a SHOWN_TO_PERSON command for the person: its output goes to the Commands tab, and what comes back for the
+ * conversation says only that it was shown. `ask`: Claude (or a command the person didn't type) wants it, so the
+ * person says yes first; dismissed or nobody there to answer is no.
+ */
+async function showToPerson($: Api, args: string, ask: boolean): Promise<string> {
+  if (ask) {
+    const question =
+      `Claude wants to see php artisan ${args}. Its output can hold passwords, keys, hosts and users, so lara-cc shows it to you in its pane and doesn't send it to Claude. Show it?`
+    const answer = await $.ui.ask(question, { header: 'Privacy', options: ['Show me', "Don't run"] }).catch(() => "Don't run")
+    if (answer !== 'Show me') return NOT_RUN
+  }
+  const run = await runCommand($, 'artisan ' + args, ['php', 'artisan', ...splitArgs(args), '--no-interaction'])
+  await openPane($, 'commands').catch(() => {})
+  return (
+    `${run.exitCode === 0 ? '✓' : '✗'} artisan ${redact(args)}: shown to the user in the lara-cc pane (Commands tab). ` +
+    "The output isn't in this conversation because it can hold secrets; ask the user for what you need from it, without the secrets."
+  )
 }
 
 /** For a service start: what the process does, when it's one that needs asking (queue worker, Horizon, scheduler; not Vite). */
@@ -704,7 +773,7 @@ async function refreshQueue($: Api) {
       snapshot = parsed
       snapshotError = parsed.error ?? ''
     } else {
-      snapshotError = clip(stripAnsi(r.stderr || r.stdout).trim().split('\n')[0] ?? '', 300) || 'Could not read the queue state.'
+      snapshotError = clip(redact(stripAnsi(r.stderr || r.stdout).trim().split('\n')[0] ?? ''), 300) || 'Could not read the queue state.'
     }
   } catch (err) {
     if (project !== projectRun) return
@@ -969,7 +1038,7 @@ function failureReason(output: string): string {
     .map(l => l.trim())
     .filter(l => l && !/^(PHP )?(Deprecated|Warning|Notice):/i.test(l))
   const [first = '', second] = lines
-  return clip(/^[\w\\]+$/.test(first) && second ? `${first}: ${second}` : first, 300)
+  return clip(redact(/^[\w\\]+$/.test(first) && second ? `${first}: ${second}` : first), 300)
 }
 
 /** Put the focus ring on the selected route, so the arrows browse the list and Enter opens one straight away. */
@@ -1599,7 +1668,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'artisan',
       description:
-        'Run a Laravel artisan command in the project and return its output, e.g. "route:list --path=api", "make:model Post -m", "db:show", "model:show User". Runs on the PHP version the site uses (Herd\'s isolated one, when set), which can differ from `php` in Bash. Refuses commands that can destroy data or run arbitrary code (migrate:fresh/rollback, db:wipe, db:seed, tinker, --force, --env…); ask the user to run those.',
+        'Run a Laravel artisan command in the project and return its output, e.g. "route:list --path=api", "make:model Post -m", "db:table users", "model:show User". Runs on the PHP version the site uses (Herd\'s isolated one, when set), which can differ from `php` in Bash. Refuses commands that can destroy data or run arbitrary code (migrate:fresh/rollback, db:wipe, db:seed, tinker, --force, --env…); ask the user to run those. Commands that reach the database, queue or cache ask the user first. config:show and db:show print secrets, so their output is shown to the user, not returned to you.',
       inputSchema: {
         type: 'object',
         properties: { command: { type: 'string', description: 'Everything after `php artisan`' } },
@@ -1696,16 +1765,17 @@ export const register: Register = on => {
       const check = await checkArtisan($, splitArgs(e.args))
       if (check.refused) return { text: `Refused: ${check.refused}. Only commands you type yourself skip this check.` }
       if (check.error) return { text: check.error }
+      if (check.shownToPerson) return { text: await showToPerson($, e.args.trim(), true) }
       if (check.impact && !(await mayRun($, `php artisan ${e.args.trim()}`, check.impact))) return { text: NOT_RUN }
-    } else {
-      // Typed by the person, but the output still lands in the conversation, where Claude reads it
-      const { resolved } = await resolveArtisan($, splitArgs(e.args))
-      if (resolved && CONFIDENTIAL.includes(resolved)) {
-        return { text: `Not run: ${resolved} prints configuration secrets, and this output goes into the conversation where Claude reads it. Run \`php artisan ${e.args.trim()}\` in your own terminal instead.` }
-      }
+      return { text: await artisanForConversation($, e.args.trim(), check.resolved) }
     }
-    const run = await runCommand($, 'artisan ' + e.args, ['php', 'artisan', ...splitArgs(e.args), '--no-interaction'])
-    return { text: formatRun(run) }
+    // Typed by the person, but the output still lands in the conversation, where Claude reads it
+    const { resolved } = await resolveArtisan($, splitArgs(e.args))
+    if (resolved && SHOWN_TO_PERSON.includes(resolved)) return { text: await showToPerson($, e.args.trim(), false) }
+    if (resolved && CONFIDENTIAL.includes(resolved)) {
+      return { text: `Not run: ${resolved} prints configuration secrets, and this output goes into the conversation where Claude reads it. Run \`php artisan ${e.args.trim()}\` in your own terminal instead.` }
+    }
+    return { text: await artisanForConversation($, e.args.trim(), resolved) }
   }).catch(commandFailed)
 
   on('command.run', { command: 'lara-queue' }, async ($, e) => {
@@ -1779,9 +1849,9 @@ export const register: Register = on => {
       return { result: `Refused: ${check.refused}. Ask the user to run it themselves with /lara-artisan ${command}` }
     }
     if (check.error) return { result: check.error }
+    if (check.shownToPerson) return { result: await showToPerson($, command, true) }
     if (check.impact && !(await mayRun($, `php artisan ${command}`, check.impact))) return { result: NOT_RUN }
-    const run = await runCommand($, 'artisan ' + command, ['php', 'artisan', ...splitArgs(command), '--no-interaction'], 300_000)
-    return { result: formatRun(run) }
+    return { result: await artisanForConversation($, command, check.resolved, 300_000) }
   }).catch(toolFailed)
 
   on('tool.call', { tool: 'mcp__lara-cc__service' }, async ($, e) => {

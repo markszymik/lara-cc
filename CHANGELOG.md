@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-10-11
+
+### Changed
+
+- `config:show` and `db:show` now run for you instead of being refused or sent: their output shows only on the pane's Commands tab, never in the conversation. When Claude asks for one you're asked first, and Claude is told it was shown, not what it said; typed with `/lara-artisan`, it just shows.
+- Claude's artisan tool runs without asking only the commands lara-cc knows stay in the project folder (`make:*`, route/config/view/event caches, `about`, `model:show`, `migrate:status`…); any other command asks first, so a package's command that runs jobs or deletes rows can't slip through.
+- The question before such a command says when lara-cc hasn't read APP_ENV or the app's servers yet, instead of reporting none found, and a yes no longer applies if the session moved to another folder meanwhile.
+
+### Fixed
+
+- Text like "CSRF token mismatch" or "Basic authentication failed" is no longer redacted; only a credential-looking value after Bearer, Basic or Token is.
+- Long command output kept only a few trailing characters when its last line was long, or nothing when it had no spaces; error headlines could end up as a bare "…".
+- Redaction stays fast on long words; a 30,000-character line took seconds.
+
+### Security
+
+- `artisan about` sent the app's URL, and `artisan route:list` route domains, into the conversation (Claude's tool and `/lara-artisan`); both still work, with the URL and the domains left out.
+- `db:show` printed the database's host and user straight into the conversation through Claude's artisan tool (and was suggested in the tool's description); its output is now shown only to you.
+- A URL in JSON could swallow the next field's secret key and leave the end of its value visible; a URL's credentials now stop at the URL.
+- A secret containing a quote in a PHP-serialized queue payload was left as is.
+- Command output and queue/routes errors are redacted whole before they're shortened, so a cut can't part a key from its value.
+
 ## [0.11.0] - 2026-10-11
 
 ### Added

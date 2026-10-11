@@ -72,22 +72,22 @@ export function helpName(stdout: string): string | undefined {
 }
 
 /**
- * The last `max` characters of `text`, from the first whole line in them (or word, in one long line), so
- * nothing is cut in two: not a key from its value, nor a token into a piece redact() no longer recognises.
+ * The last `max` characters of `text`, from a line start when one is near the cut. A cut can still part a key
+ * from its value, so text for Claude is redacted before it's cut, never after.
  */
 export function tail(text: string, max = 8000): string {
   if (text.length <= max) return text
   const kept = text.slice(-max)
   const nl = kept.indexOf('\n')
-  const at = nl >= 0 ? nl : kept.search(/\s/)
-  return '…' + (at < 0 ? '' : kept.slice(at))
+  return '…' + (nl >= 0 && nl < 200 ? kept.slice(nl) : kept)
 }
 
-/** The first `max` characters of `text`, cut at a space for the same reason as tail(). */
+/** The first `max` characters of `text`, cut at a space or between path parts when one is near the end. Redact first, as for tail(). */
 export function clip(text: string, max: number): string {
   if (text.length <= max) return text
-  const at = text.lastIndexOf(' ', max)
-  return (at > 0 ? text.slice(0, at) : '') + '…'
+  const head = text.slice(0, max)
+  const at = Math.max(head.lastIndexOf(' '), head.search(/[^\w+=-][\w+=-]*$/))
+  return (at > max / 2 ? head.slice(0, at) : head) + '…'
 }
 
 /** `App\Jobs\SendInvoice` → `SendInvoice`, `App\Http\Controllers\X@y` → `X@y`. */
@@ -627,7 +627,8 @@ export function routeWindow(at: number, top: number, rows: number, count: number
 // ─── Redaction: what goes to Claude ────────────────────────────────────────
 
 /** Key names whose value is a secret: `password=…`, `"api_key": "…"`, `'token' => '…'`, `DB_USERNAME=…`. */
-const SECRET_KEY = String.raw`[\w.-]*(?:passw(?:or)?d|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|app[_-]?key|authorization|credentials?|cookie|signature|dsn|username)[\w.-]*`
+// Bounded on each side: no key name is that long, and unbounded it backtracks for seconds on a long word
+const SECRET_KEY = String.raw`[\w.-]{0,40}(?:passw(?:or)?d|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|app[_-]?key|authorization|credentials?|cookie|signature|dsn|username)[\w.-]{0,40}`
 /**
  * A secret key and its value, in JSON (also escaped inside a JSON string, `\"password\":\"…\"`), PHP arrays,
  * query strings, headers and .env lines. A quoted value is taken whole, escaped quotes and spaces included.
@@ -636,8 +637,14 @@ const KEY_VALUE = new RegExp(
   String.raw`(\\?["']|)(${SECRET_KEY})\1(\s*(?:=>|[:=])\s*)(?:\\"(?:[^"\\]|\\(?!"))*\\"|"(?:[^"\\]|\\.)*"|'[^']*'|[^\s,;&)}\]]+)`,
   'gi',
 )
-/** PHP serialize()d strings under a secret key (queue payloads), raw or escaped in JSON: `s:8:"password";s:7:"hunter2";`. */
-const SERIALIZED = new RegExp(String.raw`(s:\d+:(\\?")(?:[^"\\]|\\u0000)*?${SECRET_KEY}\2;)s:\d+:\2(?:[^"\\]|\\(?!"))*\2;`, 'gi')
+/**
+ * PHP serialize()d strings under a secret key (queue payloads), raw or escaped in JSON: `s:8:"password";s:7:"hunter2";`.
+ * A serialized string can hold quotes, so the value ends where the next serialized value (or the object) starts.
+ */
+const SERIALIZED = new RegExp(
+  String.raw`(s:\d+:(\\?")(?:[^"\\]|\\u0000){0,40}?${SECRET_KEY}\2;)s:\d+:\2[\s\S]{0,20000}?\2;(?=[sibdaOCN][:;]|\}|$)`,
+  'gi',
+)
 /** Tokens recognisable by their prefix: AWS key ids, Stripe and Slack keys, GitHub tokens, JWTs. */
 const KNOWN_TOKENS = /\b(?:AKIA[0-9A-Z]{16}|(?:sk|pk|rk)_(?:live|test)_\w{8,}|xox[abeprs]-[\w-]{8,}|gh[pousr]_\w{20,}|github_pat_\w{20,}|eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,})/g
 
@@ -677,18 +684,59 @@ export function redact(text: string): string {
       return sqlWithoutValues(out)
     })
     .join('\n')
-    // The user (and password) in a URL, up to its last @, so a password with an @ in it goes too
-    .replace(/\b([a-z][\w+.-]*:\/\/)[^\s\/@]*(?:@[^\s\/@]*)*@/gi, '$1[redacted]@')
-    .replace(/\b(Bearer|Basic|Token)\s+[\w~+\/.=-]{8,}/gi, '$1 [redacted]')
+    // The user (and password) in a URL, up to its last @, so a password with an @ in it goes too; never past
+    // the URL's end into the next JSON field or argument
+    .replace(/\b([a-z][\w+.-]*:\/\/)[^\s\/@"'`,;<>(){}\[\]]*(?:@[^\s\/@"'`,;<>(){}\[\]]*)*@/gi, '$1[redacted]@')
+    // The credential after an auth scheme: 8+ characters with a digit, a lower-then-upper case mix or base64's
+    // symbols, so prose ("CSRF token mismatch", "Basic authentication failed") is left alone
+    .replace(/\b([Bb]earer|[Bb]asic|[Tt]oken)\s+(?=[\w~+\/.=-]{8})(?=[\w~+\/.=-]*(?:\d|[a-z][\w~+\/.=-]*[A-Z]|[+\/=]))[\w~+\/.=-]*[\w~+\/=-]/g, '$1 [redacted]')
     .replace(/\bbase64:[A-Za-z0-9+\/]{16,}={0,2}/g, 'base64:[redacted]')
     // Database login errors name the user: `for user 'forge'@'10.0.0.5'`, `for user "app"`
     .replace(/(\bfor user\s+)(["'])[^"']*\2(@(["'])[^"']*\4)?/gi, "$1$2?$2")
     .replace(SERIALIZED, '$1s:10:$2[redacted]$2;')
     .replace(KEY_VALUE, '$1$2$1$3[redacted]')
     .replace(KNOWN_TOKENS, '[redacted]')
-    .replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, '[email]')
+    .replace(/(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, '[email]')
     .replace(/(?<![\w\/\\.-])(?=[\w+=-]*[A-Z])(?=[\w+=-]*[a-z])(?=[\w+=-]*\d)[\w+=-]{32,}/g, '[redacted]')
     .replace(/\b[a-f0-9]{40,}\b/g, '[redacted]')
+}
+
+/**
+ * `artisan about` (text or `--json`) for the conversation, without the app's URL or any other web address or
+ * host name a package lists. What Claude needs from it, the versions, drivers and environment, stays.
+ */
+export function aboutWithoutAddresses(text: string): string {
+  return text
+    .replace(/^(\s*URL\b\s*\.*\s*)\S.*$/gim, '$1[not shown]')
+    .replace(/("url"\s*:\s*)"(?:[^"\\]|\\.)*"/gi, '$1"[not shown]"')
+    .replace(/\b[a-z][\w+.-]*:\/\/[^\s"']+/gi, '[address not shown]')
+    // A row whose value is a host name: `Url ....... shop.test`, `Domain ....... admin.example.com`
+    .replace(/^(\s*[\w ]+?\s\.{2,}\s+)[\w-]+(?:\.[\w-]+)*\.[a-z][\w-]*(?::\d+)?(?:\/\S*)?\s*$/gim, '$1[not shown]')
+    .replace(/("[\w ]+"\s*:\s*)"[\w-]+(?:\.[\w-]+)*\.[a-z][\w-]*(?::\d+)?(?:\/[^"]*)?"/gi, '$1"[not shown]"')
+}
+
+/**
+ * `artisan route:list --json` as lines for the conversation, each route's domain left out (a route with one says
+ * so, without naming it). Undefined when the output isn't that JSON, e.g. an app with no routes.
+ */
+export function routeListLines(stdout: string): string[] | undefined {
+  const start = stdout.indexOf('[')
+  const end = stdout.lastIndexOf(']')
+  if (start < 0 || end < start) return undefined
+  let list: unknown
+  try {
+    list = JSON.parse(stdout.slice(start, end + 1))
+  } catch {
+    return undefined
+  }
+  if (!Array.isArray(list)) return undefined
+  const text = (v: unknown) => (typeof v === 'string' ? v : '')
+  return list
+    .filter((r): r is Record<string, unknown> => !!r && typeof r === 'object')
+    .map(r => {
+      const own = text(r.domain) ? '  (own domain)' : ''
+      return `${methodLabel(text(r.method)).padEnd(9)} ${text(r.uri)}${own}${text(r.name) ? '  ' + text(r.name) : ''}  ${shortClass(text(r.action))}`
+    })
 }
 
 // ─── Test runs ─────────────────────────────────────────────────────────────

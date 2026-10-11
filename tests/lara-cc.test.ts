@@ -95,6 +95,9 @@ const HELP: Record<string, string> = {
   dow: 'down',
   tin: 'tinker',
   tinker: 'tinker',
+  'route:list': 'route:list',
+  'pulse:restart': 'pulse:restart',
+  about: 'about',
 }
 
 function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
@@ -192,6 +195,10 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
       return ok('Deprecated: x\n' + JSON.stringify({ routes: TAB_ROUTES, editor: fake.editor ?? null }))
     }
     if (argv[0] === 'php' && argv[1] === '-r' && argv[2]?.includes('proc_open')) return ok('{"opened":true}')
+    // route:list --json: domain is its own field (what lara-cc drops before the conversation)
+    if (argv[1] === 'artisan' && argv[2] === 'route:list' && argv.includes('--json')) {
+      return ok('Deprecated: x\n' + JSON.stringify(TAB_ROUTES.map(r => ({ domain: r.domain ?? null, method: r.method, uri: r.uri, name: r.name, action: r.action, middleware: ['web'] }))))
+    }
     if (argv.join(' ') === 'uname -s') return ok('Darwin\n')
     // An editor whose link macOS can't open (not installed)
     if (argv[0] === 'open' && fake.noEditor && argv[1]?.includes('://')) return missing
@@ -641,19 +648,83 @@ test('allowing for the session stops the asking, and what is sent is redacted', 
   expect(first).not.toContain('hunter2')
 })
 
-test('the artisan tool refuses commands that print secrets', async ($, on) => {
+test("about and route:list reach the conversation without the app's URL or any route's domain", async ($, on) => {
   const ran: string[][] = []
-  HELP['config:show'] = 'config:show'
-  const clock = fakeProject(on, ran)
+  const about = ['  Laravel Version .......... 12.33.0', '  URL ...................... shop.example.com', '  Database ................. mysql'].join('\n')
+  const clock = fakeProject(on, ran, { says: about })
   await $.session.start({ cwd: '/app' })
   await clock.settle()
 
-  const out = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'config:show database' }))
-  expect(out).toContain('Refused')
-  // Typed by the person too: the output would land where Claude reads it
+  for (const output of [
+    await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'about' }),
+    await $.command.run({ command: 'lara-artisan', args: 'about', origin: { kind: 'composer' } } as never),
+  ]) {
+    const text = JSON.stringify(output)
+    expect(text).toContain('12.33.0')
+    expect(text).toContain('mysql')
+    expect(text).not.toContain('shop.example.com')
+  }
+
+  for (const output of [
+    await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'route:list --path=team' }),
+    await $.command.run({ command: 'lara-artisan', args: 'route:list', origin: { kind: 'composer' } } as never),
+  ]) {
+    const text = JSON.stringify(output)
+    expect(text).toContain('users.index')
+    expect(text).toContain('(own domain)')
+    expect(text).not.toContain('example.test')
+  }
+  // The options asked for still apply: route:list ran with them, as --json
+  expect(ran).toContainEqual(['php', 'artisan', 'route:list', '--path=team', '--json', '--no-interaction'])
+})
+
+test('config:show and db:show are shown to the person in the pane, never to Claude; Claude asking asks first', async ($, on) => {
+  const ran: string[][] = []
+  const asked: string[] = []
+  HELP['config:show'] = 'config:show'
+  HELP['db:show'] = 'db:show'
+  HELP['env:encrypt'] = 'env:encrypt'
+  const fake: Fake = { asked, answers: ["Don't run"], says: 'password ......... hunter2\nHost ......... db.internal\nUsername ......... forge' }
+  const clock = fakeProject(on, ran, fake)
+  const opened: string[] = []
+  on('ui.open', ($, e) => {
+    opened.push(e.id)
+    return { value: undefined } as never
+  })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+  const shown = () => ran.filter(argv => (argv.includes('config:show') || argv.includes('db:show')) && !argv.includes('help')).length
+
+  // Claude asks, the person says no: nothing runs
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'config:show database' }))).toContain('chose not to run')
+  expect(asked.at(-1)).toContain("doesn't send it to Claude")
+  expect(shown()).toBe(0)
+
+  // Yes: it runs, shows in the pane, and Claude learns only that
+  fake.answers = ['Show me']
+  const forClaude = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'db:show' }))
+  expect(shown()).toBe(1)
+  expect(forClaude).toContain('shown to the user in the lara-cc pane')
+  for (const secret of ['hunter2', 'db.internal', 'forge']) expect(forClaude).not.toContain(secret)
+  expect(opened).toContain('lara')
+  const pane = await mountPane($)
+  expect(JSON.stringify(await pane.drawn())).toContain('db.internal')
+
+  // Typed by the person: no question, same result
+  const before = asked.length
   const typed = JSON.stringify(await $.command.run({ command: 'lara-artisan', args: 'config:show database', origin: { kind: 'composer' } } as never))
-  expect(typed).toContain('own terminal')
-  expect(ran.some(argv => argv.includes('config:show') && !argv.includes('help'))).toBe(false)
+  expect(asked.length).toBe(before)
+  expect(shown()).toBe(2)
+  expect(typed).not.toContain('hunter2')
+
+  // Nobody to answer: no
+  fake.answers = []
+  fake.share = null
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'config:show' })
+  expect(shown()).toBe(2)
+
+  // env:encrypt writes files and prints the key: still refused
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'env:encrypt' }))).toContain('Refused')
 })
 
 test('a stopped Herd service starts from its button on the Services tab, with values passed as arguments', async ($, on) => {
@@ -916,6 +987,48 @@ test("Claude's artisan tool asks before commands that reach past the folder, say
   const before = asked.length
   await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'make:model Post' })
   expect(asked.length).toBe(before)
+})
+
+test('commands lara-cc does not know to stay in the folder ask too; the ones it knows run straight away', async ($, on) => {
+  const ran: string[][] = []
+  const asked: string[] = []
+  const clock = fakeProject(on, ran, { asked, run: "Don't run" })
+  await $.session.start({ cwd: '/app' })
+  await clock.settle()
+
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'pulse:restart' })
+  expect(asked.at(-1)).toContain("isn't one lara-cc knows to stay inside the project folder")
+  expect(ran.some(argv => argv[2] === 'pulse:restart')).toBe(false)
+
+  const before = asked.length
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'route:list' })
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'make:model Post' })
+  expect(asked.length).toBe(before)
+})
+
+test("before APP_ENV and the app's servers are read, the question says it doesn't know rather than none found", async ($, on) => {
+  const ran: string[][] = []
+  const asked: string[] = []
+  let answer = () => {}
+  fakeProject(on, ran, { asked, aboutGate: new Promise<void>(resolve => (answer = resolve)) })
+  await $.session.start({ cwd: '/app' })
+
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'migrate' })
+  expect(asked.at(-1)).toContain("doesn't know APP_ENV or the app's servers")
+  expect(asked.at(-1)).not.toContain('none of its servers')
+  answer()
+})
+
+test('long command output is redacted before it is cut, so a cut between a key and its value hides nothing', async ($, on) => {
+  const ran: string[][] = []
+  // One long line, cut just past `password`: what's kept starts at `= hunter2`
+  const says = 'password = hunter2 ' + 'z'.repeat(7990)
+  fakeProject(on, ran, { says })
+  await $.session.start({ cwd: '/app' })
+
+  const output = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'make:model Post' }))
+  expect(output).toContain('zzzz')
+  expect(output).not.toContain('hunter2')
 })
 
 test('retrying failed jobs and starting a worker ask when Claude does it, not when the person types or presses', async ($, on) => {
