@@ -1,0 +1,26 @@
+name: CI
+
+# Validate the mod and run its tests. The type check (tsc) runs locally:
+# it needs .claude-plugin/types/, which Claude Code writes when it loads the mod.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      # No update checks or telemetry: CI needs only the local CLI
+      DISABLE_AUTOUPDATER: "1"
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # The version the tests were last validated on; bump it with the README
+      - run: npm install -g @anthropic-ai/claude-code@2.1.296
+      - run: claude plugin validate --strict .
+      - run: claude plugin test .

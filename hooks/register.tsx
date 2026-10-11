@@ -72,11 +72,11 @@ type Api = EngineInterface
 // ─── Config: edit these to taste ───────────────────────────────────────────
 
 /** Long-running processes the mod can start, stop and restart. `vite` and `queue` are adjusted at start-up. */
-const SERVICES: Record<string, { label: string; argv: string[] }> = {
+const SERVICES = {
   queue: { label: 'Queue worker', argv: ['php', 'artisan', 'queue:work', '--tries=1'] },
   vite: { label: 'Vite dev', argv: ['npm', 'run', 'dev'] },
   schedule: { label: 'Scheduler', argv: ['php', 'artisan', 'schedule:work'] },
-}
+} satisfies Record<string, { label: string; argv: string[] }>
 
 /** One-press commands on the Commands tab (digit = hotkey). `npm` is swapped for the detected package manager. */
 const QUICK: { key: string; label: string; argv: string[] }[] = [
@@ -184,7 +184,8 @@ type Settings = {
 
 const DEFAULT_SETTINGS: Settings = { autoRestartQueue: true, pintAfterTurn: false, showBand: true, errorToasts: true, autostart: {} }
 
-const services: Record<string, Service> = {}
+// The SERVICES keys always exist; any other name (from Claude or a setting) may not, so it reads as possibly undefined
+const services = {} as Record<keyof typeof SERVICES, Service> & Record<string, Service>
 for (const [name, def] of Object.entries(SERVICES)) {
   services[name] = { name, label: def.label, argv: [...def.argv], lines: [], partial: '' }
 }

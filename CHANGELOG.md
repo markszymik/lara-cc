@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-10-11
+
+### Added
+
+- CI on GitHub Actions: every push and pull request validates the mod (`--strict`) and runs its tests on the Claude Code version they were last validated on. The README states the minimum and last validated Claude Code versions, and the type check, which needs files only a signed-in Claude Code writes, runs before each release.
+
+### Changed
+
+- The code type-checks with no errors (it had 114 known ones, all in types, none in behaviour), so a new type error stands out.
+
 ## [0.11.2] - 2026-10-11
 
 ### Changed

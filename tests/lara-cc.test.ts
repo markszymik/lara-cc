@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { On } from 'claude-code'
+import type { On, PromptOrigin } from 'claude-code'
 
 import { PHP_OPTIONS } from '../hooks/parse'
 import { LOG } from './fixtures'
@@ -68,6 +68,19 @@ const plain = (argv: readonly string[]) => {
   return at < 0 ? [...argv] : [...argv.slice(0, at), ...argv.slice(at + PHP_OPTIONS.length)]
 }
 
+/** The session starting in `cwd`, as the REPL starts it. */
+const start = ($: Engine, cwd = '/app') => $.session.start({ cwd, surface: 'terminal', isInteractive: true })
+
+/**
+ * `/<name> <args>` run on the main screen. Without `origin` it is relayed (Claude, another plugin), stamped
+ * `unclassified` and never taken as typed; `{ kind: 'composer' }` is the person's own Enter.
+ */
+const slash = ($: Engine, name: string, args: string, origin: PromptOrigin = { kind: 'unclassified' }) =>
+  $.command.run({ command: name, args, origin, presentation: { isFullscreen: false, columns: 80 } })
+
+/** The engine's answer to `ui.open`: the pane is drawn. lara-cc doesn't read it. */
+const placed = () => ({ value: { isPlaced: true as const } })
+
 /**
  * What routesPhp prints: route:list's columns, with where each route's code is. `domain` on `team` is what the
  * mod must drop if PHP ever printed it.
@@ -126,8 +139,8 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
     fake.reads?.push(e.path)
     return { value: file(e.path) ?? '{"require":{"laravel/framework":"^12.0"}}' }
   })
-  on('command.register', () => ({ value: {} }))
-  on('tool.register', () => ({ value: {} }))
+  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('tool.register', ($, e) => ({ value: { tool: e.name } }))
   on('ui.toast', ($, e) => {
     fake.toasts?.push(e.text)
     return { value: undefined }
@@ -220,9 +233,9 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
 test('/lara-artisan runs php artisan with the arguments and returns clean output', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran)
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
-  const answer = await $.command.run({ command: 'lara-artisan', args: 'make:model Post -m' })
+  const answer = await slash($, 'lara-artisan', 'make:model Post -m')
   expect(ran.find(argv => argv[2] === 'make:model')).toEqual(['php', 'artisan', 'make:model', 'Post', '-m', '--no-interaction'])
   expect(answer.text).toContain('✓ artisan make:model Post -m')
   expect(answer.text).not.toContain('\u001b[')
@@ -231,31 +244,31 @@ test('/lara-artisan runs php artisan with the arguments and returns clean output
 test('/lara-npm uses the package manager from the lockfile', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran)
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
-  await $.command.run({ command: 'lara-npm', args: 'build' })
+  await slash($, 'lara-npm', 'build')
   expect(ran.find(argv => argv[1] === 'run')).toEqual(['pnpm', 'run', 'build'])
 })
 
 test('/lara-routes filters the route list', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran)
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
-  const answer = await $.command.run({ command: 'lara-routes', args: 'posts' })
+  const answer = await slash($, 'lara-routes', 'posts')
   expect(answer.text).toContain('1 of 6 routes')
   expect(answer.text).toContain('posts.store')
   expect(answer.text).not.toContain('users.index')
   // The same list as the Routes tab: one PHP boot, no route:list, and no route's domain
   expect(ran.some(argv => argv.join(' ') === 'php artisan route:list --json')).toBe(false)
-  expect((await $.command.run({ command: 'lara-routes', args: '' })).text).not.toContain('example')
+  expect((await slash($, 'lara-routes', '')).text).not.toContain('example')
 })
 
 test("the routes tool redacts why the routes couldn't be read", async ($, on) => {
   const ran: string[][] = []
   const routesFail = 'Deprecated: f(): Implicitly nullable\n\n  Illuminate\\Database\\QueryException\n\n  SQLSTATE[HY000] [1045] Access denied for jane@example.com (password: hunter2secret)\n'
   fakeProject(on, ran, { routesFail })
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
   const answer = await $.tool.call({ tool: 'mcp__lara-cc__routes' } as never)
   const text = JSON.stringify(answer)
@@ -267,7 +280,7 @@ test("the routes tool redacts why the routes couldn't be read", async ($, on) =>
 test('the artisan tool refuses destructive commands', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran)
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
   const attempts = [
     'migrate:fresh',
@@ -295,7 +308,7 @@ test('the artisan tool refuses destructive commands', async ($, on) => {
 test('the artisan tool runs safe commands once artisan has resolved the name', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran)
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
   const answer = await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'make:model Post -m' })
   expect(JSON.stringify(answer)).toContain('✓ artisan make:model Post -m')
@@ -306,7 +319,7 @@ test('the artisan tool runs safe commands once artisan has resolved the name', a
 test('the artisan tool does not run a name artisan cannot resolve', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran)
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
   const answer = await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'nope:thing' })
   expect(JSON.stringify(answer)).toContain('could not resolve')
@@ -316,9 +329,9 @@ test('the artisan tool does not run a name artisan cannot resolve', async ($, on
 test('/lara-artisan from a plugin or relayed message gets the same check', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran)
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
-  const answer = await $.command.run({ command: 'lara-artisan', args: 'migr:fr' })
+  const answer = await slash($, 'lara-artisan', 'migr:fr')
   expect(answer.text).toContain('Refused: migrate:fresh can destroy data')
   expect(ran.some(argv => argv[2] === 'migr:fr')).toBe(false)
 })
@@ -326,9 +339,9 @@ test('/lara-artisan from a plugin or relayed message gets the same check', async
 test('/lara-schedule reports the scheduler', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran)
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
-  const answer = await $.command.run({ command: 'lara-schedule', args: '' })
+  const answer = await slash($, 'lara-schedule', '')
   expect(answer.text).toBe('Scheduler is stopped.')
 })
 
@@ -336,7 +349,7 @@ test('the logs tool returns errors from the history and the live tail, with orig
   const ran: string[][] = []
   const split = LOG.indexOf('[2026-10-10 08:01:02]')
   const clock = fakeProject(on, ran, { history: LOG.slice(0, split), live: LOG.slice(split) })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   const all = await $.tool.call({ tool: 'mcp__lara-cc__logs', level: 'all', count: 10 })
@@ -357,7 +370,7 @@ test('the queue tool lists failed jobs and retries one', async ($, on) => {
     failed: [{ id: 'abc-123', queue: 'default', job: 'App\\Jobs\\ChargeCard', failedAt: '2026-10-10 08:01:03', exception: 'RuntimeException: Payment gateway down in /app/app/Jobs/ChargeCard.php:12\nStack trace:\n#0 ...' }],
   }
   fakeProject(on, ran, { snapshot })
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
   const status = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'status' }))
   expect(status).toContain('default=4')
@@ -382,13 +395,13 @@ for (const surface of ['terminal', 'desktop'] as const) {
       failed: [{ id: 'abc-123', queue: 'default', job: 'App\\Jobs\\ChargeCard', failedAt: '2026-10-10 08:01:03', exception: 'RuntimeException: down\n#0 x' }],
     }
     const clock = fakeProject(on, ran, { history: LOG.slice(0, split), live: LOG.slice(split), snapshot })
-    on('ui.open', () => ({ value: undefined }))
+    on('ui.open', placed)
     const asked: string[] = []
     on('prompt.submit', ($, e) => {
       asked.push(e.text)
       return { text: e.text }
     })
-    await $.session.start({ cwd: '/app' })
+    await start($)
     await clock.settle()
 
     const band = await $.ui.mount({
@@ -429,13 +442,13 @@ test('with Herd as the PATH php, artisan, composer and services run on the binar
   const ran: string[][] = []
   const spawned: string[][] = []
   fakeProject(on, ran, { herd, shellPhp: HERD_BIN + '/php84', spawned })
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
   await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'migrate' })
   expect(ran).toContainEqual([herd, 'artisan', 'help', 'migrate', '--format=json', '--no-interaction'])
   expect(ran).toContainEqual([herd, 'artisan', 'migrate', '--no-interaction'])
 
-  await $.command.run({ command: 'lara-composer', args: 'install' })
+  await slash($, 'lara-composer', 'install')
   expect(ran).toContainEqual([herd, COMPOSER, 'install', '--no-interaction'])
 
   const started = await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
@@ -450,11 +463,11 @@ test("every PHP the mod starts sends PHP's own warnings to stderr, so stdout hol
   const ran: string[][] = []
   const raw: string[][] = []
   const clock = fakeProject(on, ran, { herd, shellPhp: HERD_BIN + '/php84', raw })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'migrate' })
-  await $.command.run({ command: 'lara-composer', args: 'install' })
+  await slash($, 'lara-composer', 'install')
   await $.tool.call({ tool: 'mcp__lara-cc__routes' } as never)
   await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
   // Every launch of PHP: the probes, artisan, the php -r snippets, Composer through PHP, the worker
@@ -473,29 +486,29 @@ test("every PHP the mod starts sends PHP's own warnings to stderr, so stdout hol
 test('with Herd installed but another php on PATH, the PATH php stays', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran, { herd: HERD_BIN + '/php83', shellPhp: '/opt/homebrew/bin/php' })
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
   await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'migrate' })
   expect(ran).toContainEqual(['php', 'artisan', 'migrate', '--no-interaction'])
-  await $.command.run({ command: 'lara-composer', args: 'install' })
+  await slash($, 'lara-composer', 'install')
   expect(ran).toContainEqual(['composer', 'install', '--no-interaction'])
 })
 
 test('with Herd, a Composer that is a shell shim runs as is, not through PHP', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran, { herd: HERD_BIN + '/php83', shellPhp: HERD_BIN + '/php84', composerShim: true })
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
-  await $.command.run({ command: 'lara-composer', args: 'install' })
+  await slash($, 'lara-composer', 'install')
   expect(ran).toContainEqual(['composer', 'install', '--no-interaction'])
 })
 
 test('without Herd, php and composer come from PATH', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran)
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
-  await $.command.run({ command: 'lara-composer', args: 'install' })
+  await slash($, 'lara-composer', 'install')
   expect(ran).toContainEqual(['composer', 'install', '--no-interaction'])
   expect(ran.some(argv => argv.join(' ') === 'which composer')).toBe(false)
 })
@@ -516,7 +529,7 @@ test('the band flags a production environment, maintenance mode and cached confi
   const reads: string[] = []
   const files = { 'storage/framework/down': '{}', 'bootstrap/cache/config.php': '<?php', 'bootstrap/cache/routes-v7.php': '<?php' }
   const clock = fakeProject(on, ran, { files, env: 'production', reads })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   const drawn = await drawBand($)
@@ -529,7 +542,7 @@ test('the band flags a production environment, maintenance mode and cached confi
 test('the band flags public/hot when the Vite it names is gone', async ($, on) => {
   const ran: string[][] = []
   const clock = fakeProject(on, ran, { files: { 'public/hot': 'http://[::1]:5173' }, curl: 7 })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   expect(await drawBand($)).toContain('Vite not running (public/hot)')
@@ -539,7 +552,7 @@ test('the band flags public/hot when the Vite it names is gone', async ($, on) =
 test('public/hot is fine while Vite answers, e.g. run in another terminal', async ($, on) => {
   const ran: string[][] = []
   const clock = fakeProject(on, ran, { files: { 'public/hot': 'https://shop.test:5173' }, curl: 0 })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   expect(await drawBand($)).not.toContain('public/hot')
@@ -548,7 +561,7 @@ test('public/hot is fine while Vite answers, e.g. run in another terminal', asyn
 test('public/hot naming another machine is never probed', async ($, on) => {
   const ran: string[][] = []
   const clock = fakeProject(on, ran, { files: { 'public/hot': 'http://example.com:5173' }, curl: 7 })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   expect(ran.some(argv => argv[0] === 'curl')).toBe(false)
@@ -563,7 +576,7 @@ test('the band flags dependencies out of step with the lockfiles', async ($, on)
     'pnpm-lock.yaml': 'lockfileVersion: 9.0',
   }
   const clock = fakeProject(on, ran, { files })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   const drawn = await drawBand($)
@@ -575,13 +588,13 @@ test('the band flags dependencies out of step with the lockfiles', async ($, on)
 test('a crashed process shows in the band until the Services tab is opened', async ($, on) => {
   const ran: string[][] = []
   const clock = fakeProject(on, ran, { exits: { pnpm: 1 } })
-  on('ui.open', () => ({ value: undefined }))
-  await $.session.start({ cwd: '/app' })
+  on('ui.open', placed)
+  await start($)
   await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'vite', action: 'start' })
   await clock.settle()
 
   expect(await drawBand($)).toContain('✗ vite exited (1)')
-  await $.command.run({ command: 'lara', args: 'services' })
+  await slash($, 'lara', 'services')
   expect(await drawBand($)).not.toContain('exited')
 })
 
@@ -599,7 +612,7 @@ test('the band flags a stopped Herd service the app connects to, reading only se
   ]
   // MySQL 8.4 on 3306 is up, but the app uses 8.0 on 3307
   const clock = fakeProject(on, ran, { connections, herdServices: [MYSQL, MYSQL_80, REDIS], closed: [3307], reads })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   const drawn = await drawBand($)
@@ -616,7 +629,7 @@ test('a stopped Herd service the app does not connect to is not flagged', async 
   // The database is on a port no Herd service has (Docker, DBngin), and nothing uses Redis
   const connections = [{ use: 'database', driver: 'mysql', port: 33060 }]
   const clock = fakeProject(on, ran, { connections, herdServices: [MYSQL, REDIS], closed: [3306, 6379] })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   expect(await drawBand($)).not.toContain('stopped')
@@ -627,7 +640,7 @@ test('log entries go to Claude only after asking, redacted, and not at all on no
   const asked: string[] = []
   const history = '[2026-10-10 10:00:00] local.ERROR: Login failed for jane@example.com password=hunter2 {"exception":"x"}\n'
   const clock = fakeProject(on, ran, { history, asked, share: "Don't send" })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   const declined = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__logs' }))
@@ -641,7 +654,7 @@ test('allowing for the session stops the asking, and what is sent is redacted', 
   const asked: string[] = []
   const history = '[2026-10-10 10:00:00] local.ERROR: Login failed for jane@example.com password=hunter2 {"exception":"x"}\n'
   const clock = fakeProject(on, ran, { history, asked, share: 'Allow this session' })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   const first = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__logs' }))
@@ -654,12 +667,12 @@ test('allowing for the session stops the asking, and what is sent is redacted', 
 test("about and route:list reach the conversation without the app's URL or any route's domain", async ($, on) => {
   const ran: string[][] = []
   const clock = fakeProject(on, ran)
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   for (const output of [
     await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'about' }),
-    await $.command.run({ command: 'lara-artisan', args: 'about', origin: { kind: 'composer' } } as never),
+    await slash($, 'lara-artisan', 'about', { kind: 'composer' }),
   ]) {
     const text = JSON.stringify(output)
     expect(text).toContain('12.33.0')
@@ -669,7 +682,7 @@ test("about and route:list reach the conversation without the app's URL or any r
 
   for (const output of [
     await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'route:list --path=team' }),
-    await $.command.run({ command: 'lara-artisan', args: 'route:list', origin: { kind: 'composer' } } as never),
+    await slash($, 'lara-artisan', 'route:list', { kind: 'composer' }),
   ]) {
     const text = JSON.stringify(output)
     expect(text).toContain('users.index')
@@ -691,9 +704,9 @@ test('config:show and db:show are shown to the person in the pane, never to Clau
   const opened: string[] = []
   on('ui.open', ($, e) => {
     opened.push(e.id)
-    return { value: undefined } as never
+    return placed()
   })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
   const shown = () => ran.filter(argv => (argv.includes('config:show') || argv.includes('db:show')) && !argv.includes('help')).length
 
@@ -714,7 +727,7 @@ test('config:show and db:show are shown to the person in the pane, never to Clau
 
   // Typed by the person: no question, same result
   const before = asked.length
-  const typed = JSON.stringify(await $.command.run({ command: 'lara-artisan', args: 'config:show database', origin: { kind: 'composer' } } as never))
+  const typed = JSON.stringify(await slash($, 'lara-artisan', 'config:show database', { kind: 'composer' }))
   expect(asked.length).toBe(before)
   expect(shown()).toBe(2)
   expect(typed).not.toContain('hunter2')
@@ -733,8 +746,8 @@ test('a stopped Herd service starts from its button on the Services tab, with va
   const ran: string[][] = []
   const connections = [{ use: 'database', driver: 'mysql', port: 3306 }]
   const clock = fakeProject(on, ran, { connections, herdServices: [MYSQL], closed: [3306] })
-  on('ui.open', () => ({ value: undefined }))
-  await $.session.start({ cwd: '/app' })
+  on('ui.open', placed)
+  await start($)
   await clock.settle()
   expect(await drawBand($)).toContain('Herd MySQL stopped')
 
@@ -762,8 +775,8 @@ for (const nc of ['missing', 2] as const) {
     const toasts: string[] = []
     const connections = [{ use: 'database', driver: 'mysql', port: 3306 }]
     const clock = fakeProject(on, ran, { connections, herdServices: [MYSQL, REDIS], nc, toasts })
-    on('ui.open', () => ({ value: undefined }))
-    await $.session.start({ cwd: '/app' })
+    on('ui.open', placed)
+    await start($)
     await clock.settle()
 
     const band = await drawBand($)
@@ -795,7 +808,7 @@ test('moving to another folder leaves nothing of the last: Horizon, its worker a
   const spawned: string[][] = []
   const fake: Fake = { spawned, hold: ['horizon'], history: LOG, env: 'production', files: { 'composer.json': '{"require":{"laravel/horizon":"^5.0"}}' } }
   const clock = fakeProject(on, ran, fake)
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
   await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
   await clock.settle()
@@ -806,7 +819,7 @@ test('moving to another folder leaves nothing of the last: Horizon, its worker a
 
   // A plain Laravel app, without Horizon
   Object.assign(fake, { dir: '/other', history: '', env: 'local', files: {} })
-  await $.session.start({ cwd: '/other' })
+  await start($, '/other')
   await clock.settle()
 
   const status = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'status' }))
@@ -830,10 +843,10 @@ test('what the last folder answers after the session has moved on is dropped', a
   // The first folder's `artisan about` is slow, and says production
   const fake: Fake = { env: 'production', aboutGate: new Promise<void>(resolve => (answer = resolve)) }
   const clock = fakeProject(on, ran, fake)
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
   Object.assign(fake, { dir: '/other', env: 'local', aboutGate: undefined })
-  await $.session.start({ cwd: '/other' })
+  await start($, '/other')
   await clock.settle()
   answer()
   await clock.settle()
@@ -848,13 +861,13 @@ test('a session that starts again in the same folder keeps its worker, its outpu
   // The first start's `artisan about` is slow, and says production
   const fake: Fake = { hold: ['queue:work'], env: 'production', aboutGate: new Promise<void>(resolve => (answer = resolve)) }
   const clock = fakeProject(on, ran, fake)
-  on('ui.open', () => ({ value: undefined }))
-  await $.session.start({ cwd: '/app' })
+  on('ui.open', placed)
+  await start($)
   await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
-  await $.command.run({ command: 'lara-artisan', args: 'make:model Post' })
+  await slash($, 'lara-artisan', 'make:model Post')
 
   Object.assign(fake, { env: 'local', aboutGate: new Promise<void>(resolve => (answerAgain = resolve)) })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   answer()
   await clock.settle()
 
@@ -880,23 +893,23 @@ test('representative secrets reach Claude through no lara-cc route: tools, comma
   const exception = `RuntimeException: ${LEAKY} in /app/app/Jobs/Charge.php:12\n#0 /app/app/Jobs/Charge.php(3): App\\Jobs\\Charge->pay('hunter2')`
   const snapshot = { connection: 'redis', sizes: { default: 0 }, failedTotal: 1, failed: [{ id: 'f-1', queue: 'default', job: 'App\\Jobs\\Charge', failedAt: '2026-10-11 09:00:01', exception }] }
   const clock = fakeProject(on, ran, { history, snapshot, hold: ['queue:work'], says: LEAKY, tests: FAILING.replace('jane@example.com', LEAKY) })
-  on('ui.open', () => ({ value: undefined }))
+  on('ui.open', placed)
   on('prompt.submit', ($, e) => {
     sent.push(e.text)
     return { text: e.text }
   })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   const outputs: Record<string, unknown> = {
     'logs tool': await $.tool.call({ tool: 'mcp__lara-cc__logs' }),
-    '/lara-logs': await $.command.run({ command: 'lara-logs', args: 'errors' }),
+    '/lara-logs': await slash($, 'lara-logs', 'errors'),
     'queue tool, failed': await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'failed' }),
-    '/lara-queue failed': await $.command.run({ command: 'lara-queue', args: 'failed' }),
+    '/lara-queue failed': await slash($, 'lara-queue', 'failed'),
     'artisan tool output': await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'make:model Post' }),
     "artisan tool, a name artisan can't resolve": await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'nosuch:thing' }),
-    '/lara-artisan output': await $.command.run({ command: 'lara-artisan', args: 'make:model Post', origin: { kind: 'composer' } } as never),
-    '/lara-test': await $.command.run({ command: 'lara-test', args: '' }),
+    '/lara-artisan output': await slash($, 'lara-artisan', 'make:model Post', { kind: 'composer' }),
+    '/lara-test': await slash($, 'lara-test', ''),
   }
   await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
   await clock.settle()
@@ -926,7 +939,7 @@ test('representative secrets reach Claude through no lara-cc route: tools, comma
 test("the queue state's error reaches Claude redacted", async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran, { snapshot: `PDOException: could not connect to ${LEAKY}` })
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
   const status = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'status' }))
   expect(status).toContain('PDOException')
@@ -943,12 +956,12 @@ test('with nobody to answer (claude -p), logs, failed jobs and Boost logs are no
     boostRan = true
     return { result: 'Login failed' } as never
   })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   for (const output of [
     await $.tool.call({ tool: 'mcp__lara-cc__logs' }),
-    await $.command.run({ command: 'lara-logs', args: '' }),
+    await slash($, 'lara-logs', ''),
     await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'failed' }),
     await $.tool.call({ tool: 'mcp__laravel-boost__last-error' } as never),
   ]) {
@@ -966,7 +979,7 @@ test("Claude's artisan tool asks before commands that reach past the folder, say
   const connections = [{ use: 'database', driver: 'mysql', port: 3306 }]
   const fake: Fake = { asked, connections, run: "Don't run" }
   const clock = fakeProject(on, ran, fake)
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   const refused = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'migrate' }))
@@ -995,7 +1008,7 @@ test('commands lara-cc does not know to stay in the folder ask too; the ones it 
   const ran: string[][] = []
   const asked: string[] = []
   const clock = fakeProject(on, ran, { asked, run: "Don't run" })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'pulse:restart' })
@@ -1013,7 +1026,7 @@ test("a package's make: command asks; tests ask unless phpunit.xml uses an in-me
   const asked: string[] = []
   const fake: Fake = { asked, run: "Don't run" }
   const clock = fakeProject(on, ran, fake)
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   // Filament's make:filament-user inserts a user: not one of the file generators
@@ -1035,7 +1048,7 @@ test("a package's make: command asks; tests ask unless phpunit.xml uses an in-me
 test('route:list for Claude keeps the middleware with -v', async ($, on) => {
   const ran: string[][] = []
   fakeProject(on, ran)
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
   expect(JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'route:list' }))).not.toContain('[web]')
   const verbose = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'route:list -v' }))
@@ -1048,7 +1061,7 @@ test("before APP_ENV and the app's servers are read, the question says it doesn'
   const asked: string[] = []
   let answer = () => {}
   fakeProject(on, ran, { asked, aboutGate: new Promise<void>(resolve => (answer = resolve)) })
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
   await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'migrate' })
   expect(asked.at(-1)).toContain("doesn't know APP_ENV or the app's servers")
@@ -1061,7 +1074,7 @@ test('long command output is redacted before it is cut, so a cut between a key a
   // One long line, cut just past `password`: what's kept starts at `= hunter2`
   const says = 'password = hunter2 ' + 'z'.repeat(7990)
   fakeProject(on, ran, { says })
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
   const output = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'make:model Post' }))
   expect(output).toContain('zzzz')
@@ -1075,17 +1088,17 @@ test('retrying failed jobs and starting a worker ask when Claude does it, not wh
   const snapshot = { connection: 'redis', sizes: {}, failedTotal: 7, failed: [] }
   const fake: Fake = { asked, snapshot, spawned, run: "Don't run" }
   fakeProject(on, ran, fake)
-  await $.session.start({ cwd: '/app' })
+  await start($)
   const retries = () => ran.filter(argv => argv[2] === 'queue:retry').length
 
   expect(JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'retry', id: 'all' }))).toContain('chose not to run')
   expect(asked.at(-1)).toContain('queue:retry all (7 failed jobs)')
-  await $.command.run({ command: 'lara-queue', args: 'retry all' })
+  await slash($, 'lara-queue', 'retry all')
   expect(retries()).toBe(0)
 
   // Typed by the person: no question
   const before = asked.length
-  await $.command.run({ command: 'lara-queue', args: 'retry all', origin: { kind: 'composer' } } as never)
+  await slash($, 'lara-queue', 'retry all', { kind: 'composer' })
   expect(retries()).toBe(1)
   expect(asked.length).toBe(before)
 
@@ -1102,8 +1115,8 @@ test('restarting a worker the person started needs no question, so Claude can re
   const spawned: string[][] = []
   const asked: string[] = []
   fakeProject(on, ran, { asked, spawned, hold: ['queue:work'], run: "Don't run" })
-  await $.session.start({ cwd: '/app' })
-  await $.command.run({ command: 'lara-queue', args: 'start', origin: { kind: 'composer' } } as never)
+  await start($)
+  await slash($, 'lara-queue', 'start', { kind: 'composer' })
 
   await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'restart' })
   expect(spawned.filter(argv => argv.includes('queue:work')).length).toBe(2)
@@ -1114,14 +1127,14 @@ test('/lara-composer and /lara-npm ask when the person did not type them', async
   const ran: string[][] = []
   const asked: string[] = []
   fakeProject(on, ran, { asked, run: "Don't run" })
-  await $.session.start({ cwd: '/app' })
+  await start($)
 
-  expect((await $.command.run({ command: 'lara-composer', args: 'require evil/pkg' })).text).toContain('chose not to run')
-  expect((await $.command.run({ command: 'lara-npm', args: 'build' })).text).toContain('chose not to run')
+  expect((await slash($, 'lara-composer', 'require evil/pkg')).text).toContain('chose not to run')
+  expect((await slash($, 'lara-npm', 'build')).text).toContain('chose not to run')
   expect(ran.some(argv => argv.includes('evil/pkg') || argv.join(' ') === 'pnpm run build')).toBe(false)
   expect(asked.length).toBe(2)
 
-  await $.command.run({ command: 'lara-composer', args: 'require laravel/pail', origin: { kind: 'composer' } } as never)
+  await slash($, 'lara-composer', 'require laravel/pail', { kind: 'composer' })
   expect(ran.some(argv => argv.includes('laravel/pail'))).toBe(true)
   expect(asked.length).toBe(2)
 })
@@ -1149,7 +1162,7 @@ test('band fixes run on a press: up for maintenance, only the caches that exist,
   const ran: string[][] = []
   const files = { 'storage/framework/down': '{}', 'bootstrap/cache/config.php': '<?php', 'bootstrap/cache/routes-v7.php': '<?php' }
   const clock = fakeProject(on, ran, { files })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   const band = await mountBand($)
@@ -1166,7 +1179,7 @@ test('band fixes run on a press: up for maintenance, only the caches that exist,
 test('a narrow band drops the fix buttons before folding the warnings', async ($, on) => {
   const ran: string[][] = []
   const clock = fakeProject(on, ran, { files: { 'storage/framework/down': '{}' } })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   const narrow = JSON.stringify(await (await mountBand($, 34)).drawn())
@@ -1180,8 +1193,8 @@ test('jobs waiting with no worker show in the band with a start button; a draini
   const snapshot = { connection: 'database', sizes: { default: 3, emails: 0 }, failedTotal: 0, failed: [] }
   const fake = { snapshot, spawned }
   const clock = fakeProject(on, ran, fake)
-  on('ui.open', () => ({ value: undefined }))
-  await $.session.start({ cwd: '/app' })
+  on('ui.open', placed)
+  await start($)
   await clock.settle()
 
   const band = await mountBand($)
@@ -1193,7 +1206,7 @@ test('jobs waiting with no worker show in the band with a start button; a draini
 
   // A worker elsewhere drains it: fewer than last time
   fake.snapshot = { ...snapshot, sizes: { default: 1, emails: 0 } }
-  await $.command.run({ command: 'lara-queue', args: 'status' })
+  await slash($, 'lara-queue', 'status')
   await clock.settle()
   expect(JSON.stringify(await band.drawn())).not.toContain('waiting, no worker')
 })
@@ -1210,14 +1223,14 @@ const FAILING = String.raw`
 test('a failing test run shows in the band and the Tests tab, and goes to Claude redacted', async ($, on) => {
   const ran: string[][] = []
   const clock = fakeProject(on, ran, { tests: FAILING })
-  on('ui.open', () => ({ value: undefined }))
+  on('ui.open', placed)
   const sent: string[] = []
   on('prompt.submit', ($, e) => {
     sent.push(e.text)
     return { text: e.text }
   })
-  await $.session.start({ cwd: '/app' })
-  await $.command.run({ command: 'lara-test', args: '' })
+  await start($)
+  await slash($, 'lara-test', '')
   await clock.settle()
 
   expect(JSON.stringify(await (await mountBand($)).drawn())).toContain('✗ 1 test failing')
@@ -1240,8 +1253,8 @@ test('tests Claude runs through Bash show too', async ($, on) => {
     bashRuns++
     return { result: { stdout: 'OK (12 tests, 30 assertions)', stderr: '', interrupted: false } } as never
   })
-  on('ui.open', () => ({ value: undefined }))
-  await $.session.start({ cwd: '/app' })
+  on('ui.open', placed)
+  await start($)
   await clock.settle()
   await $.tool.call({ tool: 'Bash', command: 'vendor/bin/phpunit' } as never)
   // The band shows a passing run only next to something else; the Tests tab always does
@@ -1261,7 +1274,7 @@ test("Boost's log tools ask first and are redacted; its tinker output is redacte
     boostRan++
     return { result: 'login failed password=hunter2 for jane@example.com' } as never
   })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   const declined = JSON.stringify(await $.tool.call({ tool: 'mcp__laravel-boost__read-log-entries', entries: 5 } as never))
@@ -1279,13 +1292,13 @@ test("Herd's debug session starts and stops on a press, and goes to Claude only 
   const asked: string[] = []
   const debug = JSON.stringify({ queries: [{ sql: 'select * from users where email = ?', bindings: ['jane@example.com'] }], logs: [{ message: 'hi' }] })
   const clock = fakeProject(on, ran, { herdServices: [MYSQL], asked, debug })
-  on('ui.open', () => ({ value: undefined }))
+  on('ui.open', placed)
   const sent: string[] = []
   on('prompt.submit', ($, e) => {
     sent.push(e.text)
     return { text: e.text }
   })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   const pane = await mountPane($)
@@ -1312,7 +1325,7 @@ test("Boost's get-config refuses keys that can hold secrets and redacts the rest
     read.push(String((e as unknown as { key: string }).key))
     return { result: '{"key":"mail.from.address","value":"jane@example.com"}' } as never
   })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   for (const key of ['app.key', 'database.connections.mysql.password', 'services.stripe.secret', 'database.redis.default.url']) {
@@ -1327,7 +1340,7 @@ test("Boost's get-config refuses keys that can hold secrets and redacts the rest
 test('the band migrate fix runs migrate and counts the pending migrations again', async ($, on) => {
   const ran: string[][] = []
   const clock = fakeProject(on, ran, { pending: 2 })
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   const band = await mountBand($)
@@ -1342,10 +1355,10 @@ test('the Routes tab: rows are buttons the arrows walk, and Enter opens the code
   const ran: string[][] = []
   const fake: Fake = { answers: [], asked: [], editor: 'phpstorm' }
   const clock = fakeProject(on, ran, fake)
-  on('ui.open', () => ({ value: undefined }))
+  on('ui.open', placed)
   // The engine's end of the focus ring: the move lands
   on('ui.focus', () => ({}))
-  await $.session.start({ cwd: '/app' })
+  await start($)
   await clock.settle()
 
   const pane = await mountPane($)
@@ -1409,8 +1422,8 @@ test('the Routes tab: rows are buttons the arrows walk, and Enter opens the code
 test('Routes tab rows fit a narrow, short pane: one line each, and only as many as fit', async ($, on) => {
   const ran: string[][] = []
   const clock = fakeProject(on, ran)
-  on('ui.open', () => ({ value: undefined }))
-  await $.session.start({ cwd: '/app' })
+  on('ui.open', placed)
+  await start($)
   await clock.settle()
 
   const pane = await $.ui.mount({
@@ -1442,8 +1455,8 @@ test('Routes tab rows fit a narrow, short pane: one line each, and only as many 
 test('without an editor, a route file opens as a plain file', async ($, on) => {
   const ran: string[][] = []
   const clock = fakeProject(on, ran, { answers: ['Open UserController.php:12'] })
-  on('ui.open', () => ({ value: undefined }))
-  await $.session.start({ cwd: '/app' })
+  on('ui.open', placed)
+  await start($)
   await clock.settle()
   const pane = await mountPane($)
   await pane.press({ key: 'tab-routes' })
@@ -1457,8 +1470,8 @@ test('without an editor, a route file opens as a plain file', async ($, on) => {
 test("an editor link that doesn't open falls back to the plain file", async ($, on) => {
   const ran: string[][] = []
   const clock = fakeProject(on, ran, { answers: ['Open UserController.php:12'], editor: 'phpstorm', noEditor: true })
-  on('ui.open', () => ({ value: undefined }))
-  await $.session.start({ cwd: '/app' })
+  on('ui.open', placed)
+  await start($)
   await clock.settle()
   const pane = await mountPane($)
   await pane.press({ key: 'tab-routes' })

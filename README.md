@@ -1,5 +1,7 @@
 # lara-cc
 
+[![CI](https://github.com/markszymik/lara-cc/actions/workflows/ci.yml/badge.svg)](https://github.com/markszymik/lara-cc/actions/workflows/ci.yml)
+
 An unofficial [Claude Code](https://code.claude.com) mod for Laravel apps.
 
 > **Unofficial.** This is a community project by [Mark Szymik](https://github.com/markszymik). It is not made, endorsed or supported by Laravel LLC or Anthropic. "Laravel" is a trademark of Laravel LLC and is used here only to describe what the mod works with.
@@ -154,6 +156,8 @@ Toggles on the **Services** tab, remembered between sessions: restart queue on P
 
 macOS or Linux (log following uses `tail -F`), PHP on your `PATH` (or Herd), and a Laravel app with `artisan` in the folder you start Claude Code from. Queue job tracking reads `queue:work` output; with Horizon you still get pending and failed jobs.
 
+**Compatibility.** Needs Claude Code v2.1.287 or later; last validated on v2.1.296. CI validates the mod and runs its tests on every push and pull request. Mod APIs are early access and can change between Claude Code releases, so a newer version may need a lara-cc update.
+
 ## Customise
 
 Everything lives in `hooks/register.tsx`. Edit `SERVICES` (add Reverb, Pail, `php artisan serve`…), `QUICK` (the numbered buttons on the Commands tab), and `DESTRUCTIVE` / `DESTRUCTIVE_OPTIONS` (what Claude's `artisan` tool refuses) at the top of the file.
@@ -165,11 +169,14 @@ git clone https://github.com/markszymik/lara-cc ~/mods/lara-cc
 cd ~/Sites/your-laravel-app
 claude --plugin-dir ~/mods/lara-cc   # hot-reloads on save
 
-claude plugin validate ~/mods/lara-cc   # what it hooks and calls
-claude plugin test ~/mods/lara-cc       # tests/ (stubbed php, no real processes)
+claude plugin validate --strict ~/mods/lara-cc   # what it hooks and calls
+claude plugin test ~/mods/lara-cc                # tests/ (stubbed php, no real processes)
+npx -y -p typescript@5.6.3 tsc -p ~/mods/lara-cc --noEmit   # type check
 ```
 
-Built and tested against Claude Code 2.1.296. Mod APIs can change between releases; issues and PRs welcome.
+CI runs the validate and test commands on every push and pull request. Run the type check yourself: it needs the API types Claude Code writes to `.claude-plugin/types/` once it has loaded the mod, and a `tsconfig.json` of `{ "extends": "./.claude-plugin/types/tsconfig.json" }`. Both are gitignored, so create the `tsconfig.json` in your clone. A release needs all three to pass, the type check with no errors.
+
+Issues and PRs welcome.
 
 ## License
 
