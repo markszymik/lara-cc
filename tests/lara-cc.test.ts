@@ -11,7 +11,7 @@ import { LOG } from './fixtures'
  *
  * `herd`: the binary `herd php` reports; `shellPhp`: what plain `php` reports; `composerShim`: Composer on PATH is
  * a shell script; `files`: extra files in the project and their contents; `env`: the environment `artisan about`
- * reports; `exits`: exit code of spawned processes by command (`pnpm`); `curl`: curl's exit code; `connections`: the
+ * reports (null: it reports none); `exits`: exit code of spawned processes by command (`pnpm`); `curl`: curl's exit code; `connections`: the
  * local servers the app's config names (connectionsPhp); `herdServices`: Herd's services.plist as plutil turns it into JSON; `closed`: ports
  * nothing listens on; `share`: the answer to the "send to Claude?" question (default Send redacted), whose
  * questions land in `asked`; `tests`: what `php artisan test` prints; `debug`: what Herd's debug session hands back;
@@ -23,7 +23,13 @@ import { LOG } from './fixtures'
  * until stopped; `aboutGate`: `artisan about` answers once it resolves, with the env at the time it was asked;
  * `toasts`: the toasts shown; `says`: printed by artisan commands, held processes and a name artisan can't resolve,
  * on top of what they print anyway; `snapshot` as a string: what the queue snapshot prints instead of JSON; `run`: the answer to "Claude wants to run…" (default Run it). `share` or `run` null:
- * nobody is there to answer (`claude -p`), so the question fails.
+ * nobody is there to answer (`claude -p`), so the question fails. `snapshotGate`: the queue snapshot answers once it
+ * resolves, with the snapshot at the time it was asked; `noConnections`: connectionsPhp prints nothing it can read;
+ * `migrateFails`: migrate:status exits 1 printing this; `aboutFails`: `artisan about --json` exits 1 printing this
+ * (a string) or throws it (an Error), once `aboutGate` lets it; `noArtisan`: no `artisan` file, so not a Laravel
+ * project; `failExists`: fs.exists throws for this path; `plistFails`: plutil can't read Herd's services.plist; `migrateGate`: the next
+ * migrate:status answers once it resolves, with the pending count at the time it was asked; `npm`: no pnpm lockfile, so npm.
+ * `curl` as 'missing': curl can't run.
  */
 type Fake = {
   history?: string
@@ -35,9 +41,11 @@ type Fake = {
   spawned?: string[][]
   raw?: string[][]
   files?: Record<string, string>
-  env?: string
+  env?: string | null
+  /** `artisan about` says the app is in maintenance mode (the cache driver's, no down file) */
+  maintenance?: boolean
   exits?: Record<string, number>
-  curl?: number
+  curl?: number | 'missing'
   reads?: string[]
   connections?: { use: string; driver: string; port: number }[]
   herdServices?: unknown[]
@@ -58,6 +66,15 @@ type Fake = {
   hold?: string[]
   aboutGate?: Promise<void>
   toasts?: string[]
+  snapshotGate?: Promise<void>
+  noConnections?: boolean
+  migrateFails?: string
+  aboutFails?: string | Error
+  noArtisan?: boolean
+  failExists?: string
+  plistFails?: boolean
+  migrateGate?: Promise<void>
+  npm?: boolean
 }
 
 const COMPOSER = '/opt/bin/composer'
@@ -116,6 +133,9 @@ const HELP: Record<string, string> = {
   'pulse:restart': 'pulse:restart',
   about: 'about',
   'make:filament-user': 'make:filament-user',
+  up: 'up',
+  'config:clear': 'config:clear',
+  'migrate:status': 'migrate:status',
 }
 
 function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
@@ -128,12 +148,15 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
   mock.env(on, { HOME: '/Users/me' })
   if (fake.herdServices) fake.files = { ...fake.files, [HERD_PLIST]: '<?xml version="1.0"?><plist/>' }
   const clock = mock.clock(on)
-  on('fs.exists', ($, e) => ({
-    value:
-      ['artisan', 'composer.json', 'pnpm-lock.yaml'].some(f => e.path === f || e.path.endsWith('/' + f)) ||
-      [fake.herd, fake.shellPhp ?? '/usr/bin/php', COMPOSER, HERD_CLI].includes(e.path) ||
-      file(e.path) !== undefined,
-  }))
+  on('fs.exists', ($, e) => {
+    if (fake.failExists && (e.path === fake.failExists || e.path.endsWith('/' + fake.failExists))) throw new Error('EIO: ' + e.path)
+    return {
+      value:
+        (fake.noArtisan ? ['composer.json', 'pnpm-lock.yaml'] : ['artisan', 'composer.json', ...(fake.npm ? [] : ['pnpm-lock.yaml'])]).some(f => e.path === f || e.path.endsWith('/' + f)) ||
+        [fake.herd, fake.shellPhp ?? '/usr/bin/php', COMPOSER, HERD_CLI].includes(e.path) ||
+        file(e.path) !== undefined,
+    }
+  })
   on('fs.stat', ($, e) => {
     if (file(e.path) === undefined) throw new Error('ENOENT: ' + e.path)
     return { value: { kind: 'file' as const, size: 1, mtimeMs: 1, isLink: false } as never }
@@ -180,17 +203,30 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
     const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     const missing = { value: { exitCode: 1, stdout: '', stderr: 'not found', isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv[0] === 'tail') return ok(fake.history ?? '')
-    if (argv[0] === 'curl') return { value: { exitCode: fake.curl ?? 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (argv[0] === 'curl') {
+      if (fake.curl === 'missing') throw new Error('spawn curl ENOENT')
+      return { value: { exitCode: fake.curl ?? 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     if (argv[1] === 'artisan' && argv[2] === 'about' && argv.includes('--json')) {
       const env = fake.env ?? 'local'
       await fake.aboutGate
+      if (fake.aboutFails instanceof Error) throw fake.aboutFails
+      if (fake.aboutFails) return { value: { exitCode: 1, stdout: fake.aboutFails, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
       // json_encode escapes slashes, as PHP prints it
-      const about = { environment: { environment: env, laravel_version: '12.33.0', url: 'shop.example.com' }, drivers: { database: 'mysql' }, pulse: { dashboard: 'https://admin.example.com/pulse' } }
+      const about = { environment: { ...(fake.env === null ? {} : { environment: env }), laravel_version: '12.33.0', url: 'shop.example.com', ...(fake.maintenance ? { maintenance_mode: true } : {}) }, drivers: { database: 'mysql' }, pulse: { dashboard: 'https://admin.example.com/pulse' } }
       return ok(JSON.stringify(about).replace(/\//g, '\\/'))
     }
-    if (argv[0] === 'plutil') return argv.at(-1) === HERD_PLIST && fake.herdServices ? ok(JSON.stringify(fake.herdServices)) : missing
+    if (argv[0] === 'plutil') return argv.at(-1) === HERD_PLIST && fake.herdServices && !fake.plistFails ? ok(JSON.stringify(fake.herdServices)) : missing
     // Herd starts the service: its port answers from then on
-    if (argv.includes('migrate:status')) return ok(Array.from({ length: fake.pending ?? 0 }, (_, i) => `2026_01_0${i + 1}_000000_x ..... Pending`).join('\n'))
+    // Not `artisan help migrate:status`, which resolves the name below
+    const migrateStatus = argv.includes('migrate:status') && argv[2] !== 'help'
+    if (migrateStatus && fake.migrateFails) return { value: { exitCode: 1, stdout: fake.migrateFails, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (migrateStatus) {
+      const [pending, gate] = [fake.pending ?? 0, fake.migrateGate]
+      fake.migrateGate = undefined
+      await gate
+      return ok(Array.from({ length: pending }, (_, i) => `2026_01_0${i + 1}_000000_x ..... Pending`).join('\n'))
+    }
     if (argv[0] === 'php' && argv[2] === 'migrate') fake.pending = 0
     if (argv[0] === 'osascript' && argv.join(' ').includes('dumps')) return ok(argv.join(' ').includes('dumps stop debug') ? (fake.debug ?? '{}') : '')
     if (argv[0] === 'php' && argv[1] === 'artisan' && argv[2] === 'test' && fake.tests !== undefined) return { value: { exitCode: 1, stdout: fake.tests, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -209,7 +245,10 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
     if (argv.join(' ') === 'which composer') return ok(COMPOSER)
     if (argv[0] === 'php' && argv[2]?.includes('PHP_BINARY')) return ok(`${fake.shellPhp ?? '/usr/bin/php'}\n8.4.1`)
     if (argv[1] === COMPOSER && argv[2] === '--version') return ok(fake.composerShim ? '#!/usr/bin/env bash\nexec mise x -- composer "$@"' : 'Composer version 2.10.2')
-    if (argv[0] === 'php' && argv[1] === '-r' && argv[2]?.includes("'connections'")) return ok('Deprecated: x\n' + JSON.stringify({ connections: fake.connections ?? [] }))
+    if (argv[0] === 'php' && argv[1] === '-r' && argv[2]?.includes("'connections'")) {
+      if (fake.noConnections) return missing
+      return ok('Deprecated: x\n' + JSON.stringify({ connections: fake.connections ?? [] }))
+    }
     if (argv[0] === 'php' && argv[1] === '-r' && argv[2]?.includes("'onDomain'")) {
       if (fake.routesFail) return { value: { exitCode: 1, stdout: fake.routesFail, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
       return ok('Deprecated: x\n' + JSON.stringify({ routes: TAB_ROUTES, editor: fake.editor ?? null }))
@@ -222,7 +261,11 @@ function fakeProject(on: On, ran: string[][], fake: Fake = {}) {
     if (argv.join(' ') === 'uname -s') return ok('Darwin\n')
     // An editor whose link macOS can't open (not installed)
     if (argv[0] === 'open' && fake.noEditor && argv[1]?.includes('://')) return missing
-    if (argv[0] === 'php' && argv[1] === '-r') return ok(typeof fake.snapshot === 'string' ? fake.snapshot : fake.snapshot ? JSON.stringify(fake.snapshot) : 'no snapshot')
+    if (argv[0] === 'php' && argv[1] === '-r') {
+      const snapshot = fake.snapshot
+      await fake.snapshotGate
+      return ok(typeof snapshot === 'string' ? snapshot : snapshot ? JSON.stringify(snapshot) : 'no snapshot')
+    }
     // `artisan help <name>` resolves abbreviations and case the way Symfony does
     if (argv[2] === 'help') {
       const name = HELP[argv[3]!.toLowerCase()]
@@ -346,7 +389,7 @@ test('/lara-schedule reports the scheduler', async ($, on) => {
   await start($)
 
   const answer = await slash($, 'lara-schedule', '', TYPED)
-  expect(answer.text).toBe('Scheduler is stopped.')
+  expect(answer.text).toBe("Scheduler is not running in this session; lara-cc can't see one run elsewhere.")
 })
 
 test('the logs tool returns errors from the history and the live tail, with origin', async ($, on) => {
@@ -748,8 +791,9 @@ test('config:show and db:show are shown to the person in the pane, never to Clau
 
 test('a stopped Herd service starts from its button on the Services tab, with values passed as arguments', async ($, on) => {
   const ran: string[][] = []
+  const toasts: string[] = []
   const connections = [{ use: 'database', driver: 'mysql', port: 3306 }]
-  const clock = fakeProject(on, ran, { connections, herdServices: [MYSQL], closed: [3306] })
+  const clock = fakeProject(on, ran, { connections, herdServices: [MYSQL], closed: [3306], toasts })
   on('ui.open', placed)
   await start($)
   await clock.settle()
@@ -771,6 +815,8 @@ test('a stopped Herd service starts from its button on the Services tab, with va
   // The script text is fixed: nothing from the plist is written into it
   expect(osascript.filter((_, i) => osascript[i - 1] === '-e').join('\n')).not.toContain('mysql')
   expect(await drawBand($)).not.toContain('stopped')
+  // What lara-cc saw: the port answers, not that it's Herd's MySQL
+  expect(toasts).toContain('Herd MySQL started: port 3306 answers')
 })
 
 for (const nc of ['missing', 2] as const) {
@@ -785,6 +831,7 @@ for (const nc of ['missing', 2] as const) {
 
     const band = await drawBand($)
     expect(band).toContain('Herd MySQL unchecked')
+    expect(band).toContain('? Herd MySQL unchecked')
     expect(band).not.toContain('stopped')
     // Redis isn't used, so it isn't flagged either way
     expect(band).not.toContain('Redis')
@@ -820,6 +867,7 @@ test('moving to another folder leaves nothing of the last: Horizon, its worker a
   expect(JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'status' }))).toContain('Horizon')
   expect(JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__logs' }))).toContain('Call to undefined method')
   expect(await drawBand($)).toContain('env: production')
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__health' }))).toContain('env: production')
 
   // A plain Laravel app, without Horizon
   Object.assign(fake, { dir: '/other', history: '', env: 'local', files: {} })
@@ -835,6 +883,9 @@ test('moving to another folder leaves nothing of the last: Horizon, its worker a
   expect(output).not.toContain('■')
   expect(JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__logs' }))).not.toContain('Call to undefined method')
   expect(await drawBand($)).not.toContain('env: production')
+  const health = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__health' }))
+  expect(health).not.toContain('env: production')
+  expect(health).not.toContain('Horizon')
 
   await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
   await clock.settle()
@@ -887,8 +938,8 @@ test('a session that starts again in the same folder keeps its worker, its outpu
 })
 
 /** Secrets of several kinds, and the parts of them that must never reach Claude. */
-const LEAKY = 'password=hunter2 Authorization: Bearer abcdef123456 mysql://forge:s3cr3t@db.internal:3306 sk_live_51HxYzAbCdEfGhIjKl'
-const LEAKED = ['hunter2', 'abcdef123456', 's3cr3t', 'forge', '51HxYzAbCdEfGh']
+const LEAKY = 'password=hunter2 Authorization: Bearer abcdef123456 mysql://forge:s3cr3t@db.internal:3306 sk_live_51HxYzAbCdEfGhIjKl (Host: db.internal) Unable to connect to db.internal:6379 FATAL:  no pg_hba.conf entry for host "10.0.0.5", user "forge"'
+const LEAKED = ['hunter2', 'abcdef123456', 's3cr3t', 'forge', '51HxYzAbCdEfGh', 'db.internal', '10.0.0.5']
 
 test('representative secrets reach Claude through no lara-cc route: tools, commands and ask Claude buttons', async ($, on) => {
   const ran: string[][] = []
@@ -896,7 +947,8 @@ test('representative secrets reach Claude through no lara-cc route: tools, comma
   const history = `[2026-10-11 09:00:00] local.ERROR: Login failed ${LEAKY} {"exception":"x"}\n`
   const exception = `RuntimeException: ${LEAKY} in /app/app/Jobs/Charge.php:12\n#0 /app/app/Jobs/Charge.php(3): App\\Jobs\\Charge->pay('hunter2')`
   const snapshot = { connection: 'redis', sizes: { default: 0 }, failedTotal: 1, failed: [{ id: 'f-1', queue: 'default', job: 'App\\Jobs\\Charge', failedAt: '2026-10-11 09:00:01', exception }] }
-  const clock = fakeProject(on, ran, { history, snapshot, hold: ['queue:work'], says: LEAKY, tests: FAILING.replace('jane@example.com', LEAKY) })
+  const fake: Fake = { history, snapshot, hold: ['queue:work'], says: LEAKY, tests: FAILING.replace('jane@example.com', LEAKY) }
+  const clock = fakeProject(on, ran, fake)
   on('ui.open', placed)
   on('prompt.submit', ($, e) => {
     sent.push(e.text)
@@ -914,10 +966,21 @@ test('representative secrets reach Claude through no lara-cc route: tools, comma
     "artisan tool, a name artisan can't resolve": await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'nosuch:thing' }),
     '/lara-artisan output': await slash($, 'lara-artisan', 'make:model Post', TYPED),
     '/lara-test': await slash($, 'lara-test', ''),
+    'health tool': await $.tool.call({ tool: 'mcp__lara-cc__health' }),
   }
   await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
   await clock.settle()
   outputs['service tool, logs'] = await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'logs' })
+
+  // Where hosts could slip through: artisan about, migrate:status and the queue read failing with them in the message
+  Object.assign(fake, {
+    aboutFails: `SQLSTATE[HY000] [2002] Connection refused ${LEAKY}`,
+    migrateFails: `Illuminate\\Database\\QueryException SQLSTATE[HY000] [2002] Connection refused ${LEAKY}`,
+    snapshot: `PDOException: could not connect to ${LEAKY}`,
+  })
+  await clock.advance(60_000)
+  outputs['health tool, failing reads'] = await $.tool.call({ tool: 'mcp__lara-cc__health' })
+  outputs['service tool, queue status after a failed read'] = await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'status' })
 
   // The ask Claude buttons send the person's message: the log error, the failed job, the failing test
   const pane = await mountPane($)
@@ -938,6 +1001,8 @@ test('representative secrets reach Claude through no lara-cc route: tools, comma
   // Still what Claude needs: the error and where
   expect(JSON.stringify(outputs['logs tool'])).toContain('Login failed')
   expect(JSON.stringify(outputs['queue tool, failed'])).toContain('RuntimeException')
+  expect(JSON.stringify(outputs['health tool, failing reads'])).toContain('SQLSTATE[HY000] [2002]')
+  expect(JSON.stringify(outputs['health tool, failing reads'])).toContain('PDOException')
 })
 
 test("the queue state's error reaches Claude redacted", async ($, on) => {
@@ -948,6 +1013,10 @@ test("the queue state's error reaches Claude redacted", async ($, on) => {
   const status = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'status' }))
   expect(status).toContain('PDOException')
   for (const secret of LEAKED) expect(status).not.toContain(secret)
+  expect(status).not.toContain('db.internal')
+  const health = JSON.stringify(await $.tool.call({ tool: 'mcp__lara-cc__health' }))
+  expect(health).toContain('PDOException')
+  for (const secret of LEAKED) expect(health).not.toContain(secret)
 })
 
 test('with nobody to answer (claude -p), logs, failed jobs and Boost logs are not sent', async ($, on) => {
@@ -1202,14 +1271,15 @@ test('jobs waiting with no worker show in the band with a start button; a draini
   await clock.settle()
 
   const band = await mountBand($)
-  expect(JSON.stringify(await band.drawn())).toContain('3 jobs waiting, no worker')
+  expect(JSON.stringify(await band.drawn())).toContain('? 3 jobs waiting, no worker in this session')
   await band.press({ key: 'fix-start worker' })
   await clock.settle()
   expect(spawned.some(argv => argv.includes('queue:work'))).toBe(true)
   await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'stop' })
 
-  // A worker elsewhere drains it: fewer than last time
+  // A worker elsewhere drains it: fewer than a minute ago (the read before moves once a minute tick)
   fake.snapshot = { ...snapshot, sizes: { default: 1, emails: 0 } }
+  await clock.advance(60_000)
   await slash($, 'lara-queue', 'status')
   await clock.settle()
   expect(JSON.stringify(await band.drawn())).not.toContain('waiting, no worker')
@@ -1486,4 +1556,690 @@ test("an editor link that doesn't open falls back to the plain file", async ($, 
     'phpstorm://open?file=/app/app/Http/Controllers/UserController.php&line=12',
     '/app/app/Http/Controllers/UserController.php',
   ])
+})
+
+/** What Claude's health tool answers, as the model reads it. */
+async function callHealth($: Engine): Promise<string> {
+  const answer = (await $.tool.call({ tool: 'mcp__lara-cc__health' } as never)) as { result?: unknown }
+  return String(answer.result)
+}
+
+/** A tool's answer as the model reads it. */
+const resultOf = (answer: unknown) => String((answer as { result?: unknown }).result)
+
+test('the health tool sorts what lara-cc saw, inferred and could not tell, and its next steps match what the tools then do', async ($, on) => {
+  const ran: string[][] = []
+  const spawned: string[][] = []
+  const asked: string[] = []
+  const files = { 'storage/framework/down': '{}', 'bootstrap/cache/config.php': '<?php', 'public/hot': 'http://[::1]:5173' }
+  const snapshot = { connection: 'database', sizes: { default: 3 }, failedTotal: 0, failed: [] }
+  const connections = [{ use: 'database', driver: 'mysql', port: 3306 }]
+  const clock = fakeProject(on, ran, { files, curl: 7, snapshot, connections, herdServices: [MYSQL], nc: 2, asked, spawned, run: "Don't run" })
+  await start($)
+  await clock.settle()
+
+  const [ranBefore, spawnedBefore] = [ran.length, spawned.length]
+  const health = await callHealth($)
+  expect(health.indexOf('Problems:')).toBeGreaterThan(-1)
+  expect(health.indexOf('Unknown:')).toBeGreaterThan(health.indexOf('Problems:'))
+  expect(health.indexOf('Fine:')).toBeGreaterThan(health.indexOf('Unknown:'))
+  for (const part of [
+    '- [seen] maintenance mode: storage/framework/down exists',
+    `next: artisan tool: "up" (asks the user first) · the user's button "up"`,
+    '- [seen] config cached: bootstrap/cache/config.php exists',
+    'artisan tool: "config:clear" (runs without asking)',
+    '- [seen] Vite not running (public/hot): public/hot names port 5173 on this machine, and nothing accepts connections there (curl exit 7)',
+    'service tool: vite start (runs without asking)',
+    '- [inferred] 3 jobs waiting, no worker in this session:',
+    'service tool: queue start (asks the user first)',
+    "- [unknown] Herd MySQL unchecked: nc couldn't probe localhost:3306",
+    'Not listed means not checked, not fine',
+    'Never checked:',
+  ]) {
+    expect(health).toContain(part)
+  }
+  // The queue's counts go with the backlog problem, so they aren't listed as fine
+  expect(health.indexOf('Queue: database connection')).toBeGreaterThan(health.indexOf('This session:'))
+  // Read-only: no fix ran
+  expect(ran.slice(ranBefore).some(argv => argv[0] === 'osascript' || argv.includes('up') || argv.includes('config:clear'))).toBe(false)
+  expect(spawned.slice(spawnedBefore).some(argv => argv.includes('dev'))).toBe(false)
+
+  // Each step does what its tag said
+  let questions = asked.length
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'config:clear' })
+  expect(asked.length).toBe(questions)
+  expect(ran).toContainEqual(['php', 'artisan', 'config:clear', '--no-interaction'])
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'up' })
+  expect(asked.length).toBe(questions + 1)
+  expect(asked.at(-1)!.startsWith('Claude (or a command')).toBe(true)
+  expect(ran.some(argv => argv.join(' ') === 'php artisan up --no-interaction')).toBe(false)
+  questions = asked.length
+  await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'vite', action: 'start' })
+  expect(asked.length).toBe(questions)
+  await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'start' })
+  expect(asked.length).toBe(questions + 1)
+})
+
+test('the health tool reads the queue and migrate:status again on every call, after any read already running', async ($, on) => {
+  const ran: string[][] = []
+  const fake: Fake = { pending: 2, snapshot: { connection: 'database', sizes: { default: 0 }, failedTotal: 0, failed: [] } }
+  const clock = fakeProject(on, ran, fake)
+  await start($)
+  await clock.settle()
+  const migrateRuns = () => ran.filter(argv => argv.includes('migrate:status')).length
+  const queueReads = () => ran.filter(argv => argv[1] === '-r' && argv[2]?.includes('queue.failer')).length
+
+  const [migrations, reads] = [migrateRuns(), queueReads()]
+  const health = await callHealth($)
+  expect(migrateRuns()).toBe(migrations + 1)
+  expect(queueReads()).toBe(reads + 1)
+  expect(health).toContain('- [seen] 2 pending migrations (migrate:status, ')
+  expect(health).toContain(`artisan tool: "migrate" (asks the user first) · the user's button "migrate"`)
+
+  // A read already running started before the call: health waits for it, then reads again
+  let release = () => {}
+  fake.snapshotGate = new Promise<void>(resolve => (release = resolve))
+  void slash($, 'lara-queue', 'status')
+  await clock.settle()
+  fake.snapshot = { connection: 'database', sizes: { default: 0 }, failedTotal: 2, failed: [] }
+  const later = callHealth($)
+  await clock.settle()
+  release()
+  expect(await later).toContain('- [seen] 2 failed jobs stored')
+})
+
+test('before anything is read, the health tool says unknown rather than fine', async ($, on) => {
+  const ran: string[][] = []
+  let answer = () => {}
+  const clock = fakeProject(on, ran, { herdServices: [MYSQL], aboutGate: new Promise<void>(resolve => (answer = resolve)) })
+  on('ui.open', placed)
+  await start($)
+  await clock.settle()
+
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-services' })
+  expect(JSON.stringify(await pane.drawn())).toContain('checks not run yet')
+
+  const health = await callHealth($)
+  for (const part of [
+    "- [unknown] APP_ENV: artisan about hasn't answered yet, so production isn't ruled out",
+    '- [unknown] Which servers the app uses:',
+    '- [unknown] Tests: none run this session',
+    'ago failed (no reason given), so waiting and failed jobs are unknown',
+    "- [inferred] no storage/framework/down; maintenance through the cache driver needs artisan about, which hasn't answered",
+  ]) {
+    expect(health).toContain(part)
+  }
+  expect(health).not.toContain('APP_ENV is')
+
+  // The Services tab says what went unchecked, rather than "nothing found"
+  const drawn = JSON.stringify(await pane.drawn())
+  expect(drawn).toContain('checks ran')
+  expect(drawn).toContain('not checked:')
+  expect(drawn).toContain("Herd (the app's servers unknown)")
+  expect(drawn).not.toContain('nothing found')
+  answer()
+  await clock.settle()
+})
+
+test('checks that stop finishing show as stale in the band and on the Services tab; recheck runs them again', async ($, on) => {
+  const ran: string[][] = []
+  const fake: Fake = { files: { 'bootstrap/cache/config.php': '<?php' } }
+  const clock = fakeProject(on, ran, fake)
+  on('ui.open', placed)
+  await start($)
+  await clock.settle()
+  expect(await drawBand($)).not.toContain('checks stale')
+
+  // artisan about hangs, so the minute's checks never run
+  let release = () => {}
+  fake.aboutGate = new Promise<void>(resolve => (release = resolve))
+  await clock.advance(181_000)
+  expect(await drawBand($)).toContain('? checks stale')
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-services' })
+  expect(JSON.stringify(await pane.drawn())).toContain('checks stale, last finished')
+
+  // A re-check that fails keeps the old results, marked stale, and lists nothing they cover as fine
+  fake.failExists = 'storage/framework/down'
+  const health = await callHealth($)
+  expect(health).toContain("the checks' last run failed")
+  expect(health.indexOf('- [seen] config cached:')).toBeGreaterThan(health.indexOf('Stale:'))
+  expect(health).not.toContain('not in maintenance mode')
+
+  fake.failExists = undefined
+  const band = await mountBand($)
+  await band.press({ key: 'fix-recheck' })
+  await clock.settle()
+  expect(JSON.stringify(await band.drawn())).not.toContain('checks stale')
+  release()
+  await clock.settle()
+})
+
+for (const code of [28, 6]) {
+  test(`a public/hot whose server gives no web reply (curl exit ${code}) reads as Vite unchecked, never gone or fine`, async ($, on) => {
+    const ran: string[][] = []
+    const clock = fakeProject(on, ran, { files: { 'public/hot': 'https://shop.test:5173' }, curl: code })
+    on('ui.open', placed)
+    await start($)
+    await clock.settle()
+
+    const band = await drawBand($)
+    expect(band).toContain('? Vite unchecked (public/hot)')
+    expect(band).not.toContain('Vite not running')
+    const health = await callHealth($)
+    expect(health).toContain(`- [unknown] Vite unchecked (public/hot): public/hot names port 5173 on this machine; curl exit ${code}`)
+    expect(health).not.toContain('shop.test')
+    const pane = await mountPane($)
+    await pane.press({ key: 'tab-services' })
+    expect(JSON.stringify(await pane.drawn())).toContain('? public/hot points pages at a dev server on port 5173')
+  })
+}
+
+test('a Herd port that answers is a listener, not proof of the service', async ($, on) => {
+  const ran: string[][] = []
+  const connections = [
+    { use: 'database', driver: 'mysql', port: 3306 },
+    { use: 'cache', driver: 'redis', port: 6380 },
+  ]
+  const clock = fakeProject(on, ran, { connections, herdServices: [MYSQL, REDIS] })
+  on('ui.open', placed)
+  await start($)
+  await clock.settle()
+
+  const health = await callHealth($)
+  expect(health).toContain("- [inferred] localhost:3306 accepts connections, where Herd's MySQL 8.4.11 is set up and the app's database uses mysql (a listener, not proof it's Herd's MySQL)")
+  expect(health).toContain('local servers on ports no Herd service has')
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-services' })
+  expect(JSON.stringify(await pane.drawn())).toContain('Herd services (port check)')
+})
+
+test('a migration count whose re-check fails stays, dated and stale', async ($, on) => {
+  const ran: string[][] = []
+  const fake: Fake = { pending: 2 }
+  const clock = fakeProject(on, ran, fake)
+  await start($)
+  await clock.settle()
+
+  fake.migrateFails = `SQLSTATE[HY000] [2002] Connection refused (Connection: mysql, Host: db.internal) ${LEAKY}`
+  const health = await callHealth($)
+  expect(health).toContain('Stale:')
+  expect(health).toContain('2 pending migrations (migrate:status, ')
+  expect(health).toContain('stale: migrate:status has failed since (SQLSTATE[HY000] [2002])')
+  for (const secret of LEAKED) expect(health).not.toContain(secret)
+  expect(await drawBand($)).toContain('2 pending migrations (last check failed)')
+})
+
+test('a migrate:status that never worked reads as unknown, in the health tool and on the Services tab', async ($, on) => {
+  const ran: string[][] = []
+  const clock = fakeProject(on, ran, { pending: 2, migrateFails: 'SQLSTATE[HY000] [2002] Connection refused (Connection: mysql, Host: db.internal)' })
+  on('ui.open', placed)
+  await start($)
+  await clock.settle()
+
+  const health = await callHealth($)
+  expect(health).toContain('- [unknown] Migrations: migrate:status failed (SQLSTATE[HY000] [2002]); maybe there is no database yet, or it is not reachable')
+  expect(health).toContain('artisan tool: "migrate:status" (runs without asking)')
+  expect(health).not.toContain('db.internal')
+  expect(await drawBand($)).not.toContain('migration')
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-services' })
+  expect(JSON.stringify(await pane.drawn())).toContain('migrations (migrate:status failed)')
+})
+
+test("tests from before Claude's PHP edits read as stale, never as passing", async ($, on) => {
+  const ran: string[][] = []
+  const fake: Fake = { hold: ['dev'] }
+  const clock = fakeProject(on, ran, fake)
+  let bashGate: Promise<void> | undefined
+  on('tool.call', { tool: 'Bash' }, async () => {
+    await bashGate
+    return { result: { stdout: 'OK (12 tests, 30 assertions)', stderr: '', interrupted: false } } as never
+  })
+  on('tool.call', { tool: 'Edit' }, () => ({ result: 'ok' }) as never)
+  on('ui.open', placed)
+  await start($)
+  await clock.settle()
+  // Something running, so the band has a passing run to draw beside it
+  await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'vite', action: 'start' })
+  await clock.settle()
+
+  await $.tool.call({ tool: 'Bash', command: 'vendor/bin/phpunit' } as never)
+  expect(await drawBand($)).toContain('✓ 12 tests')
+
+  await $.tool.call({ tool: 'Edit', file_path: '/app/app/Models/User.php' } as never)
+  expect(await drawBand($)).not.toContain('✓ 12 tests')
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-tests' })
+  expect(JSON.stringify(await pane.drawn())).toContain('Claude edited PHP files since this run; not re-run')
+  const health = await callHealth($)
+  expect(health).toContain('Tests: 12 passed in the last run')
+  expect(health).toContain('stale: Claude edited PHP files since')
+  expect(health.indexOf('Tests: 12 passed')).toBeGreaterThan(health.indexOf('Stale:'))
+
+  // An edit while the run is still going counts too: the run started before it
+  let release = () => {}
+  bashGate = new Promise<void>(resolve => (release = resolve))
+  const run = $.tool.call({ tool: 'Bash', command: 'vendor/bin/phpunit' } as never)
+  await clock.settle()
+  await $.tool.call({ tool: 'Edit', file_path: '/app/app/Models/Order.php' } as never)
+  release()
+  await run
+  expect(await drawBand($)).not.toContain('✓ 12 tests')
+
+  // A failing run from before an edit is yellow, not red
+  fake.tests = FAILING
+  await slash($, 'lara-test', '')
+  await $.tool.call({ tool: 'Edit', file_path: '/app/app/Models/User.php' } as never)
+  expect(await drawBand($)).toContain('✗ 1 test failed, edited since')
+})
+
+for (const env of ['local', 'production']) {
+  test(`after artisan about fails, APP_ENV (${env}) is stale and the question says so, without the host`, async ($, on) => {
+    const ran: string[][] = []
+    const asked: string[] = []
+    const fake: Fake = { env, asked, run: "Don't run" }
+    const clock = fakeProject(on, ran, fake)
+    await start($)
+    await clock.settle()
+
+    fake.aboutFails = 'SQLSTATE[HY000] [2002] Connection refused (Connection: mysql, Host: db.internal)'
+    await clock.advance(60_000)
+    const health = await callHealth($)
+    // production is reported once, by its own finding; other environments by the APP_ENV line
+    if (env !== 'production') {
+      expect(health).toContain(`- [seen] APP_ENV was ${env} at the artisan about`)
+      expect(health).toContain('stale: artisan about has failed since (SQLSTATE[HY000] [2002])')
+    }
+    expect(health).toContain('- [inferred] no storage/framework/down; maintenance through the cache driver needs artisan about, which failed')
+    expect(health).not.toContain('db.internal')
+    if (env === 'production') {
+      // Read from about alone, so it's as stale as about
+      expect(health.indexOf('- [seen] env: production')).toBeGreaterThan(health.indexOf('Stale:'))
+      expect(health).toContain('artisan about says APP_ENV is production; read ')
+      expect(health).toContain('and artisan about has failed since (SQLSTATE[HY000] [2002])')
+      expect(health).not.toContain('Problems:')
+      expect(health.match(/APP_ENV (?:is|was) production/g)).toHaveLength(1)
+    }
+    await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'migrate' })
+    expect(asked.at(-1)).toContain('artisan about has failed since')
+  })
+}
+
+test('a maintenance finding that comes from artisan about says so when about has failed since', async ($, on) => {
+  const ran: string[][] = []
+  const fake: Fake = { maintenance: true }
+  const clock = fakeProject(on, ran, fake)
+  await start($)
+  await clock.settle()
+
+  fake.aboutFails = 'SQLSTATE[HY000] [2002] Connection refused (Connection: mysql, Host: db.internal)'
+  await clock.advance(60_000)
+  const health = await callHealth($)
+  expect(health).toContain('artisan about reports maintenance mode (cache driver); read ')
+  expect(health).toContain('and artisan about has failed since (SQLSTATE[HY000] [2002])')
+  expect(health.indexOf('maintenance mode:')).toBeGreaterThan(health.indexOf('Stale:'))
+  expect(health).not.toContain('db.internal')
+})
+
+test('an artisan about that times out keeps what it last said, marked stale', async ($, on) => {
+  const ran: string[][] = []
+  const fake: Fake = { env: 'production' }
+  const clock = fakeProject(on, ran, fake)
+  await start($)
+  await clock.settle()
+
+  fake.aboutFails = new Error('timed out after 60000ms')
+  await clock.advance(60_000)
+  const health = await callHealth($)
+  expect(health).toContain('artisan about says APP_ENV is production; read ')
+  expect(health).toContain("and artisan about has failed since (it timed out or couldn't run)")
+  expect(health).not.toContain('APP_ENV was production')
+  expect(await drawBand($)).toContain('env: production')
+})
+
+test("the question says it couldn't read the app's servers, not that it found none", async ($, on) => {
+  const ran: string[][] = []
+  const asked: string[] = []
+  const clock = fakeProject(on, ran, { noConnections: true, asked, run: "Don't run" })
+  await start($)
+  await clock.settle()
+
+  await $.tool.call({ tool: 'mcp__lara-cc__artisan', command: 'migrate' })
+  expect(asked.at(-1)).toContain("couldn't read which servers it connects to")
+  expect(asked.at(-1)).not.toContain('found none')
+})
+
+test('a worker not started here is never a stopped queue; a draining queue says so, however often it is read', async ($, on) => {
+  const ran: string[][] = []
+  const snapshot = { connection: 'database', sizes: { default: 3 }, failedTotal: 0, failed: [] }
+  const fake: Fake = { snapshot }
+  const clock = fakeProject(on, ran, fake)
+  on('ui.open', placed)
+  await start($)
+  await clock.settle()
+
+  const queueStatus = async () => resultOf(await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'status' }))
+  expect(await queueStatus()).toContain("not started by this session; lara-cc can't see a worker run elsewhere")
+  const status = resultOf(await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'status' }))
+  expect(status).toContain("Queue worker is not running in this session; lara-cc can't see one run elsewhere.\n")
+  const stop = resultOf(await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'stop' }))
+  expect(stop).toContain('in this session')
+  expect(stop).not.toContain('started')
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-services' })
+  expect(JSON.stringify(await pane.drawn())).toContain('not started')
+  // Left on the Queue tab, which reads the queue every 15 seconds
+  await pane.press({ key: 'tab-queue' })
+  expect(JSON.stringify(await pane.drawn())).toContain('Queue worker: not running in this session')
+
+  // A worker elsewhere drains it: fewer jobs than a minute ago, however many reads come after
+  fake.snapshot = { ...snapshot, sizes: { default: 1 } }
+  await clock.advance(60_000)
+  await slash($, 'lara-queue', 'status')
+  expect(await queueStatus()).toContain('Jobs waiting went from 3 to 1')
+  for (const _ of [1, 2]) expect(await callHealth($)).toContain('- [inferred] Fewer jobs wait than at the read before (3 → 1)')
+  expect(await drawBand($)).not.toContain('waiting')
+})
+
+test('a failed queue re-read marks the old failed-job count stale', async ($, on) => {
+  const ran: string[][] = []
+  const fake: Fake = { snapshot: { connection: 'database', sizes: { default: 0 }, failedTotal: 1, failed: [] } }
+  const clock = fakeProject(on, ran, fake)
+  await start($)
+  await clock.settle()
+  expect(await drawBand($)).toContain('1 failed job')
+
+  fake.snapshot = `PDOException: could not connect to ${LEAKY}`
+  await slash($, 'lara-queue', 'status')
+  await clock.settle()
+  expect(await drawBand($)).toContain('1 failed job (last read failed)')
+  const health = await callHealth($)
+  expect(health).toContain('Stale:')
+  expect(health).toContain('1 failed job stored')
+  expect(health).toContain('failed (PDOException)')
+  for (const secret of LEAKED) expect(health).not.toContain(secret)
+  const status = resultOf(await $.tool.call({ tool: 'mcp__lara-cc__service', name: 'queue', action: 'status' }))
+  expect(status).toContain('last queue read failed')
+  for (const secret of LEAKED) expect(status).not.toContain(secret)
+})
+
+test('a queue read that counted the jobs but not the failed ones keeps the backlog, and says the failed jobs are unknown', async ($, on) => {
+  const ran: string[][] = []
+  const error = `SQLSTATE[42S02]: Base table or view not found: 1146 Table 'shop.failed_jobs' doesn't exist (Connection: mysql, Host: db.internal)`
+  const snapshot = { connection: 'database', sizes: { default: 2 }, failedTotal: 0, failed: [], error, errorKind: 'QueryException', partial: true }
+  const clock = fakeProject(on, ran, { snapshot })
+  await start($)
+  await clock.settle()
+
+  const band = await drawBand($)
+  expect(band).toContain('? 2 jobs waiting, no worker in this session')
+  expect(band).not.toContain('last read failed')
+  expect(band).toContain('? failed jobs unknown')
+  const health = await callHealth($)
+  expect(health).toContain("- [seen] Queue: database connection, 2 waiting (default: 2) (read ")
+  expect(health).toContain("ago couldn't count the failed jobs (QueryException)")
+  expect(health).not.toContain('db.internal')
+  expect(resultOf(await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'status' }))).toContain('Failed jobs stored: unknown')
+})
+
+test('health without a Laravel project says so', async ($, on) => {
+  const ran: string[][] = []
+  fakeProject(on, ran, { noArtisan: true })
+  await start($)
+
+  expect(await callHealth($)).toBe('No `artisan` file in this directory, so this does not look like a Laravel project. Start Claude Code from the project root.')
+})
+
+test('a narrow band folds unchecked and inferred findings under ?, never ⚠', async ($, on) => {
+  const ran: string[][] = []
+  const connections = [{ use: 'database', driver: 'mysql', port: 3306 }]
+  const snapshot = { connection: 'database', sizes: { default: 3 }, failedTotal: 0, failed: [] }
+  const clock = fakeProject(on, ran, { connections, herdServices: [MYSQL], nc: 2, snapshot })
+  await start($)
+  await clock.settle()
+
+  const narrow = JSON.stringify(await (await mountBand($, 34)).drawn())
+  expect(narrow).toContain('? 2 unchecked')
+  expect(narrow).not.toContain('⚠')
+})
+
+test('a lockfile lara-cc cannot read is said as unchecked, never as matching, and is read again', async ($, on) => {
+  const ran: string[][] = []
+  const reads: string[] = []
+  const files = { 'composer.lock': '{ not json', 'vendor/composer/installed.json': JSON.stringify({ packages: [] }) }
+  const clock = fakeProject(on, ran, { files, reads })
+  on('ui.open', placed)
+  await start($)
+  await clock.settle()
+
+  const lockReads = () => reads.filter(path => path.endsWith('composer.lock')).length
+  const before = lockReads()
+  const health = await callHealth($)
+  expect(health).toContain("- [unknown] composer drift: couldn't read composer.lock or installed.json")
+  expect(health).not.toContain('matches composer.lock')
+  // Nothing changed on disk, yet it's read again rather than cached as fine
+  expect(lockReads()).toBeGreaterThan(before)
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-services' })
+  expect(JSON.stringify(await pane.drawn())).toContain('composer drift (files unreadable)')
+})
+
+test('the failed action never gives a partial or failed queue read as zero failed jobs, nor an older read as current', async ($, on) => {
+  const ran: string[][] = []
+  const error = `SQLSTATE[42S02]: Base table or view not found: 1146 Table 'shop.failed_jobs' doesn't exist (Connection: mysql, Host: db.internal)`
+  const partial = { connection: 'database', sizes: { default: 2 }, failedTotal: 0, failed: [], error, errorKind: 'QueryException', partial: true }
+  const fake: Fake = { snapshot: partial }
+  const clock = fakeProject(on, ran, fake)
+  await start($)
+  await clock.settle()
+
+  const failed = async () => [resultOf(await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'failed' })), (await slash($, 'lara-queue', 'failed')).text]
+  for (const text of await failed()) {
+    expect(text).toContain("The queue read couldn't count the failed jobs (QueryException)")
+    expect(text).not.toContain('0 failed jobs')
+    expect(text).not.toContain('No failed jobs')
+    expect(text).not.toContain('db.internal')
+  }
+
+  // A good read with a failed job, then a read that fails: the older list is not given as current
+  fake.snapshot = { connection: 'database', sizes: { default: 0 }, failedTotal: 1, failed: [{ id: 'old-1', queue: 'default', job: 'App\\Jobs\\Charge', failedAt: 'x', exception: 'RuntimeException: boom' }] }
+  expect((await failed())[0]).toContain('old-1')
+  fake.snapshot = `PDOException: could not connect to ${LEAKY}`
+  for (const text of await failed()) {
+    expect(text).toContain('The queue read failed (PDOException)')
+    expect(text).not.toContain('old-1')
+    for (const secret of LEAKED) expect(text).not.toContain(secret)
+  }
+})
+
+test('a failed-job count whose re-read could not count them stays, dim, and the Services tab and the health tool both say so', async ($, on) => {
+  const ran: string[][] = []
+  const error = `SQLSTATE[42S02]: Base table or view not found: 1146 Table 'shop.failed_jobs' doesn't exist (Connection: mysql, Host: db.internal)`
+  const fake: Fake = { snapshot: { connection: 'database', sizes: { default: 0 }, failedTotal: 3, failed: [] } }
+  const clock = fakeProject(on, ran, fake)
+  on('ui.open', placed)
+  await start($)
+  await clock.settle()
+  expect(await drawBand($)).toContain('3 failed jobs')
+  expect(await drawBand($)).not.toContain('last read failed')
+
+  // Sizes counted, failed jobs not: the PHP default of 0 is not a count
+  fake.snapshot = { connection: 'database', sizes: { default: 0 }, failedTotal: 0, failed: [], error, errorKind: 'QueryException', partial: true }
+  await slash($, 'lara-queue', 'status')
+  await clock.settle()
+  expect(await drawBand($)).toContain('3 failed jobs (last read failed)')
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-services' })
+  expect(JSON.stringify(await pane.drawn())).toContain("failed jobs (couldn't count)")
+  let health = await callHealth($)
+  expect(health.indexOf('3 failed jobs stored')).toBeGreaterThan(health.indexOf('Stale:'))
+  expect(health).toContain("- [unknown] Queue: the read ")
+  expect(health).toContain("ago couldn't count the failed jobs (QueryException)")
+  expect(health).not.toContain('db.internal')
+
+  // A read that fails outright, after one that found no failed jobs: unknown, not none
+  fake.snapshot = { connection: 'database', sizes: { default: 0 }, failedTotal: 0, failed: [] }
+  await slash($, 'lara-queue', 'status')
+  await clock.settle()
+  expect(await drawBand($)).not.toContain('failed jobs unknown')
+  fake.snapshot = `PDOException: could not connect to ${LEAKY}`
+  await slash($, 'lara-queue', 'status')
+  await clock.settle()
+  expect(await drawBand($)).toContain('? failed jobs unknown')
+  await pane.press({ key: 'tab-services' })
+  expect(JSON.stringify(await pane.drawn())).toContain('queue (last read failed)')
+  health = await callHealth($)
+  expect(health).toContain('- [unknown] Queue: the read ')
+  expect(health).toContain('failed (PDOException), so waiting and failed jobs are unknown')
+  expect(health).not.toContain('earlier read')
+  for (const secret of LEAKED) expect(health).not.toContain(secret)
+})
+
+test('a queue read with no usable error kind says so, rather than passing the message or an anonymous class name on', async ($, on) => {
+  const ran: string[][] = []
+  const base = { connection: 'database', sizes: { default: 2 }, failedTotal: 0, failed: [], partial: true }
+  const reads = [
+    { ...base, error: 'Connection refused [tcp://db.internal:6379]' },
+    // What PHP's getShortName() gives for an anonymous class: its file's path
+    { ...base, error: 'boom', errorKind: 'RuntimeException@anonymous\u0000/Users/me/acme-secret-dir/a.php:2$0' },
+  ]
+  const fake: Fake = { snapshot: reads[0] }
+  const clock = fakeProject(on, ran, fake)
+  await start($)
+  await clock.settle()
+
+  for (const snapshot of reads) {
+    fake.snapshot = snapshot
+    const texts = [await callHealth($), resultOf(await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'status' })), resultOf(await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'failed' }))]
+    for (const text of texts) {
+      for (const secret of ['db.internal', 'Connection refused', 'acme-secret-dir', '/Users/me', 'anonymous']) expect({ text, secret, leaked: text.includes(secret) }).toMatchObject({ leaked: false })
+    }
+    expect(texts[1]).toContain('(no reason given)')
+  }
+})
+
+test('a backlog that stays the same size across minute ticks is still a backlog, not a draining queue', async ($, on) => {
+  const ran: string[][] = []
+  const snapshot = { connection: 'database', sizes: { default: 3 }, failedTotal: 0, failed: [] }
+  const clock = fakeProject(on, ran, { snapshot })
+  await start($)
+  await clock.settle()
+
+  // Two more minute ticks, each reading the same count
+  for (const _ of [1, 2]) {
+    await clock.advance(60_000)
+    await slash($, 'lara-queue', 'status')
+  }
+  expect(await drawBand($)).toContain('? 3 jobs waiting, no worker in this session')
+  expect(resultOf(await $.tool.call({ tool: 'mcp__lara-cc__queue', action: 'status' }))).not.toContain('Jobs waiting went from')
+  const health = await callHealth($)
+  expect(health).toContain('- [inferred] 3 jobs waiting, no worker in this session:')
+  expect(health).toContain('3 at the read before')
+  expect(health).not.toContain('Fewer jobs wait')
+})
+
+test("a Herd services.plist lara-cc can't read is said as unchecked, not as nothing found", async ($, on) => {
+  const ran: string[][] = []
+  const clock = fakeProject(on, ran, { connections: [{ use: 'database', driver: 'mysql', port: 3306 }], herdServices: [MYSQL], plistFails: true })
+  on('ui.open', placed)
+  await start($)
+  await clock.settle()
+
+  expect(await callHealth($)).toContain("- [unknown] Herd services: couldn't read services.plist")
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-services' })
+  const drawn = JSON.stringify(await pane.drawn())
+  expect(drawn).toContain('Herd (services.plist unreadable)')
+  expect(drawn).not.toContain('nothing found')
+})
+
+test('an npm lockfile or record lara-cc cannot read is said as unchecked, never as matching, and is read again', async ($, on) => {
+  const ran: string[][] = []
+  const reads: string[] = []
+  const files = { 'package-lock.json': '{ not json', 'node_modules/.package-lock.json': '{}', node_modules: '' }
+  const clock = fakeProject(on, ran, { npm: true, files, reads })
+  on('ui.open', placed)
+  await start($)
+  await clock.settle()
+
+  const lockReads = () => reads.filter(path => path.endsWith('package-lock.json')).length
+  const before = lockReads()
+  const health = await callHealth($)
+  expect(health).toContain("- [unknown] npm drift: couldn't read package-lock.json or node_modules/.package-lock.json")
+  expect(health).not.toContain('matches package-lock.json')
+  expect(lockReads()).toBeGreaterThan(before)
+  const pane = await mountPane($)
+  await pane.press({ key: 'tab-services' })
+  expect(JSON.stringify(await pane.drawn())).toContain('npm drift (files unreadable)')
+})
+
+test('an older migrate:status that finishes after the migrate fix cannot bring the old count back', async ($, on) => {
+  const ran: string[][] = []
+  const fake: Fake = { pending: 2 }
+  const clock = fakeProject(on, ran, fake)
+  await start($)
+  await clock.settle()
+  expect(await drawBand($)).toContain('2 pending migrations')
+
+  // A read that counted 2 and is held, while the migrate fix runs and counts 0
+  let release = () => {}
+  fake.migrateGate = new Promise<void>(resolve => (release = resolve))
+  const slow = callHealth($)
+  await clock.settle()
+  const band = await mountBand($)
+  await band.press({ key: 'fix-migrate' })
+  await clock.settle()
+  expect(JSON.stringify(await band.drawn())).not.toContain('pending migration')
+
+  release()
+  await slow
+  await clock.settle()
+  expect(JSON.stringify(await band.drawn())).not.toContain('pending migration')
+  expect(await callHealth($)).toContain('no pending migrations')
+})
+
+test("checks whose last run failed are stale at once, before three ticks have passed", async ($, on) => {
+  const ran: string[][] = []
+  const fake: Fake = { files: { 'bootstrap/cache/config.php': '<?php' } }
+  const clock = fakeProject(on, ran, fake)
+  await start($)
+  await clock.settle()
+  expect(await drawBand($)).not.toContain('checks stale')
+
+  // No tick has passed: only the failed run makes them stale
+  fake.failExists = 'storage/framework/down'
+  const health = await callHealth($)
+  expect(health).toContain('Stale:')
+  expect(health).toContain("the checks' last run failed")
+  expect(health).not.toContain('not in maintenance mode')
+  expect(await drawBand($)).toContain('? checks stale')
+})
+
+test('a public/hot with curl missing reads as Vite unchecked, naming that curl could not run', async ($, on) => {
+  const ran: string[][] = []
+  const clock = fakeProject(on, ran, { files: { 'public/hot': 'https://shop.test:5173' }, curl: 'missing' })
+  await start($)
+  await clock.settle()
+
+  const band = await drawBand($)
+  expect(band).toContain('? Vite unchecked (public/hot)')
+  expect(band).not.toContain('Vite not running')
+  const health = await callHealth($)
+  expect(health).toContain("- [unknown] Vite unchecked (public/hot): public/hot names port 5173 on this machine; curl couldn't run")
+  expect(health).not.toContain('shop.test')
+})
+
+test('an artisan about that answers without an environment is unknown, not fine', async ($, on) => {
+  const ran: string[][] = []
+  const clock = fakeProject(on, ran, { env: null })
+  await start($)
+  await clock.settle()
+
+  const health = await callHealth($)
+  expect(health).toContain("- [unknown] APP_ENV: artisan about answered ")
+  expect(health).toContain("without an environment, so production isn't ruled out")
+  expect(health).not.toContain('APP_ENV is')
+  expect(health.indexOf('APP_ENV: artisan about answered')).toBeLessThan(health.indexOf('Fine:'))
 })

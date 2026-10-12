@@ -7,6 +7,7 @@ import {
   connectionsPhp,
   durationMs,
   editorHref,
+  errorKind,
   exceptionHeadline,
   feedLog,
   formatEntry,
@@ -14,6 +15,7 @@ import {
   helpName,
   herdNeeds,
   herdServices,
+  hotPort,
   isError,
   isTestCommand,
   isWarning,
@@ -64,7 +66,7 @@ import type { AppConnection, FailedJob, HerdService, LogEntry, QueueSnapshot, Ta
  *   /lara-npm <script>      `npm run <script>` (pnpm / yarn / bun detected from the lockfile)
  *   /lara-composer <args>   run composer
  *
- * Claude gets tools: artisan, service, routes, logs and queue.
+ * Claude gets tools: artisan, service, routes, logs, queue and health.
  */
 
 type Api = EngineInterface
@@ -161,6 +163,8 @@ const SECRET_CONFIG = /(^|[._-])(key|keys|pass(word)?|pwd|secret|token|auth|cred
 const PANE = 'lara'
 const MAX_SERVICE_LINES = 400
 const TOAST_GAP_MS = 5000
+/** Minute ticks without a finished health check before its results count as stale: they run every minute, so three means they're stuck. */
+const CHECKS_STALE = 3
 
 // ─── State (module variables reset when the mod reloads; child processes die with it) ──
 
@@ -233,7 +237,8 @@ const fixing = new Set<string>()
 // A test run started by runCommand is in progress (the Tests tab's button waits for it)
 let testsRunning = false
 // The last test run this session: /lara-test, the Tests tab, the artisan tool or Claude's Bash (see noteTestRun)
-let lastTest: (TestRun & { label: string; at: number }) | undefined
+// `editedSince`: Claude edited PHP during or after it, so it no longer covers the code
+let lastTest: (TestRun & { label: string; at: number; editedSince?: true }) | undefined
 // Herd's debug session (queries, logs, dumps, HTTP calls the app made), started from the Services tab
 type DebugState = 'off' | 'starting' | 'on' | 'stopping'
 let debugState: DebugState = 'off'
@@ -243,6 +248,8 @@ let hasBoost = false
 // The person let log entries and failed-job exceptions go to Claude for the rest of this session (see mayShare)
 let shareAllowed = false
 const editedPhp = new Set<string>()
+// Counts Claude's PHP edits, so a test run knows whether one landed while it ran (see noteTestRun)
+let phpEdits = 0
 
 // Log monitoring
 let logPath = ''
@@ -255,31 +262,83 @@ let logReady: Promise<void> = Promise.resolve()
 // Health checks: things that quietly break the app (see checkHealth)
 /** `fix`: what the check's button runs, only ever on the person's press; it may return a line to show. */
 type Fix = { label: string; run: () => Promise<string | void> }
-type Check = { band: string; color: 'red' | 'yellow'; detail: string; fix?: Fix; backlog?: true }
+/**
+ * A health check's finding: something wrong, or something lara-cc couldn't tell. `known`: 'seen' when the evidence
+ * shows it (a file exists, nothing listens on the port), 'inferred' for a conclusion (no worker here and the count
+ * isn't falling), 'unknown' when a probe couldn't answer. `detail`: the Services tab's line, for the person.
+ * `evidence`: Claude's health tool's line, only drivers, local ports, file names, package names, counts and
+ * errorKind(): never a host, user, URL or message text. `claude`: what Claude's own tools can do about it and
+ * whether that asks (artisanStep, serviceStep). `fromAbout`: read from `artisan about` alone, so stale when it fails.
+ */
+type Check = {
+  band: string
+  color: 'red' | 'yellow'
+  known: 'seen' | 'inferred' | 'unknown'
+  detail: string
+  evidence: string
+  fix?: Fix
+  claude?: string
+  backlog?: true
+  fromAbout?: true
+}
+/** Something a check looked at and found fine, for Claude's health tool: 'inferred' when the evidence is indirect (a port answers). */
+type Fine = { known: 'seen' | 'inferred'; evidence: string }
+/** The band's and Services tab's marker: ⚠ for something seen, ? for a conclusion or something lara-cc couldn't tell. */
+const mark = (c: Check) => (c.known === 'seen' ? '⚠' : '?')
 let checks: Check[] = []
+// What the last finished checks looked at and found fine (Claude's health tool), set with `checks`
+let checkedFine: Fine[] = []
 let checking = false
 let checkAgain = false
+// Resolves once the run in progress, and the one queued behind it, have finished (see checkHealth)
+let checksDone: Promise<void> = Promise.resolve()
+// When the checks last finished here (0: not yet), the minute ticks since (see CHECKS_STALE), and the kind of the last failure ('')
+let checkedAt = 0
+let checksMissed = 0
+let checksFailed = ''
 let depsSeen = ''
 let depsChecks: Check[] = []
+let depsFine: Fine[] = []
+// The tools whose drift files couldn't be read at the last check (tried again next time)
+let depsUnread: string[] = []
 // Herd's installed services and whether each listens; services.plist is re-read only when it changes
 type Probe = 'up' | 'down' | 'unknown'
 let herdList: (HerdService & { up: Probe })[] = []
 let herdSeen = -2
 let herdInstalled: HerdService[] = []
+// plutil couldn't read services.plist the last time it changed
+let herdUnread = false
 // Ports of the Herd services a start button is starting, so it reads "starting…" meanwhile
 const herdStarting = new Set<number>()
-// The driver and port of each local server the app's config connects to (see connectionsPhp), read with `about`
-let connections: AppConnection[] = []
+// The driver and port of each local server the app's config connects to (see connectionsPhp), read with `about`;
+// undefined until connectionsPhp has answered
+let connections: AppConnection[] | undefined
+// When `artisan about` last worked, and the kind of its last failure ('' when the last one worked); see errorKind
+let aboutAt = 0
+let aboutFailed = ''
+// When migrate:status last worked (0: never here), the kind of its last failure (''), and a run count so only the newest writes
+let migrationsAt = 0
+let migrationsFailed = ''
+let migrationRuns = 0
 
 // Queue monitoring
 let jobs: Job[] = []
 const stats = { done: 0, failed: 0, totalMs: 0 }
 let snapshot: QueueSnapshot | undefined
+// When the queue was last read (whether or not it worked), and when a read last worked in full
 let snapshotAt = 0
+let snapshotOkAt = 0
+// Why the last read failed: the message for the person, its kind for Claude (see errorKind)
 let snapshotError = ''
-let snapshotLoading = false
-// The jobs waiting at the snapshot before this one, to tell a backlog from a queue a worker elsewhere drains
+let snapshotKind = ''
+// The last read counted the jobs waiting: in full, or all but the failed jobs (a partial read)
+let sizesRead = false
+// The read in progress, so a caller can wait for it (see recheck)
+let snapshotLoad: Promise<void> | undefined
+// The jobs waiting at the read before, to tell a backlog from a queue a worker elsewhere drains. That's the first
+// read of the minute tick before (`waitingAtTick` is this tick's), so reads close together don't each reset it
 let waitingBefore: number | undefined
+let waitingAtTick: number | undefined
 
 // ─── Small helpers ─────────────────────────────────────────────────────────
 
@@ -420,6 +479,7 @@ async function runPhp($: Api, argv: string[], init: { timeoutMs: number }) {
 async function runCommand($: Api, label: string, argv: string[], timeoutMs = 600_000, whole = false): Promise<LastRun> {
   const isTests = isTestCommand(argv.join(' '))
   const project = projectRun
+  const edits = phpEdits
   lastRun = { label, isRunning: true, output: '' }
   if (isTests) testsRunning = true
   redraw($)
@@ -428,7 +488,7 @@ async function runCommand($: Api, label: string, argv: string[], timeoutMs = 600
     const r = await runPhp($, argv, { timeoutMs })
     const output = stripAnsi([r.stdout, r.stderr].filter(Boolean).join('\n')).trim()
     run = { label, isRunning: false, exitCode: r.exitCode, output: tail(output, whole ? 200_000 : 8000), raw: tail(output, 200_000), whole }
-    if (isTests && project === projectRun) noteTestRun($, label, output)
+    if (isTests && project === projectRun) noteTestRun($, label, output, edits)
   } catch (err) {
     run = { label, isRunning: false, exitCode: -1, output: 'Could not run `' + argv.join(' ') + '`: ' + String(err) }
   }
@@ -471,11 +531,14 @@ function resultText(result: { text?: string; result?: unknown }): string {
   return ''
 }
 
-/** Remember a test run's result for the band and the Tests tab; output with no test summary is ignored. */
-function noteTestRun($: Api, label: string, output: string) {
+/**
+ * Remember a test run's result for the band and the Tests tab; output with no test summary is ignored. `edits`:
+ * phpEdits when the run started, so an edit Claude made while it ran marks it as not covering the code.
+ */
+function noteTestRun($: Api, label: string, output: string, edits: number) {
   const run = parseTestRun(stripAnsi(output))
   if (!run) return
-  lastTest = { ...run, label, at: Date.now() }
+  lastTest = { ...run, label, at: Date.now(), ...(edits !== phpEdits ? { editedSince: true as const } : {}) }
   redraw($)
 }
 
@@ -513,22 +576,33 @@ async function checkArtisan(
   const { resolved, error } = await resolveArtisan($, argv)
   if (error) return { error }
   if (!resolved) return {}
-  if (SHOWN_TO_PERSON.includes(resolved)) return { resolved, shownToPerson: true }
-  if (CONFIDENTIAL.includes(resolved)) return { resolved, refused: `${resolved} prints configuration secrets (passwords, keys)` }
+  return { resolved, ...(await artisanSafety($, resolved)) }
+}
+
+/** What checkArtisan does with an artisan command artisan has resolved, by the 0.11 lists: Claude's tool and the health tool's suggestions both read it. */
+async function artisanSafety($: Api, resolved: string): Promise<{ refused?: string; impact?: string; shownToPerson?: true }> {
+  if (SHOWN_TO_PERSON.includes(resolved)) return { shownToPerson: true }
+  if (CONFIDENTIAL.includes(resolved)) return { refused: `${resolved} prints configuration secrets (passwords, keys)` }
   if (DESTRUCTIVE.includes(resolved)) {
-    return { resolved, refused: resolved === 'tinker' ? 'tinker runs arbitrary PHP' : `${resolved} can destroy data` }
+    return { refused: resolved === 'tinker' ? 'tinker runs arbitrary PHP' : `${resolved} can destroy data` }
   }
-  if (CONTAINED.test(resolved)) return { resolved }
+  if (CONTAINED.test(resolved)) return {}
   // Tests stay in the folder only when they can't touch a real database (RefreshDatabase resets the one configured)
   if (resolved === 'test') {
     const xml = await $.fs.read('phpunit.xml').catch(() => $.fs.read('phpunit.xml.dist').catch(() => ''))
-    if (testsUseMemoryDb(xml)) return { resolved }
-    return { resolved, impact: "runs the test suite, and phpunit.xml doesn't send it to an in-memory database, so RefreshDatabase and the like can reset or fill a real one" }
+    if (testsUseMemoryDb(xml)) return {}
+    return { impact: "runs the test suite, and phpunit.xml doesn't send it to an in-memory database, so RefreshDatabase and the like can reset or fill a real one" }
   }
   return {
-    resolved,
     impact: IMPACTFUL[resolved] ?? "isn't one lara-cc knows to stay inside the project folder, so it may reach the database, queue, cache or network",
   }
+}
+
+/** An artisan step to suggest to Claude, saying what its tool will do (artisanSafety), so the suggestion can't promise otherwise. */
+async function artisanStep($: Api, commands: string[]): Promise<string> {
+  const safety = await Promise.all(commands.map(c => artisanSafety($, c)))
+  const how = safety.some(s => s.refused) ? 'refused; ask the user' : safety.some(s => s.impact || s.shownToPerson) ? 'asks the user first' : 'runs without asking'
+  return `artisan tool: ${commands.map(c => '"' + c + '"').join(', then ')} (${how})`
 }
 
 /**
@@ -572,11 +646,15 @@ async function mayRun($: Api, what: string, effect: string): Promise<boolean> {
   const project = projectRun
   // `about` and the servers are read together, a moment after start; until then, say so rather than "none found"
   const env = about?.environment?.environment
-  const local = connections.map(c => `${c.use} ${c.driver}:${c.port}`)
+  const local = (connections ?? []).map(c => `${c.use} ${c.driver}:${c.port}`)
   const where = !about
     ? "lara-cc doesn't know APP_ENV or the app's servers (not read yet, or `artisan about` failed)."
-    : `APP_ENV is ${typeof env === 'string' ? env : 'unknown'}; ` +
-      (local.length ? `servers on this machine it connects to: ${local.join(', ')}.` : 'lara-cc found none of its servers on this machine (it may use SQLite, files or a server elsewhere).')
+    : `APP_ENV is ${typeof env === 'string' ? env : 'unknown'}${aboutFailed ? ` (as read ${ago(aboutAt)} ago; artisan about has failed since)` : ''}; ` +
+      (connections === undefined
+        ? "lara-cc couldn't read which servers it connects to."
+        : local.length
+          ? `servers on this machine it connects to: ${local.join(', ')}.`
+          : 'lara-cc found none of its servers on this machine (it may use SQLite, files or a server elsewhere).')
   const question = `Claude (or a command you didn't type) wants to run ${what}, which ${effect}. ${where} Run it?`
   const answer = await $.ui.ask(question, { header: 'lara-cc', options: ['Run it', "Don't run"] }).catch(() => "Don't run")
   // A yes is for the folder the question was about
@@ -611,14 +689,30 @@ function startImpact(name: string): string | undefined {
   return argv[1] === 'artisan' ? IMPACTFUL[argv[2] ?? ''] : undefined
 }
 
+/** What a service action does that needs the person's yes: starting the worker or scheduler (a restart of what isn't running starts it). */
+function serviceImpact(name: string, action: string): string | undefined {
+  const starts = !services[name]?.run && (action === 'start' || action === 'restart')
+  return starts ? startImpact(name) : undefined
+}
+
+/** A service step to suggest to Claude, saying what guardedServiceAction will do. */
+function serviceStep(name: string, action: 'start' | 'restart'): string {
+  return `service tool: ${name} ${action} (${serviceImpact(name, action) ? 'asks the user first' : 'runs without asking'})`
+}
+
+/** A finding's next steps for Claude's health tool: what Claude's tools can do, then the person's button. */
+function nextSteps(claude: string | undefined, button: string | undefined): string {
+  const steps = [claude ?? (button ? 'no tool of yours does this' : 'no tool of yours does this; tell the user'), button ? `the user's button "${button}"` : '']
+  return '  next: ' + steps.filter(Boolean).join(' · ')
+}
+
 /**
  * serviceAction for anyone but the person typing or pressing: a start (or a restart that starts) of a process
  * that runs jobs or tasks asks first. Stopping, and restarting what already runs, are left to Claude, so it can
  * restart the worker after changing job code.
  */
 async function guardedServiceAction($: Api, name: string, action: string): Promise<string> {
-  const starts = !services[name]?.run && (action === 'start' || action === 'restart')
-  const impact = starts ? startImpact(name) : undefined
+  const impact = serviceImpact(name, action)
   if (impact && !(await mayRun($, (services[name]?.argv ?? []).join(' '), impact))) return NOT_RUN
   return serviceAction($, name, action)
 }
@@ -724,7 +818,8 @@ async function stopService($: Api, name: string): Promise<string> {
   // A start waiting on phpReady goes first, so this sees (and stops) what it spawns
   await phpReady
   const run = svc.run
-  if (!run) return `${svc.label} is not running.`
+  // Only what this session started: one run elsewhere is out of its sight
+  if (!run) return `${svc.label} isn't running in this session, so there's nothing to stop; lara-cc can't stop one run elsewhere.`
   svc.lines.push('… stopping')
   redraw($)
   // Closing the stream kills the child. Don't wait forever on a quiet process.
@@ -751,7 +846,9 @@ async function serviceAction($: Api, name: string, action: string): Promise<stri
   if (action === 'stop') return stopService($, name)
   if (action === 'restart') return restartService($, name)
   if (action === 'logs') return `${svc.label}, last 60 lines:\n` + (redact(svc.lines.slice(-60).join('\n')) || '(no output)')
-  const state = svc.run ? `${svc.label} is running (${ago(svc.startedAt ?? Date.now())}).` : `${svc.label} is stopped.`
+  const state = svc.run
+    ? `${svc.label} is running (${ago(svc.startedAt ?? Date.now())}), started by this session.`
+    : `${svc.label} is not running in this session; lara-cc can't see one run elsewhere.`
   return name === 'queue' ? state + '\n' + queueSummary() : state
 }
 
@@ -783,38 +880,71 @@ function onWorkerLine($: Api, line: string) {
   if (jobs.length > 100) jobs.splice(0, jobs.length - 100)
 }
 
-async function refreshQueue($: Api) {
-  if (!isLaravel || snapshotLoading) return
+/** Read the queue state. One read at a time: a call while one runs gets that read (recheck then reads again). */
+function refreshQueue($: Api): Promise<void> {
+  if (!isLaravel) return Promise.resolve()
+  if (snapshotLoad) return snapshotLoad
   const project = projectRun
-  snapshotLoading = true
-  redraw($)
-  try {
-    const r = await runPhp($, ['php', '-r', snapshotPhp(queuesOf(services.queue.argv))], { timeoutMs: 30_000 })
-    // Another folder's queue: detectProject has cleared the snapshot and the loading flag
-    if (project !== projectRun) return
-    const parsed = parseSnapshot(r.stdout)
-    if (parsed) {
-      waitingBefore = snapshot ? waiting(snapshot) : undefined
-      snapshot = parsed
-      snapshotError = parsed.error ?? ''
-    } else {
-      snapshotError = clip(redact(stripAnsi(r.stderr || r.stdout).trim().split('\n')[0] ?? ''), 300) || 'Could not read the queue state.'
+  const loading = (async () => {
+    try {
+      const r = await runPhp($, ['php', '-r', snapshotPhp(queuesOf(services.queue.argv))], { timeoutMs: 30_000 })
+      // Another folder's queue: detectProject has cleared the snapshot and the read in progress
+      if (project !== projectRun) return
+      const parsed = parseSnapshot(r.stdout)
+      // Taken when it counted the jobs waiting; one that failed there keeps the last good read, so no count reads as current that isn't
+      sizesRead = !!parsed && (!parsed.error || !!parsed.partial)
+      if (parsed && sizesRead) {
+        waitingAtTick ??= waiting(parsed)
+        // A partial read's failed-job count is the PHP default 0, not a count: the last one stays (marked, see the band)
+        snapshot = parsed.partial && snapshot ? { ...parsed, failedTotal: snapshot.failedTotal, failed: snapshot.failed } : parsed
+      }
+      if (parsed && !parsed.error) snapshotOkAt = Date.now()
+      snapshotError = parsed ? (parsed.error ?? '') : clip(redact(stripAnsi(r.stderr || r.stdout).trim().split('\n')[0] ?? ''), 300) || 'Could not read the queue state.'
+      snapshotKind = parsed ? parsed.errorKind || errorKind(parsed.error ?? '') : errorKind(r.stderr + '\n' + r.stdout)
+    } catch (err) {
+      if (project !== projectRun) return
+      sizesRead = false
+      snapshotError = String(err)
+      snapshotKind = "it timed out or couldn't run"
     }
-  } catch (err) {
-    if (project !== projectRun) return
-    snapshotError = String(err)
-  }
-  snapshotAt = Date.now()
-  snapshotLoading = false
-  // Only the backlog warning depends on the snapshot: swap it in without running every check
-  const backlog = backlogCheck($)
-  checks = [...checks.filter(c => !c.backlog), ...(backlog ? [backlog] : [])]
+    snapshotAt = Date.now()
+    // Only the backlog warning depends on the snapshot: swap it in without running every check
+    const backlog = backlogCheck($)
+    checks = [...checks.filter(c => !c.backlog), ...(backlog ? [backlog] : [])]
+    redraw($)
+  })().finally(() => {
+    // Not one a later folder started (leaveProject let go of this one)
+    if (snapshotLoad === loading) snapshotLoad = undefined
+  })
+  snapshotLoad = loading
   redraw($)
+  return loading
 }
 
 /** Jobs waiting across the snapshot's queues. */
 function waiting(snap: QueueSnapshot): number {
   return Object.values(snap.sizes).reduce((n, size) => n + (Number(size) || 0), 0)
+}
+
+/** `default: 3, emails: 1`: the snapshot's queues with jobs waiting. */
+function waitingSizes(snap: QueueSnapshot): string {
+  return Object.entries(snap.sizes).filter(([, n]) => n).map(([q, n]) => `${q}: ${n}`).join(', ')
+}
+
+/** Fewer jobs wait than at the read before while this session runs no worker: something elsewhere is working the queue. */
+function drainingNote(): string {
+  if (services.queue.run || !snapshot || !sizesRead || waitingBefore === undefined || waiting(snapshot) >= waitingBefore) return ''
+  return `Jobs waiting went from ${waitingBefore} to ${waiting(snapshot)} since the read before, so a worker elsewhere seems to be working the queue.`
+}
+
+/** How the last queue read failed, for Claude: the kind only, since the message can name a host. */
+function queueReadFailure(): string {
+  return `${sizesRead ? "couldn't count the failed jobs" : 'failed'} (${snapshotKind || 'no reason given'})`
+}
+
+/** Claude's answer when the failed jobs aren't known (no read, or a read that failed or couldn't count them). */
+function queueUnread(): string {
+  return `The queue read ${queueReadFailure()}; the full message is on lara-cc's Queue tab, shown only to the user.`
 }
 
 async function retryFailed($: Api, id: string): Promise<string> {
@@ -837,7 +967,13 @@ function queueSummary(): string {
   if (snapshot) {
     lines.push(`Connection: ${snapshot.connection}${snapshot.connection === 'sync' ? ' (jobs run inline; no worker needed)' : ''}`)
     lines.push('Pending: ' + (Object.entries(snapshot.sizes).map(([q, n]) => `${q}=${n}`).join(', ') || 'unknown'))
-    lines.push(`Failed jobs stored: ${snapshot.failedTotal}`)
+    lines.push(`Failed jobs stored: ${sizesRead && snapshotError ? 'unknown' : snapshot.failedTotal}`)
+  }
+  const draining = drainingNote()
+  if (draining) lines.push(draining)
+  // The kind only: the message can name a host, and it's on the Queue tab for the person
+  if (snapshotError) {
+    lines.push(`Note: the last queue read ${queueReadFailure()}; the full message is on lara-cc's Queue tab, shown only to the user.`)
   }
   const recent = jobs.slice(-10).map(j => `  ${j.status === 'done' ? '✓' : j.status === 'failed' ? '✗' : '…'} ${j.time} ${j.job}${j.ms !== undefined ? ` ${Math.round(j.ms)}ms` : ''}`)
   if (recent.length) lines.push('Recent jobs:', ...recent)
@@ -1172,32 +1308,51 @@ function methodColor(label: string): string {
 async function loadAbout($: Api) {
   const project = projectRun
   const read = runPhp($, ['php', '-r', connectionsPhp()], { timeoutMs: 30_000 }).catch(() => undefined)
+  // A failed read keeps the last result, dated by aboutAt and marked by aboutFailed, rather than forgetting it
   let found = about
+  let failed = ''
   try {
     const r = await runPhp($, ['php', 'artisan', 'about', '--json'], { timeoutMs: 60_000 })
-    if (r.exitCode === 0) found = phpJson(r.stdout) as typeof about
+    const json = r.exitCode === 0 ? (phpJson(r.stdout) as typeof about) : undefined
+    if (json) found = json
+    else failed = r.exitCode === 0 ? 'unreadable output' : errorKind(r.stdout + '\n' + r.stderr) || 'exit ' + r.exitCode
   } catch {
-    found = undefined
+    // A run that throws (timeout, no PHP) carries no PHP output to take a kind from
+    failed = "it timed out or couldn't run"
   }
   const conn = await read
   // Read for a folder the session has since left
   if (project !== projectRun) return
   about = found
+  aboutFailed = failed
+  if (about && !failed) aboutAt = Date.now()
   if (conn) connections = parseConnections(conn.stdout) ?? connections
   redraw($)
 }
 
 async function checkMigrations($: Api) {
   const project = projectRun
+  // Only the newest run writes, so a re-check that started before the migrate fix can't bring the old count back
+  const run = ++migrationRuns
+  let failed = ''
   try {
     const r = await runPhp($, ['php', 'artisan', 'migrate:status', '--no-ansi'], { timeoutMs: 60_000 })
-    if (r.exitCode !== 0 || project !== projectRun) return
-    pendingMigrations = r.stdout.split('\n').filter(l => /\bPending\b/.test(l)).length
-    if (pendingMigrations) toast($, `${plural(pendingMigrations, 'pending migration')}. Run /lara-artisan migrate`)
-    redraw($)
+    if (project !== projectRun || run !== migrationRuns) return
+    if (r.exitCode !== 0) failed = errorKind(r.stdout + '\n' + r.stderr) || 'exit ' + r.exitCode
+    else {
+      const before = pendingMigrations
+      pendingMigrations = r.stdout.split('\n').filter(l => /\bPending\b/.test(l)).length
+      migrationsAt = Date.now()
+      // Only when the count rose: the health tool reads it again on every call
+      if (pendingMigrations > before) toast($, `${plural(pendingMigrations, 'pending migration')}. Run /lara-artisan migrate`)
+    }
   } catch {
-    // no database yet: nothing to report
+    if (project !== projectRun || run !== migrationRuns) return
+    // Timed out or couldn't run: the count stays, marked stale, rather than reading as zero
+    failed = "it timed out or couldn't run"
   }
+  migrationsFailed = failed
+  redraw($)
 }
 
 // ─── Health checks ─────────────────────────────────────────────────────────
@@ -1209,24 +1364,37 @@ const CACHE_FILES = { config: 'bootstrap/cache/config.php', routes: 'bootstrap/c
  * Look for things that quietly break the app and show them in the band: a production environment, maintenance
  * mode, cached config/routes/events, a public/hot pointing at a dead Vite, a stopped Herd service the app uses,
  * and dependencies out of step with the lockfiles. Reads lockfiles and Laravel's marker files, never .env. Cheap: lockfiles are re-read only when changed.
+ * What each check found fine goes to checkedFine, for Claude's health tool. Update healthText's Never checked line when a check is added.
  */
-async function checkHealth($: Api) {
+async function checkHealth($: Api): Promise<void> {
   if (!isLaravel) return
-  // One run at a time; a request that arrives meanwhile runs again afterwards so nothing is missed
+  // One run at a time; a request that arrives meanwhile runs again afterwards, and waits for that run
   if (checking) {
     checkAgain = true
-    return
+    return checksDone
   }
   checking = true
+  let done = () => {}
+  checksDone = new Promise<void>(resolve => (done = resolve))
   const project = projectRun
   try {
     const next: Check[] = []
+    const fine: Fine[] = []
+    // What about said is as old as the last time it worked
+    const aboutStale = aboutFailed ? `; read ${ago(aboutAt)} ago, and artisan about has failed since (${aboutFailed})` : ''
     if (about?.environment?.environment === 'production') {
-      next.push({ band: 'env: production', color: 'red', detail: 'APP_ENV is production on this machine: errors are hidden and migrations need --force.' })
+      next.push({
+        band: 'env: production',
+        color: 'red',
+        known: 'seen',
+        detail: 'APP_ENV is production on this machine: errors are hidden and migrations need --force.',
+        evidence: `artisan about says APP_ENV is production${aboutStale}`,
+        fromAbout: true,
+      })
     }
     const [down, hot, ...cacheFiles] = await Promise.all([
       $.fs.exists('storage/framework/down'),
-      viteIsGone($),
+      viteProbe($),
       ...Object.values(CACHE_FILES).map(f => $.fs.exists(f)),
     ])
     // The file covers the default driver; about covers the cache driver too
@@ -1234,9 +1402,17 @@ async function checkHealth($: Api) {
       next.push({
         band: 'maintenance mode',
         color: 'red',
+        known: 'seen',
         detail: 'The app answers every request with 503 (storage/framework/down). `artisan up` brings it back.',
+        evidence: down ? 'storage/framework/down exists' : `artisan about reports maintenance mode (cache driver)${aboutStale}`,
         fix: { label: 'up', run: artisanFix($, [['up']]) },
+        claude: await artisanStep($, ['up']),
+        ...(down ? {} : { fromAbout: true as const }),
       })
+    } else if (about && !aboutFailed) {
+      fine.push({ known: 'seen', evidence: 'not in maintenance mode (no storage/framework/down, and artisan about agrees)' })
+    } else {
+      fine.push({ known: 'inferred', evidence: `no storage/framework/down; maintenance through the cache driver needs artisan about, which ${aboutFailed ? 'failed' : "hasn't answered"}` })
     }
     const cached = Object.keys(CACHE_FILES).filter((_, i) => cacheFiles[i])
     if (cached.length) {
@@ -1246,34 +1422,86 @@ async function checkHealth($: Api) {
       next.push({
         band: `${cached.join('+')} cached`,
         color: 'yellow',
+        known: 'seen',
         detail: `Laravel is using cached ${list}, so edits to them don't take effect until the cache is cleared (${clear.join(', ')}).`,
+        evidence: `${cached.map(c => CACHE_FILES[c as keyof typeof CACHE_FILES]).join(', ')} ${cached.length > 1 ? 'exist' : 'exists'}`,
         fix: { label: 'clear', run: artisanFix($, clear.map(c => [c])) },
+        claude: await artisanStep($, clear),
       })
+    } else {
+      fine.push({ known: 'seen', evidence: 'no cached config, routes or events in bootstrap/cache' })
     }
-    if (hot) {
+    // Only the port ever reaches a string: the host stays in public/hot
+    if (hot.state === 'down') {
       next.push({
         band: 'Vite not running (public/hot)',
         color: 'yellow',
+        known: 'seen',
         detail: "public/hot points pages at a Vite dev server that isn't running, so they load without CSS and JS. Start Vite, or delete public/hot.",
+        evidence: `public/hot names port ${hot.port} on this machine, and nothing accepts connections there (curl exit 7)`,
         fix: { label: 'start vite', run: () => startService($, 'vite') },
+        claude: serviceStep('vite', 'start'),
       })
+    } else if (hot.state === 'unknown') {
+      next.push({
+        band: 'Vite unchecked (public/hot)',
+        color: 'yellow',
+        known: 'unknown',
+        detail: `public/hot points pages at a dev server on port ${hot.port} of this machine, but lara-cc couldn't tell whether it answers (${hot.exit}).`,
+        evidence: `public/hot names port ${hot.port} on this machine; ${hot.exit}, so whether a dev server answers there is unknown`,
+        claude: `ask the user whether a dev server runs there; ${serviceStep('vite', 'start')}`,
+      })
+    } else if (hot.state === 'up') {
+      fine.push({ known: 'inferred', evidence: `public/hot names port ${hot.port} on this machine and something gives a web reply there (not checked to be this app's Vite)` })
+    } else if (hot.state === 'here') {
+      fine.push({ known: 'seen', evidence: 'Vite runs in this session' })
+    } else if (hot.state === 'none') {
+      fine.push({ known: 'seen', evidence: 'no public/hot, so pages use the built assets' })
     }
     const backlog = backlogCheck($)
     if (backlog) next.push(backlog)
-    const [herd, deps] = await Promise.all([checkHerd($), checkDeps($)])
+    const [herd, deps] = await Promise.all([checkHerd($, fine), checkDeps($, fine)])
     next.push(...herd, ...deps)
     // Checked a folder the session has since left: the run requested meanwhile checks the new one
-    if (project === projectRun) checks = next
+    if (project === projectRun) {
+      checks = next
+      checkedFine = fine
+      checkedAt = Date.now()
+      checksMissed = 0
+      checksFailed = ''
+    }
   } catch (err) {
     $.ui.log('lara-cc: health check failed: ' + String(err))
+    // The last results stay, marked stale (see checksStale); the error itself is in the log, for the person
+    if (project === projectRun) checksFailed = 'a file read or probe threw'
   } finally {
     checking = false
   }
   redraw($)
-  if (checkAgain) {
-    checkAgain = false
-    void checkHealth($)
+  try {
+    // Awaited, so whoever waits on checksDone gets the run that started after they asked
+    if (checkAgain) {
+      checkAgain = false
+      await checkHealth($)
+    }
+  } finally {
+    done()
   }
+}
+
+/** The checks' results can't be trusted as current: the last run failed, or none has finished for CHECKS_STALE minute ticks. */
+function checksStale(): boolean {
+  return !!checksFailed || checksMissed >= CHECKS_STALE
+}
+
+/** Read again what the health tool reports: the checks, the queue and migrate:status. All reads, so the health tool and the person's recheck run it unasked. */
+async function recheck($: Api) {
+  // A queue read already running started before this call: wait for it, then read again
+  const queue = async () => {
+    await snapshotLoad
+    await refreshQueue($)
+  }
+  await Promise.all([checkHealth($), queue(), checkMigrations($)])
 }
 
 /** The artisan commands that clear each cache file. */
@@ -1309,19 +1537,31 @@ function commandFix($: Api, label: string, argv: string[]): Fix['run'] {
 }
 
 /**
- * Jobs waiting while this session runs no worker, so they won't run. Left out when the count dropped since
- * the last snapshot: a worker elsewhere (another terminal, Horizon) is draining it.
+ * Jobs waiting while this session runs no worker, so they won't run unless one runs elsewhere. Left out when the
+ * count dropped since the read before (see drainingNote): a worker elsewhere (another terminal, Horizon) is draining it.
  */
 function backlogCheck($: Api): Check | undefined {
-  if (!snapshot || snapshot.connection === 'sync' || services.queue.run) return undefined
+  // Counts from a read that failed aren't current; a partial read's are (only the failed jobs weren't counted)
+  if (!snapshot || !sizesRead || snapshot.connection === 'sync' || services.queue.run) return undefined
   const now = waiting(snapshot)
-  if (!now || (waitingBefore !== undefined && now < waitingBefore)) return undefined
-  const sizes = Object.entries(snapshot.sizes).filter(([, n]) => n).map(([q, n]) => `${q}: ${n}`).join(', ')
+  if (!now || drainingNote()) return undefined
+  const sizes = waitingSizes(snapshot)
+  const before = waitingBefore
+  const trend =
+    before === undefined
+      ? "This is the first read, so it can't tell yet whether they're being worked off. "
+      : `The count hasn't dropped since the read before (${before}), so nothing seems to be working them off. `
   return {
-    band: `${plural(now, 'job')} waiting, no worker`,
+    band: `${plural(now, 'job')} waiting, no worker in this session`,
     color: 'yellow',
-    detail: `${plural(now, 'job')} waiting on the ${snapshot.connection} queue (${sizes}) and no worker runs in this session, so they won't run. Start one, or ignore this if a worker runs elsewhere (delayed jobs count too).`,
+    known: 'inferred',
+    detail:
+      `${plural(now, 'job')} waiting on the ${snapshot.connection} queue (${sizes}) and no worker runs in this session, so they won't run unless one runs elsewhere (another terminal, Supervisor), which lara-cc can't see. ` +
+      trend +
+      'Delayed jobs count too.',
+    evidence: `${now} waiting on the ${snapshot.connection} queue (${sizes}), ${before === undefined ? 'first read' : `${before} at the read before`}; no worker runs in this session; one elsewhere is not ruled out`,
     fix: { label: 'start worker', run: () => startService($, 'queue') },
+    claude: `ask the user whether a worker runs elsewhere; ${serviceStep('queue', 'start')}`,
     backlog: true,
   }
 }
@@ -1346,14 +1586,23 @@ async function runFix($: Api, fix: Fix) {
   }
 }
 
-/** public/hot names a local dev server and nothing listens there (curl exit 7: couldn't connect). Vite run elsewhere counts as running. */
-async function viteIsGone($: Api): Promise<boolean> {
-  if (services.vite.run || !(await $.fs.exists('public/hot'))) return false
+/**
+ * What public/hot's dev server says: 'none' (no public/hot), 'here' (this session runs Vite), 'remote' (another machine:
+ * never probed), else curl at its local port: 'up' (a web reply), 'down' (exit 7: nothing accepts connections),
+ * 'unknown' (anything else, curl missing included; `exit` names it). Only the port ever leaves this function.
+ */
+async function viteProbe($: Api): Promise<{ state: 'none' | 'here' | 'remote' | Probe; port?: number; exit?: string }> {
+  if (!(await $.fs.exists('public/hot'))) return { state: 'none' }
+  if (services.vite.run) return { state: 'here' }
   const url = localHotUrl(await $.fs.read('public/hot').catch(() => ''))
-  if (!url) return false
+  if (!url) return { state: 'remote' }
+  const port = hotPort(url)
   // -q first so a ~/.curlrc can't change the request; -k because local dev certificates are often self-signed
   const r = await $.process.run(['curl', '-q', '-s', '-o', '/dev/null', '-m', '2', '-k', url + '/'], { timeoutMs: 5_000 }).catch(() => undefined)
-  return r?.exitCode === 7
+  if (r?.exitCode === 0) return { state: 'up', port }
+  if (r?.exitCode === 7) return { state: 'down', port }
+  // A timeout, a TLS or DNS failure, curl missing: none of these says whether a server is there
+  return { state: 'unknown', port, exit: r ? `curl exit ${r.exitCode}` : "curl couldn't run" }
 }
 
 /**
@@ -1361,19 +1610,28 @@ async function viteIsGone($: Api): Promise<boolean> {
  * Reads Herd's services.plist (type, port, version: no credentials), never its site list, and only checks this
  * machine at the ports it names. A server on a port no Herd service has (Docker, DBngin, remote) is left alone.
  */
-async function checkHerd($: Api): Promise<Check[]> {
+async function checkHerd($: Api, fine: Fine[]): Promise<Check[]> {
   const installed = await herdInstalledServices($)
   const up = await Promise.all(installed.map(s => probePort($, s.port)))
   herdList = installed.map((s, i) => ({ ...s, up: up[i]! }))
-  const needs = herdNeeds(connections, herdList)
+  const needs = herdNeeds(connections ?? [], herdList)
   const stopped: Check[] = needs
     .filter(need => need.service.up === 'down')
     .map(({ service: s, driver, uses }) => ({
       band: `Herd ${s.name} stopped`,
       color: 'red' as const,
+      known: 'seen' as const,
       detail: `The app's ${uses.join(', ')} uses ${driver} on port ${s.port}, and Herd's ${s.name} ${s.version} there isn't running, so anything that needs it fails.`,
+      evidence: `nothing accepts connections on localhost:${s.port}, where Herd's ${s.name} ${s.version} is set up; the app's ${uses.join(', ')} uses ${driver} there`,
       fix: { label: `start ${s.name}`, run: () => startHerdService($, s) },
     }))
+  // A port that answers is a listener, maybe another server on the same port: not proof it's Herd's
+  for (const { service: s, driver, uses } of needs.filter(need => need.service.up === 'up')) {
+    fine.push({
+      known: 'inferred',
+      evidence: `localhost:${s.port} accepts connections, where Herd's ${s.name} ${s.version} is set up and the app's ${uses.join(', ')} uses ${driver} (a listener, not proof it's Herd's ${s.name})`,
+    })
+  }
   // Neither running nor stopped: say so once, rather than calling them fine
   const unchecked = needs.filter(need => need.service.up === 'unknown').map(need => need.service)
   if (unchecked.length) {
@@ -1381,7 +1639,10 @@ async function checkHerd($: Api): Promise<Check[]> {
     stopped.push({
       band: `Herd ${unchecked.map(s => s.name).join('+')} unchecked`,
       color: 'yellow',
+      known: 'unknown',
       detail: `The app uses Herd's ${names}, but lara-cc couldn't tell whether ${unchecked.length > 1 ? 'they are' : 'it is'} running: nc is missing or didn't answer.`,
+      evidence: `nc couldn't probe ${unchecked.map(s => 'localhost:' + s.port).join(', ')} (missing, timed out or an unexpected exit)`,
+      claude: 'ask the user whether it is running (Herd → Services)',
     })
   }
   return stopped
@@ -1410,7 +1671,7 @@ async function startHerdService($: Api, s: HerdService) {
       up = await probePort($, s.port)
     }
     const told = {
-      up: `Herd ${s.name} is running`,
+      up: `Herd ${s.name} started: port ${s.port} answers`,
       down: `Herd ${s.name} hasn't started yet; check Herd → Services`,
       unknown: `Herd was asked to start ${s.name}, but lara-cc couldn't check port ${s.port} (nc missing or not answering)`,
     }
@@ -1482,10 +1743,13 @@ async function herdInstalledServices($: Api): Promise<HerdService[]> {
   if (time === herdSeen) return herdInstalled
   if (time < 0) {
     herdSeen = time
+    herdUnread = false
     herdInstalled = []
     return herdInstalled
   }
   const r = await $.process.run(['plutil', '-convert', 'json', '-o', '-', plist], { timeoutMs: 5_000 }).catch(() => undefined)
+  // Said in the health tool and on the Services tab: Herd's services go unchecked meanwhile
+  herdUnread = r?.exitCode !== 0
   if (r?.exitCode !== 0) return herdInstalled
   herdSeen = time
   herdInstalled = herdServices(r.stdout)
@@ -1515,53 +1779,236 @@ const NODE_LOCKS: Record<string, string[]> = { npm: ['package-lock.json'], pnpm:
 
 const DEP_FILES = ['composer.lock', 'vendor/composer/installed.json', 'package-lock.json', 'node_modules/.package-lock.json', 'node_modules', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb']
 
-/** Composer and node packages out of step with the lockfiles, e.g. after a `git pull`. */
-async function checkDeps($: Api): Promise<Check[]> {
+/** Composer and node packages out of step with the lockfiles, e.g. after a `git pull`. What matches goes to `fine`. */
+async function checkDeps($: Api, fine: Fine[]): Promise<Check[]> {
   const project = projectRun
   const times = await Promise.all(DEP_FILES.map(f => mtime($, f)))
   const key = times.join(',')
-  if (key === depsSeen) return depsChecks
+  if (key === depsSeen) {
+    fine.push(...depsFine)
+    return depsChecks
+  }
   const has = (file: string) => times[DEP_FILES.indexOf(file)]! >= 0
   const out: Check[] = []
-  const add = (tool: string, detail: string) =>
+  const ok: Fine[] = []
+  const unread: string[] = []
+  const add = (tool: string, detail: string, evidence: string) =>
     out.push({
       band: `${tool} install needed`,
       color: 'yellow',
+      known: 'seen',
       detail,
+      evidence,
       fix: { label: `${tool} install`, run: commandFix($, `${tool} install`, tool === 'composer' ? ['composer', 'install', '--no-interaction'] : [pm, 'install']) },
     })
-  const differ = (lock: string, drift: string[], fix: string) =>
-    `${plural(drift.length, 'package')} in ${lock} differ from what's installed (${drift.slice(0, 3).join(', ')}${drift.length > 3 ? '…' : ''}). Run ${fix}.`
+  const sample = (drift: string[]) => `${drift.slice(0, 3).join(', ')}${drift.length > 3 ? '…' : ''}`
+  const differ = (lock: string, drift: string[], fix: string) => `${plural(drift.length, 'package')} in ${lock} differ from what's installed (${sample(drift)}). Run ${fix}.`
+  const differIn = (files: string, drift: string[]) => `${files} differ for ${plural(drift.length, 'package')} (${sample(drift)})`
 
   if (has('composer.lock')) {
     const fix = 'composer install (/lara-composer install)'
-    if (!has('vendor/composer/installed.json')) add('composer', `vendor/ is missing. Run ${fix}.`)
+    if (!has('vendor/composer/installed.json')) add('composer', `vendor/ is missing. Run ${fix}.`, "composer.lock exists, vendor/composer/installed.json doesn't")
     else {
-      // An unreadable or half-written file (mid-install) is skipped, and read again once it changes
+      // An unreadable or half-written file (mid-install) is neither a match nor drift: said as unread, and read again next time
       const drift = await Promise.all([$.fs.read('composer.lock'), $.fs.read('vendor/composer/installed.json')])
         .then(([lock, installed]) => composerDrift(lock, installed))
-        .catch(() => [])
-      if (drift.length) add('composer', differ('composer.lock', drift, fix))
+        .catch(() => undefined)
+      if (!drift) unread.push('composer')
+      else if (drift.length) add('composer', differ('composer.lock', drift, fix), differIn('composer.lock and vendor/', drift))
+      else ok.push({ known: 'seen', evidence: 'vendor/ matches composer.lock' })
     }
   }
 
   // The lockfile `pm` was picked from, so the advice matches the tool (a stray package-lock.json in a yarn project is ignored)
   const nodeLock = NODE_LOCKS[pm]?.find(has)
-  if (nodeLock && !has('node_modules')) add(pm, `node_modules/ is missing. Run ${pm} install.`)
+  if (nodeLock && !has('node_modules')) add(pm, `node_modules/ is missing. Run ${pm} install.`, `${nodeLock} exists, node_modules/ doesn't`)
   // Only npm keeps a record of what it installed precise enough to compare against the lockfile
   else if (nodeLock === 'package-lock.json' && has('node_modules/.package-lock.json')) {
     const drift = await Promise.all([$.fs.read('package-lock.json'), $.fs.read('node_modules/.package-lock.json')])
       .then(([lock, installed]) => npmDrift(lock, installed))
-      .catch(() => [])
-    if (drift.length) add(pm, differ('package-lock.json', drift, `${pm} install`))
-  }
+      .catch(() => undefined)
+    if (!drift) unread.push(pm)
+    else if (drift.length) add(pm, differ('package-lock.json', drift, `${pm} install`), differIn('package-lock.json and node_modules/', drift))
+    else ok.push({ known: 'seen', evidence: 'node_modules/ matches package-lock.json' })
+  } else if (nodeLock) ok.push({ known: 'inferred', evidence: `node_modules/ exists (${pm} leaves no record lara-cc compares with ${nodeLock})` })
 
-  // Not into the cache once the session has moved to another folder
+  // Not into the cache once the session has moved to another folder, nor while a file couldn't be read
   if (project === projectRun) {
-    depsSeen = key
+    if (!unread.length) depsSeen = key
     depsChecks = out
+    depsFine = ok
+    depsUnread = unread
+  }
+  fine.push(...ok)
+  return out
+}
+
+/**
+ * What lara-cc couldn't check right now: neither fine nor broken. `label` for the Services tab's checks row, `text`
+ * for Claude's health tool, which lists each under Unknown, so the two can't disagree; `artisan`: what reads it again.
+ */
+function notChecked(): { label: string; text: string; artisan?: string }[] {
+  const out: { label: string; text: string; artisan?: string }[] = []
+  if (!about) {
+    out.push({
+      label: `APP_ENV (artisan about ${aboutFailed ? 'failed' : "hasn't answered"})`,
+      text: `APP_ENV: artisan about ${aboutFailed ? `failed (${aboutFailed})` : "hasn't answered yet"}, so production isn't ruled out`,
+    })
+  }
+  if (connections === undefined) {
+    out.push({
+      label: herdInstalled.length ? "Herd (the app's servers unknown)" : "the app's servers (config unread)",
+      text: "Which servers the app uses: lara-cc hasn't read its config (not yet, or it failed), so Herd services aren't checked against it",
+    })
+  }
+  if (herdUnread) out.push({ label: 'Herd (services.plist unreadable)', text: "Herd services: couldn't read services.plist" })
+  for (const tool of depsUnread) {
+    const files = tool === 'composer' ? 'composer.lock or installed.json' : 'package-lock.json or node_modules/.package-lock.json'
+    out.push({ label: `${tool} drift (files unreadable)`, text: `${tool} drift: couldn't read ${files}` })
+  }
+  if (!migrationsAt && migrationsFailed) {
+    // A SQLSTATE comes from the database; anything else (a parse error, no vendor/) says nothing about one
+    const maybe = migrationsFailed.includes('SQLSTATE') ? '; maybe there is no database yet, or it is not reachable' : ''
+    out.push({ label: 'migrations (migrate:status failed)', text: `Migrations: migrate:status failed (${migrationsFailed})${maybe}`, artisan: 'migrate:status' })
+  } else if (!migrationsAt) {
+    out.push({ label: "migrations (migrate:status hasn't answered)", text: "Migrations: migrate:status hasn't answered yet" })
+  }
+  if (snapshotError) {
+    // A partial read has current waiting counts but no failed-job count; a failed one has neither
+    out.push({
+      label: sizesRead ? "failed jobs (couldn't count)" : snapshot ? 'queue (last read failed)' : 'queue (unread)',
+      text: `Queue: the read ${ago(snapshotAt)} ago ${queueReadFailure()}${sizesRead ? '' : ', so waiting and failed jobs are unknown'}`,
+    })
+  } else if (!snapshot) out.push({ label: 'queue (not read yet)', text: 'Queue: not read yet' })
+  if (!logRun) {
+    out.push({
+      label: 'log (not following)',
+      text: `Log: lara-cc isn't following ${logPath || 'storage/logs'} right now (tail stopped or hasn't started); it tries again within a minute, so new errors may be missed meanwhile`,
+    })
   }
   return out
+}
+
+/** What Claude's health tool never looks at, so nothing left out reads as fine. */
+const NEVER_CHECKED =
+  "Never checked: servers not on this machine (lara-cc doesn't name them); local servers on ports no Herd service has (Docker, DBngin); a public/hot that names another machine; workers, Vite or schedulers started outside this session; PHP edited outside Claude's Edit and Write tools; whether pages actually render."
+
+/**
+ * Claude's health tool: problems, what lara-cc couldn't tell, what's stale and what's fine, each marked [seen],
+ * [inferred] or [unknown]. Only counts, drivers, local ports, file names, package names, times and errorKind():
+ * never log or exception text (the logs and queue tools ask for those). Update Never checked when a check is added.
+ * `slow`: the re-check it asked for hadn't finished when the answer was due.
+ */
+async function healthText($: Api, slow: boolean): Promise<string> {
+  const problems: string[] = []
+  const unknown: string[] = []
+  const stale: string[] = []
+  const fine: string[] = []
+  const session: string[] = []
+  const line = (known: string, text: string) => `- [${known}] ${text}`
+  const old = checksStale()
+
+  const why = checksFailed ? `the checks' last run failed (${checksFailed})` : !checkedAt ? "the checks haven't finished yet" : `the checks haven't finished for ${CHECKS_STALE}+ minutes`
+  const sentence = `${checkedAt ? `The checks finished ${ago(checkedAt)} ago` : "The checks haven't finished yet"}; they also run every minute and after each of your turns.`
+  if (slow) unknown.push(line('unknown', 'A re-check is still running (it took over 20 s), so what follows is from before it; call health again shortly'))
+  if (!checkedAt || old) unknown.push(line('unknown', `What the checks cover (maintenance, caches, public/hot, Herd, installs): ${why}, so nothing they cover is listed as fine`))
+
+  for (const c of checks) {
+    // The backlog is swapped in by each queue read, so it's as current as the queue
+    const checkOld = old && !c.backlog
+    const text = line(c.known, `${c.band}: ${c.evidence}${checkOld ? `; stale: ${why}, so this is from ${ago(checkedAt)} ago` : ''}`) + '\n' + nextSteps(c.claude, c.fix?.label)
+    if (checkOld || (c.fromAbout && aboutFailed)) stale.push(text)
+    else if (c.known === 'unknown') unknown.push(text)
+    else problems.push(text)
+  }
+  for (const n of notChecked()) unknown.push(line('unknown', n.text) + (n.artisan ? '\n' + nextSteps(await artisanStep($, [n.artisan]), undefined) : ''))
+
+  const env = about?.environment?.environment
+  // An answer without an environment is unknown, not fine
+  if (about && typeof env !== 'string') unknown.push(line('unknown', `APP_ENV: artisan about answered ${ago(aboutAt)} ago without an environment, so production isn't ruled out`))
+  // production is the env: production finding's, which goes stale with about
+  else if (about && env !== 'production') {
+    if (aboutFailed) stale.push(line('seen', `APP_ENV was ${env} at the artisan about ${ago(aboutAt)} ago; stale: artisan about has failed since (${aboutFailed})`))
+    else fine.push(line('seen', `APP_ENV is ${env} (artisan about, ${ago(aboutAt)} ago)`))
+  }
+  if (!old) fine.push(...checkedFine.map(f => line(f.known, f.evidence)))
+
+  for (const svc of Object.values(services)) {
+    if (svc.crashed && !svc.run) {
+      problems.push(line('seen', `${svc.label}, started by this session, exited with code ${svc.crashed.code}`) + '\n' + nextSteps(serviceStep(svc.name, 'restart'), `restart ${svc.name}`))
+    }
+  }
+
+  // A count kept from before a failed re-check is stale, never zero
+  if (migrationsAt) {
+    const read = `migrate:status, ${ago(migrationsAt)} ago`
+    const failedSince = migrationsFailed ? `; stale: migrate:status has failed since (${migrationsFailed})` : ''
+    if (pendingMigrations) {
+      const text = line('seen', `${plural(pendingMigrations, 'pending migration')} (${read})${failedSince}`) + '\n' + nextSteps(await artisanStep($, ['migrate']), 'migrate')
+      ;(migrationsFailed ? stale : problems).push(text)
+    } else if (migrationsFailed) stale.push(line('seen', `no pending migrations (${read})${failedSince}`))
+    else fine.push(line('seen', `no pending migrations (${read})`))
+  }
+
+  // A run from before Claude's PHP edits is stale, passed or failed
+  const t = lastTest
+  let passing = ''
+  if (!t) unknown.push(line('unknown', 'Tests: none run this session'))
+  else {
+    const run = t.failed ? `${t.failed} failed, ${t.passed} passed${t.skipped ? `, ${t.skipped} skipped` : ''}` : `${t.passed} passed`
+    const text = line('seen', `Tests: ${run} in the last run (${redact(t.label)}, ${ago(t.at)} ago)${t.editedSince ? '; stale: Claude edited PHP files since' : ''}`)
+    const next = t.failed || t.editedSince ? '\n' + nextSteps(await artisanStep($, ['test']), undefined) : ''
+    if (t.editedSince) stale.push(text + next)
+    else if (t.failed) problems.push(text + next)
+    else passing = text
+  }
+
+  const failedNext = `queue tool "failed" (${shareAllowed ? 'the user allowed exceptions this session' : 'asks the user before sending exceptions'}); queue tool "retry" (asks the user first)`
+  if (snapshot?.failedTotal && !snapshotError) {
+    problems.push(line('seen', `${plural(snapshot.failedTotal, 'failed job')} stored (queue read ${ago(snapshotAt)} ago)`) + '\n' + nextSteps(failedNext, undefined))
+  } else if (snapshot?.failedTotal) {
+    stale.push(line('seen', `${plural(snapshot.failedTotal, 'failed job')} stored (queue read ${ago(snapshotOkAt)} ago); stale: the queue read ${ago(snapshotAt)} ago ${queueReadFailure()}`) + '\n' + nextSteps(failedNext, undefined))
+  }
+
+  // Counts and the log's own timestamp only: entries go through the logs tool, which asks
+  const newestError = [...logState.entries].reverse().find(isError)
+  if (unseenErrors) {
+    const when = newestError ? `, newest at ${newestError.time}` : ''
+    const logsNext = `logs tool (${shareAllowed ? 'the user allowed log entries this session' : 'asks the user before sending entries'})`
+    problems.push(line('seen', `${plural(unseenErrors, 'new error')} in ${logPath} since the user last looked at the log (Log tab or /lara-logs)${when}`) + '\n' + nextSteps(logsNext, undefined))
+  }
+
+  if (snapshot) {
+    const n = waiting(snapshot)
+    const counted = `${snapshot.connection} connection, ${n ? `${n} waiting (${waitingSizes(snapshot)})` : 'nothing waiting'}`
+    // notChecked() lists a failed or partial read under Unknown; a partial one still has current counts
+    if (snapshotError && sizesRead) session.push(line('seen', `Queue: ${counted} (read ${ago(snapshotAt)} ago)`))
+    else if (!snapshotError && snapshot.connection === 'sync') fine.push(line('seen', `Queue: sync connection, so jobs run inline and no worker is needed (read ${ago(snapshotAt)} ago)`))
+    else if (!snapshotError && !n && !snapshot.failedTotal) fine.push(line('seen', `Queue: nothing waiting, no failed jobs stored (${snapshot.connection} connection, read ${ago(snapshotAt)} ago)`))
+    // Not under Fine: these counts go with the backlog or failed-job problems above
+    else if (!snapshotError) session.push(line('seen', `Queue: ${counted}, ${snapshot.failedTotal} failed stored (read ${ago(snapshotAt)} ago)`))
+    if (drainingNote()) fine.push(line('inferred', `Fewer jobs wait than at the read before (${waitingBefore} → ${n}), so a worker elsewhere seems to be working the queue`))
+  }
+  if (passing) fine.push(passing)
+
+  for (const svc of Object.values(services)) {
+    if (svc.run) session.push(line('seen', `${svc.label}: running for ${ago(svc.startedAt ?? Date.now())}, started by this session`))
+    else session.push(line('seen', `${svc.label}: not running in this session; lara-cc can't see one run elsewhere (another terminal, Supervisor)`))
+  }
+  if (logRun) {
+    const errors = filteredLog('errors').length
+    session.push(line('seen', `Log: following ${logPath}; ${errors ? plural(errors, 'error') : 'no errors'} among the last ${logState.entries.length} entries`))
+  }
+
+  const sections: [string, string[]][] = [['Problems', problems], ['Unknown', unknown], ['Stale', stale], ['Fine', fine], ['This session', session]]
+  return [
+    `lara-cc health (read-only: it changed nothing). ${sentence}`,
+    "[seen]: lara-cc saw it. [inferred]: a conclusion from indirect evidence. [unknown]: lara-cc couldn't tell; treat it as neither fine nor broken. Stale: true when last seen, not confirmed since. Not listed means not checked, not fine.",
+    "next: (runs without asking) you may do; (asks the user first) shows them a question, and a no means don't retry; the user's button is theirs to press: suggest it.",
+    '',
+    ...sections.filter(([, lines]) => lines.length).flatMap(([name, lines]) => [name + ':', ...lines]),
+    NEVER_CHECKED,
+  ].join('\n')
 }
 
 /**
@@ -1588,9 +2035,14 @@ function leaveProject() {
   stats.done = stats.failed = stats.totalMs = 0
   snapshot = undefined
   snapshotAt = 0
+  snapshotOkAt = 0
   snapshotError = ''
-  snapshotLoading = false
+  snapshotKind = ''
+  sizesRead = false
+  snapshotLoad = undefined
   pendingMigrations = 0
+  migrationsAt = 0
+  migrationsFailed = ''
   lastRun = undefined
   testsRunning = false
   restartTimer?.cancel()
@@ -1609,14 +2061,23 @@ async function detectProject($: Api) {
   composerArgv = ['composer']
   phpInfo = ''
   checks = []
-  connections = []
+  checkedFine = []
+  checkedAt = 0
+  checksMissed = 0
+  checksFailed = ''
+  connections = undefined
   shareAllowed = false
   lastTest = undefined
   waitingBefore = undefined
+  waitingAtTick = undefined
   hasBoost = false
   depsSeen = ''
   depsChecks = []
+  depsFine = []
+  depsUnread = []
   about = undefined
+  aboutAt = 0
+  aboutFailed = ''
   routeList = undefined
   // A load still running is for the folder left behind (see loadRouteList)
   routesLoading = undefined
@@ -1750,6 +2211,13 @@ export const register: Register = on => {
       inputSchema: { type: 'object', properties: { filter: { type: 'string' } } },
       isDeferred: false,
     })
+    await $.tool.register({
+      name: 'health',
+      description:
+        "What lara-cc knows about this Laravel app's local health, and how: problems, what it couldn't tell, what is stale and what is fine, each marked [seen], [inferred] or [unknown] with its age, and each problem with its next step and whether that runs without asking, asks the user first, or is the user's to do. Read-only: it re-runs the checks, the queue read and migrate:status first. Counts, drivers, local ports and file names only: read log entries and exceptions with the logs and queue tools. Call it before telling the user something is broken or working, and after a fix to confirm it took.",
+      inputSchema: { type: 'object', properties: {} },
+      isDeferred: false,
+    })
 
     if (isLaravel) {
       void watchLog($)
@@ -1760,6 +2228,13 @@ export const register: Register = on => {
       for (const name of settings.autostart[projectDir] ?? []) if (services[name]) void startService($, name)
       // Pick up a new daily log file, and keep the Queue tab current while it's showing
       timers.push($.clock.every(60_000, () => {
+        // Reset when checkHealth finishes: three ticks without that and its results show as stale
+        checksMissed++
+        // The queue's read before moves at most once a tick (see refreshQueue)
+        if (waitingAtTick !== undefined) {
+          waitingBefore = waitingAtTick
+          waitingAtTick = undefined
+        }
         void watchLog($)
         // about is re-read so a changed APP_ENV or `artisan down` shows within a minute
         void loadAbout($).then(() => checkHealth($))
@@ -1809,8 +2284,10 @@ export const register: Register = on => {
     const [action = 'status', id = ''] = splitArgs(e.args)
     if (action === 'failed') {
       await refreshQueue($)
-      if (snapshot?.failed.length && !(await mayShare($, `${plural(snapshot.failedTotal, 'failed job')} with their exceptions`))) return { text: NOT_SHARED }
-      return { text: snapshot ? `${plural(snapshot.failedTotal, 'failed job')}:\n` + formatFailed(snapshot.failed, 3) : redact(snapshotError) }
+      // A failed or partial read has no failed-job list to give: not "0 failed jobs", and not an older read's list
+      if (!snapshot || snapshotError) return { text: queueUnread() }
+      if (snapshot.failed.length && !(await mayShare($, `${plural(snapshot.failedTotal, 'failed job')} with their exceptions`))) return { text: NOT_SHARED }
+      return { text: `${plural(snapshot.failedTotal, 'failed job')}:\n` + formatFailed(snapshot.failed, 3) }
     }
     const typed = fromUser(e.origin)
     if (action === 'retry') return { text: id ? await (typed ? retryFailed($, id) : guardedRetry($, id)) : 'Usage: /lara-queue retry <id|all>' }
@@ -1839,7 +2316,7 @@ export const register: Register = on => {
 
   on('command.run', { command: 'lara-test' }, async ($, e) => {
     if (!isLaravel) return { text: notLaravel() }
-    const run = await runCommand($, 'test ' + e.args, ['php', 'artisan', 'test', ...splitArgs(e.args)])
+    const run = await runCommand($, ('test ' + e.args).trim(), ['php', 'artisan', 'test', ...splitArgs(e.args)])
     return { text: formatRun(run) }
   }).catch(commandFailed)
 
@@ -1902,11 +2379,14 @@ export const register: Register = on => {
     if (args.action === 'retry') return { result: args.id ? await guardedRetry($, String(args.id)) : 'Give the failed job id, or "all".' }
     await refreshQueue($)
     if (args.action === 'failed') {
-      if (snapshot?.failed.length && !(await mayShare($, `${plural(snapshot.failedTotal, 'failed job')} with their exceptions`))) return { result: NOT_SHARED }
-      return { result: snapshot ? `${plural(snapshot.failedTotal, 'failed job')}:\n` + formatFailed(snapshot.failed, 5) : redact(snapshotError) }
+      if (!snapshot || snapshotError) return { result: queueUnread() }
+      if (snapshot.failed.length && !(await mayShare($, `${plural(snapshot.failedTotal, 'failed job')} with their exceptions`))) return { result: NOT_SHARED }
+      return { result: `${plural(snapshot.failedTotal, 'failed job')}:\n` + formatFailed(snapshot.failed, 5) }
     }
-    const worker = services.queue.run ? `${services.queue.label} running (started by this session).` : `${services.queue.label} not started by this session.`
-    return { result: [worker, queueSummary(), snapshotError ? 'Note: ' + redact(snapshotError) : ''].filter(Boolean).join('\n') }
+    const worker = services.queue.run
+      ? `${services.queue.label} running (started by this session).`
+      : `${services.queue.label} not started by this session; lara-cc can't see a worker run elsewhere (another terminal, Supervisor), so whether one runs is unknown.`
+    return { result: [worker, queueSummary()].join('\n') }
   }).catch(toolFailed)
 
   on('tool.call', { tool: 'mcp__lara-cc__routes' }, async ($, e) => {
@@ -1914,14 +2394,26 @@ export const register: Register = on => {
     return { result: await routesText($, String((e as unknown as { filter?: string }).filter ?? '')) }
   }).catch(toolFailed)
 
+  on('tool.call', { tool: 'mcp__lara-cc__health' }, async ($, e) => {
+    if (!isLaravel) return { result: notLaravel() }
+    const project = projectRun
+    // Read-only, so no question: everything it runs already runs unasked (nc and curl to this machine, migrate:status,
+    // the queue read). Bounded, so a hung PHP can't hang the tool: past it, the answer says the re-check is still running
+    const finished = await Promise.race([recheck($).then(() => true), $.clock.sleep(20_000).then(() => false)])
+    if (project !== projectRun) return { result: 'The session moved to another folder while lara-cc was checking; call health again.' }
+    // Every input is from the allow-list already; redact() is a second line of defence
+    return { result: redact(await healthText($, !finished)) }
+  }).catch(toolFailed)
+
   // ── Tests Claude runs itself: the result shows in the band and the Tests tab ──
 
   // No .catch that calls next again: the command has already run, and must not run twice
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const edits = phpEdits
     const result = await next(e)
     try {
       const command = String((e as unknown as { command?: string }).command ?? '')
-      if (isLaravel && isTestCommand(command) && !('deny' in result && result.deny)) noteTestRun($, 'Claude ran ' + command.slice(0, 60), resultText(result))
+      if (isLaravel && isTestCommand(command) && !('deny' in result && result.deny)) noteTestRun($, 'Claude ran ' + command.slice(0, 60), resultText(result), edits)
     } catch (err) {
       $.ui.log('lara-cc: could not read the test run: ' + String(err))
     }
@@ -1961,6 +2453,9 @@ export const register: Register = on => {
       const path = String((e as unknown as { file_path?: string }).file_path ?? '')
       if (!path.endsWith('.php') || ('isError' in result && result.isError)) return result
       editedPhp.add(path)
+      phpEdits++
+      // The last test run no longer covers the code
+      if (lastTest) lastTest.editedSince = true
       if (settings.autoRestartQueue && services.queue.run) {
         restartTimer?.cancel()
         restartTimer = $.clock.after(2000, async () => {
@@ -2028,27 +2523,44 @@ export const register: Register = on => {
     if (!isLaravel || !settings.showBand || e.props.hasSurvey) return next(e)
     const running = Object.values(services).filter(s => s.run)
     const failedStored = snapshot?.failedTotal ?? 0
+    // A read that failed or couldn't count them leaves the failed jobs unknown, not none
+    const failedUnknown = !!snapshot && !!snapshotError && !failedStored
     const crashed = Object.values(services).filter(s => s.crashed && !s.crashed.seen)
     const failingTests = lastTest?.failed ?? 0
-    if (!running.length && !crashed.length && !unseenErrors && !failedStored && !pendingMigrations && !failingTests && !checks.length) return next(e)
+    const stale = checksStale()
+    if (!running.length && !crashed.length && !unseenErrors && !failedStored && !failedUnknown && !pendingMigrations && !failingTests && !checks.length && !stale) return next(e)
 
     const { Box, Text, Button } = $.ui.resolve(e)
     const theirs = await next(e)
-    type Item = { text: string; color?: string; fix?: Fix }
+    // `dim`: a count kept from before a re-read that failed
+    type Item = { text: string; color?: string; fix?: Fix; dim?: boolean }
     const items: Item[] = []
     for (const s of running) {
       const extra = s.name === 'queue' && (stats.done || stats.failed) ? ` ${stats.done}✓${stats.failed ? ` ${stats.failed}✗` : ''}` : ''
       items.push({ text: '●', color: 'green' }, { text: s.name + extra })
     }
-    if (lastTest && !failingTests) items.push({ text: `✓ ${plural(lastTest.passed, 'test')}`, color: 'green' })
+    // A passing run from before Claude's PHP edits isn't drawn: it no longer covers the code
+    if (lastTest && !failingTests && !lastTest.editedSince) items.push({ text: `✓ ${plural(lastTest.passed, 'test')}`, color: 'green' })
     for (const s of crashed) {
       items.push({ text: `✗ ${s.name} exited (${s.crashed!.code})`, color: 'red', fix: { label: `restart ${s.name}`, run: () => restartService($, s.name) } })
     }
-    if (failingTests) items.push({ text: `✗ ${plural(failingTests, 'test')} failing`, color: 'red' })
+    if (failingTests) {
+      items.push(
+        lastTest!.editedSince
+          ? { text: `✗ ${plural(failingTests, 'test')} failed, edited since`, color: 'yellow' }
+          : { text: `✗ ${plural(failingTests, 'test')} failing`, color: 'red' },
+      )
+    }
     if (unseenErrors) items.push({ text: `▲ ${plural(unseenErrors, 'new error')}`, color: 'red' })
-    if (failedStored) items.push({ text: plural(failedStored, 'failed job'), color: 'yellow' })
-    if (pendingMigrations) items.push({ text: plural(pendingMigrations, 'pending migration'), color: 'yellow', fix: { label: 'migrate', run: migrateFix($) } })
-    const warnings: Item[] = checks.map(c => ({ text: `⚠ ${c.band}`, color: c.color, fix: c.fix }))
+    if (failedStored) {
+      items.push({ text: plural(failedStored, 'failed job') + (snapshotError ? ' (last read failed)' : ''), color: 'yellow', dim: !!snapshotError })
+    } else if (failedUnknown) items.push({ text: '? failed jobs unknown', color: 'yellow', dim: true })
+    if (pendingMigrations) {
+      items.push({ text: plural(pendingMigrations, 'pending migration') + (migrationsFailed ? ' (last check failed)' : ''), color: 'yellow', dim: !!migrationsFailed, fix: { label: 'migrate', run: migrateFix($) } })
+    }
+    // In items, so it's never folded away. runFix checks again once this returns
+    if (stale) items.push({ text: checkedAt ? `? checks stale (${ago(checkedAt)})` : '? checks not run', color: 'yellow', fix: { label: 'recheck', run: async () => {} } })
+    const warnings: Item[] = checks.map(c => ({ text: `${mark(c)} ${c.band}`, color: c.color, fix: c.fix }))
 
     // Too wide for one row: drop the fix buttons, then fold the warnings into a count (the Services tab has both)
     const widthOf = (list: Item[], withFixes: boolean) =>
@@ -2057,12 +2569,19 @@ export const register: Register = on => {
     let withFixes = widthOf(shown, true) <= e.props.bodyColumns
     if (!withFixes && widthOf(shown, false) > e.props.bodyColumns) {
       shown = [...items]
-      if (checks.length) shown.push({ text: `⚠ ${plural(checks.length, 'warning')}`, color: checks.some(c => c.color === 'red') ? 'red' : 'yellow' })
+      // Folded under the marker of what's folded: only unchecked or inferred findings aren't warnings
+      const seen = checks.some(c => c.known === 'seen')
+      const count = seen ? `⚠ ${plural(checks.length, 'warning')}` : `? ${checks.length} unchecked`
+      if (checks.length) shown.push({ text: count, color: checks.some(c => c.color === 'red') ? 'red' : 'yellow' })
       withFixes = widthOf(shown, true) <= e.props.bodyColumns
     }
     const parts = shown.flatMap(i => {
       const fix = withFixes ? i.fix : undefined
-      const text = <Text color={i.color}>{i.text + (fix ? ' ' : i.text === '●' ? ' ' : '  ')}</Text>
+      const text = (
+        <Text color={i.color} dimColor={i.dim}>
+          {i.text + (fix ? ' ' : i.text === '●' ? ' ' : '  ')}
+        </Text>
+      )
       if (!fix) return [text]
       // A fix runs only on the person's press
       const busy = fixing.has(fix.label)
@@ -2137,13 +2656,21 @@ export const register: Register = on => {
       const autostart = settings.autostart[projectDir] ?? []
       const herdText = herdList.map(s => `○ ${s.name} ${s.version} :${s.port}` + (s.up === 'up' ? '' : s.up === 'down' ? ' starting…' : ' unchecked starting…'))
       // The Herd row wraps on a narrow pane
-      const herdRows = herdList.length ? Math.ceil(['Herd services', ...herdText].join('  ').length / width) : 0
+      const herdRows = herdList.length ? Math.ceil(['Herd services (port check)', ...herdText].join('  ').length / width) : 0
+      // When the checks ran, and what they couldn't check: not fine, not broken (the health tool lists the same)
+      const stale = checksStale()
+      const missing = notChecked().map(n => n.label)
+      const ran = checkedAt
+        ? `checks ${stale ? 'stale, last finished' : 'ran'} ${ago(checkedAt)} ago${checks.length || missing.length ? '' : ': nothing found'}`
+        : 'checks not run yet'
+      const notCheckedText = missing.length ? `· not checked: ${missing.join(', ')}` : ''
+      const checksRows = Math.ceil(`${ran} ${notCheckedText} recheck`.length / width)
       body = (
         <Box flexDirection="column">
           {phpInfo && <Text dimColor>{phpInfo}</Text>}
           {herdList.length > 0 && (
             <Box flexDirection="row" columnGap={2} flexWrap="wrap">
-              <Text dimColor>Herd services</Text>
+              <Text dimColor>Herd services (port check)</Text>
               {herdList.map(s =>
                 s.up === 'up' ? (
                   <Text color="green">{`● ${s.name} ${s.version} :${s.port}`}</Text>
@@ -2174,9 +2701,16 @@ export const register: Register = on => {
               {debugState === 'off' && debugCapture && <Button key="debug-ask" label="ask Claude" plain onPress={() => void askAboutDebugCapture($)} />}
             </Box>
           )}
+          <Box flexDirection="row" columnGap={1} flexWrap="wrap">
+            <Text dimColor={!stale} color={stale ? 'yellow' : undefined}>
+              {ran}
+            </Text>
+            {notCheckedText && <Text dimColor>{notCheckedText}</Text>}
+            <Button key="checks-recheck" label={checking ? 'checking…' : 'recheck'} plain dimColor onPress={() => void recheck($)} />
+          </Box>
           {checks.map(c => (
             <Box flexDirection="row" columnGap={1}>
-              <Text color={c.color}>{`⚠ ${c.detail}`}</Text>
+              <Text color={c.color}>{`${mark(c)} ${c.detail}`}</Text>
               {c.fix && (
                 <Button
                   key={'check-fix-' + c.fix.label}
@@ -2196,7 +2730,7 @@ export const register: Register = on => {
               {svc.crashed && !svc.run ? (
                 <Text color="red">{`exited (${svc.crashed.code})`.padEnd(13)}</Text>
               ) : (
-                <Text dimColor>{(svc.run ? 'running ' + ago(svc.startedAt ?? Date.now()) : 'stopped').padEnd(13)}</Text>
+                <Text dimColor>{(svc.run ? 'running ' + ago(svc.startedAt ?? Date.now()) : svc.lines.length ? 'stopped' : 'not started').padEnd(13)}</Text>
               )}
               {svc.run ? (
                 <Button key={'stop-' + svc.name} label="stop" onPress={() => void stopService($, svc.name)} />
@@ -2230,28 +2764,31 @@ export const register: Register = on => {
           </Box>
           <Text> </Text>
           <Text bold>{shown?.label ?? ''} output</Text>
-          {(shown?.lines.length ? shown.lines.slice(-Math.max(3, rows - Object.keys(services).length - 4 - (phpInfo ? 1 : 0) - herdRows - (herdList.length ? 1 : 0) - checks.length * 2)) : ['(no output yet)']).map(l => line(l, true))}
+          {(shown?.lines.length ? shown.lines.slice(-Math.max(3, rows - Object.keys(services).length - 4 - (phpInfo ? 1 : 0) - herdRows - (herdList.length ? 1 : 0) - checks.length * 2 - checksRows)) : ['(no output yet)']).map(l => line(l, true))}
         </Box>
       )
     } else if (tab === 'queue') {
       const avg = stats.done ? Math.round(stats.totalMs / stats.done) : 0
       const failed = snapshot?.failed ?? []
       const recent = jobs.slice(-Math.max(3, Math.floor((rows - 8) / 2)))
+      // When the counts shown were read: after a read that couldn't count, the last full one's
+      const readAt = sizesRead ? snapshotAt : snapshotOkAt
       body = (
         <Box flexDirection="column">
           <Box flexDirection="row" columnGap={2}>
             <Text>
-              {snapshot ? `connection ${snapshot.connection}` : snapshotLoading ? 'reading queue…' : 'queue state unknown'}
+              {snapshot ? `connection ${snapshot.connection}` : snapshotLoad ? 'reading queue…' : 'queue state unknown'}
             </Text>
             {snapshot && (
               <Text dimColor>{Object.entries(snapshot.sizes).map(([q, n]) => `${q}: ${n} pending`).join('  ')}</Text>
             )}
-            <Button key="queue-refresh" label={snapshotAt ? `refresh (${ago(snapshotAt)} ago)` : 'refresh'} plain dimColor onPress={() => void refreshQueue($)} />
+            <Button key="queue-refresh" label={readAt ? `refresh (read ${ago(readAt)} ago)` : 'refresh'} plain dimColor onPress={() => void refreshQueue($)} />
+            {snapshotError && <Text dimColor>(last read failed)</Text>}
           </Box>
           {snapshot?.connection === 'sync' && line('QUEUE_CONNECTION=sync: jobs run inline during the request, so no worker is needed.', false, 'yellow')}
           {snapshotError && line(snapshotError, false, 'red')}
           <Text>
-            {`${services.queue.label}: ${services.queue.run ? 'running' : 'stopped'}  ·  ${stats.done} done  ·  ${stats.failed} failed${stats.done ? `  ·  avg ${avg}ms` : ''}`}
+            {`${services.queue.label}: ${services.queue.run ? 'running' : 'not running in this session'}  ·  ${stats.done} done  ·  ${stats.failed} failed${stats.done ? `  ·  avg ${avg}ms` : ''}`}
           </Text>
           <Text> </Text>
           <Text bold>Recent jobs</Text>
@@ -2377,6 +2914,7 @@ export const register: Register = on => {
             </Text>
           )}
           {t && <Text dimColor>{`${t.label} · ${ago(t.at)} ago`}</Text>}
+          {t?.editedSince && <Text dimColor>Claude edited PHP files since this run; not re-run</Text>}
           {t && t.failed > 0 && !t.failures.length && <Text dimColor>The output didn't include the failures. Run the tests here to see them.</Text>}
           {t?.failures.slice(0, room).map((f, i) => (
             <Box flexDirection="column">

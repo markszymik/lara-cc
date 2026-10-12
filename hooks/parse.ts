@@ -95,6 +95,20 @@ export function shortClass(name: string): string {
   return name.replace(/^App\\(Jobs|Listeners|Mail|Notifications|Http\\Controllers)\\/, '')
 }
 
+/**
+ * The kind of a PHP failure, for Claude where the message itself could name a host, user or path: the short class
+ * of the first exception or error named, else `PHP Parse error` / `PHP Fatal error`, and the SQLSTATE and driver
+ * code; '' when none is found. Never message text.
+ */
+export function errorKind(output: string): string {
+  const text = stripAnsi(output)
+  const sql = /SQLSTATE\[(\w{5})\](?:\s*\[(\d+)\])?/.exec(text)
+  const cls = /(?:^|[\s\\(])([A-Z]\w*(?:Exception|Error))\b/.exec(text)
+  const php = /\bPHP (Parse|Fatal) error\b/.exec(text)
+  const parts = [cls?.[1] ?? (php ? `PHP ${php[1]} error` : ''), sql ? `SQLSTATE[${sql[1]}]` + (sql[2] ? ` [${sql[2]}]` : '') : '']
+  return parts.filter(Boolean).join(', ')
+}
+
 // ─── storage/logs/*.log ────────────────────────────────────────────────────
 
 const LOG_HEADER = /^\[(\d{4}-\d\d-\d\d[ T][^\]]+)\] ([\w-]+)\.([A-Z]+): ?(.*)$/
@@ -210,7 +224,11 @@ export type QueueSnapshot = {
   sizes: Record<string, number>
   failedTotal: number
   failed: FailedJob[]
+  /** The message of what failed, for the person; `errorKind` is its exception's short class, for Claude. */
   error?: string
+  errorKind?: string
+  /** The sizes were read but the failed jobs weren't: `failedTotal` and `failed` say nothing. */
+  partial?: true
 }
 
 /** PHP run with `php -r` from the project root: boots the app and prints the queue state as JSON. */
@@ -224,7 +242,9 @@ $c = config('queue.default');
 $queues = [${list}];
 if (!$queues) $queues = [config("queue.connections.$c.queue") ?: 'default'];
 $out = ['connection' => $c, 'sizes' => [], 'failedTotal' => 0, 'failed' => []];
-foreach ($queues as $q) { try { $out['sizes'][$q] = Illuminate\\Support\\Facades\\Queue::connection($c)->size($q); } catch (Throwable $e) { $out['error'] = $e->getMessage(); } }
+// The class's short name is safe for Claude; the message can name a host or user
+$fail = function (Throwable $e) use (&$out) { $out['error'] = $e->getMessage(); $out['errorKind'] = (new ReflectionClass($e))->getShortName(); };
+foreach ($queues as $q) { try { $out['sizes'][$q] = Illuminate\\Support\\Facades\\Queue::connection($c)->size($q); } catch (Throwable $e) { $fail($e); } }
 try {
   $all = app('queue.failer')->all();
   $out['failedTotal'] = count($all);
@@ -233,14 +253,17 @@ try {
     $p = json_decode($f['payload'] ?? '{}', true) ?: [];
     $out['failed'][] = ['id' => (string) ($f['uuid'] ?? $f['id'] ?? ''), 'queue' => (string) ($f['queue'] ?? ''), 'job' => (string) ($p['displayName'] ?? '?'), 'failedAt' => (string) ($f['failed_at'] ?? ''), 'exception' => mb_substr((string) ($f['exception'] ?? ''), 0, 4000)];
   }
-} catch (Throwable $e) { $out['error'] = $e->getMessage(); }
+} catch (Throwable $e) { if (!isset($out['error'])) $out['partial'] = true; $fail($e); }
 echo json_encode($out);
 `
 }
 
 /** Read the JSON from the snapshot's output. */
 export function parseSnapshot(stdout: string): QueueSnapshot | undefined {
-  return phpJson(stdout, '{"connection"') as QueueSnapshot | undefined
+  const snap = phpJson(stdout, '{"connection"') as QueueSnapshot | undefined
+  // Only a plain class name reaches Claude: anything else (an anonymous class's name holds a path) is dropped
+  if (snap?.errorKind !== undefined && !/^[A-Za-z_]\w*$/.test(String(snap.errorKind))) snap.errorKind = ''
+  return snap
 }
 
 /** First line of a stored exception, e.g. `RuntimeException: Payment gateway down in /app/...:12`. */
@@ -307,6 +330,12 @@ export function localHotUrl(text: string): string | undefined {
   const host = url.hostname.replace(/^\[|\]$/g, '')
   const local = ['localhost', '127.0.0.1', '::1', '0.0.0.0'].includes(host) || host.endsWith('.test') || host.endsWith('.localhost')
   return local ? url.origin : undefined
+}
+
+/** The port of a dev server origin from localHotUrl, with the scheme's default when none is given. */
+export function hotPort(origin: string): number {
+  const url = new URL(origin)
+  return Number(url.port) || (url.protocol === 'https:' ? 443 : 80)
 }
 
 export type HerdService = { type: string; name: string; port: number; version: string }
@@ -645,6 +674,29 @@ const SERIALIZED = new RegExp(
   String.raw`(s:\d+:(\\?")(?:[^"\\]|\\u0000){0,100}?${SECRET_KEY}\2;)s:\d+:\2[\s\S]{0,20000}?\2;(?=[sibdaOCN][:;]|\}|$)`,
   'gi',
 )
+/**
+ * A host key and its value: `Host: db.internal`, `host=…`, `"host":"…"`, `'host' => '…'`, `DB_HOST=…`, also a list
+ * (`'host' => ['10.0.0.5', …]`). The key starts a word, so `localhost:6379` is no key.
+ */
+const HOST_VALUE = new RegExp(
+  String.raw`(?<![\w.-])(\\?["']|)((?:[\w.-]{0,100}[_.-])?host(?:name)?)\1(\s*(?:=>|[:=])\s*)(\[[^\]\n]{0,1000}\]|\\"(?:[^"\\]|\\(?!"))*\\"|"(?:[^"\\]|\\.)*"|'[^']*'|[^\s,;&)}\]]+)`,
+  'gi',
+)
+/** This machine, which Claude may see: it's where Herd's services run, and says nothing about anyone's network. */
+const LOCAL_HOST = /^(?:\\?["'])?\[?(?:localhost|127\.0\.0\.1|::1)\]?(?::\d{1,5})?(?:\\?["'])?$/i
+/** Schemes that always name a server, never a page: their host goes even without a user (`[tcp://10.0.0.5:6379]`). */
+const SERVER_URL = /\b((?:tcp|tls|ssl|redis|rediss|mysql|mariadb|pgsql|postgres(?:ql)?|sqlsrv|mongodb(?:\+srv)?|amqps?|memcached?):\/\/)(?!\[redacted\])(\[[\w.:%-]*\]|[\w.%-]+)/gi
+
+/**
+ * Connection errors that name a host after a phrase, with no key and no URL: `Unable to connect to db.internal:6379`,
+ * `failed to connect to db.internal port 3306`, `Can't connect to MySQL server on 'db.internal' (111)`, `could not
+ * translate host name "db.internal"`, `getaddrinfo failed for db.internal`, `Connection to db.internal:3306 refused`,
+ * `No route to host 10.0.0.5`, Node's `connect ECONNREFUSED 2001:db8::1:3306`. The host is dotted, an IP, or followed
+ * by a port, so `connect to the database` is left alone; the port stays.
+ */
+const CONNECT_HOST = /(\b(?:(?:unable|failed|could not) (?:to )?connect to |could not open socket to |could not translate host name "?|getaddrinfo failed for |established with host "?|connect to MySQL server on ['"]?|connection to |no route to host |\b(?:ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ENOTFOUND) ))((?:[\w-]+\.)+[\w-]+|\[[\w.:%-]*\]|(?:[\da-f]{0,4}:){2,7}[\da-f]{0,4}|[\w-]+(?=:\d|\s+port\b|['"]\s*\())/gi
+/** An IPv4 or bracketed IPv6 address with a port (`connect ECONNREFUSED 10.1.2.3:5432`): a server, not a version number or a client. */
+const ADDRESS_PORT = /(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3}|\[[\da-f.]*:[\da-f:.]*\])(?=:\d{1,5}\b)/gi
 /** Tokens recognisable by their prefix: AWS key ids, Stripe and Slack keys, GitHub tokens, JWTs. */
 const KNOWN_TOKENS = /\b(?:AKIA[0-9A-Z]{16}|(?:sk|pk|rk)_(?:live|test)_\w{8,}|xox[abeprs]-[\w-]{8,}|gh[pousr]_\w{20,}|github_pat_\w{20,}|eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,})/g
 
@@ -674,7 +726,8 @@ function sqlWithoutValues(line: string): string {
   if (!/SQLSTATE|SQL: /.test(line)) return line
   const at = line.indexOf('SQL: ')
   const message = (at < 0 ? line : line.slice(0, at))
-    .replace(/'((?:[^'\\]|\\.)*)'/g, (all, inner: string) => (/^[a-z_][a-z0-9_]*(\.[a-z0-9_]+)*$/.test(inner) ? all : "'?'"))
+    // An opening quote isn't an apostrophe (`Can't connect to MySQL server on 'db.internal'`)
+    .replace(/(?<!\w)'((?:[^'\\]|\\.)*)'/g, (all, inner: string) => (/^[a-z_][a-z0-9_]*(\.[a-z0-9_]+)*$/.test(inner) ? all : "'?'"))
     .replace(/\)=\([^)]*\)/g, ')=(?)')
   if (at < 0) return message
   const sql = line.slice(at)
@@ -684,9 +737,10 @@ function sqlWithoutValues(line: string): string {
 
 /**
  * Hide what looks confidential in log entries, exceptions and command output before they go to Claude:
- * passwords, tokens and keys by name, credentials in URLs, bearer tokens, email addresses, SQL values,
- * stack frame arguments, and long random strings. Best effort: it can't know every secret, so callers
- * still ask before sending log and exception text.
+ * passwords, tokens and keys by name, credentials in URLs, bearer tokens, hosts other than this machine (as a
+ * `host` value, in a server URL, after a connection error's phrase, or an IP with a port; an http(s) URL's hostname stays unless it has a user, but an IP in one goes: `http://[host]:5173/`),
+ * email addresses, SQL values, stack frame arguments, and long random strings. Best effort: it can't know
+ * every secret, so callers still ask before sending log and exception text.
  */
 export function redact(text: string): string {
   return text
@@ -698,16 +752,28 @@ export function redact(text: string): string {
     .join('\n')
     // The user (and password) in a URL, up to its last @, so a password with an @ (or ; ( ) , … which userinfo
     // allows) goes too; a quote ends it, so it never runs into the next JSON field or argument
-    .replace(/\b([a-z][\w+.-]*:\/\/)[^\s\/@"'`<>]*(?:@[^\s\/@"'`<>]*)*@/gi, '$1[redacted]@')
+    // and the host after it (a port stays), unless it's this machine
+    .replace(/(?<![\w+.-])([a-z][\w+.-]*:\/\/)[^\s\/@"'`<>]*(?:@[^\s\/@"'`<>]*)*@(\[[\w.:%-]*\]|[\w.%-]*)/gi, (all, scheme: string, host: string) =>
+      `${scheme}[redacted]@${!host || LOCAL_HOST.test(host) ? host : '[host]'}`)
+    .replace(SERVER_URL, (all, scheme: string, host: string) => (LOCAL_HOST.test(host) ? all : `${scheme}[host]`))
+    // Connection errors name the host: `getaddrinfo for db.internal failed`
+    .replace(/(\bgetaddrinfo for )([\w.:%\[\]-]+)/gi, (all, before: string, host: string) => (LOCAL_HOST.test(host) ? all : `${before}[host]`))
+    .replace(CONNECT_HOST, (all, before: string, host: string) => (LOCAL_HOST.test(host) ? all : `${before}[host]`))
+    .replace(ADDRESS_PORT, (all, address: string) => (LOCAL_HOST.test(address) ? all : '[host]'))
     .replace(/\b(bearer|basic|token)(\s+)([\w~+\/.=-]{8,})/gi, (all, scheme: string, space: string, value: string) => {
       const credential = value.replace(/\.+$/, '')
       return looksLikeCredential(credential) ? `${scheme}${space}[redacted]${value.slice(credential.length)}` : all
     })
     .replace(/\bbase64:[A-Za-z0-9+\/]{16,}={0,2}/g, 'base64:[redacted]')
-    // Database login errors name the user: `for user 'forge'@'10.0.0.5'`, `for user "app"`
-    .replace(/(\bfor user\s+)(["'])[^"']*\2(@(["'])[^"']*\4)?/gi, "$1$2?$2")
+    // Database login errors name the user: `for user 'forge'@'10.0.0.5'`, `for user "app"`, Postgres' `user "forge"`, `role "forge"`
+    .replace(/(\b(?:for )?(?:user|role)\s+)(["'])[^"']*\2(@(["'])[^"']*\4)?/gi, "$1$2?$2")
+    // and so do Postgres' `server at "db.internal" (10.0.0.5)` and pg_hba.conf rejection `no pg_hba.conf entry for host "10.0.0.5"`
+    .replace(/(\b(?:host|server at)\s+)"([^"\n]*)"( \([\da-f.:]{0,45}\))?/gi, (all, before: string, host: string, address?: string) =>
+      LOCAL_HOST.test(host) || host.startsWith('[host]') ? all : `${before}"[host]"${address ? ' ([host])' : ''}`)
     .replace(SERIALIZED, '$1s:10:$2[redacted]$2;')
     .replace(KEY_VALUE, '$1$2$1$3[redacted]')
+    .replace(HOST_VALUE, (all, quote: string, key: string, separator: string, value: string) =>
+      LOCAL_HOST.test(value) ? all : `${quote}${key}${quote}${separator}[host]`)
     .replace(KNOWN_TOKENS, '[redacted]')
     .replace(/(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, '[email]')
     .replace(/(?<![\w\/\\.-])(?=[\w+=-]*[A-Z])(?=[\w+=-]*[a-z])(?=[\w+=-]*\d)[\w+=-]{32,}/g, '[redacted]')

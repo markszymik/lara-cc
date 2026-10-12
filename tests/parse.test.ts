@@ -5,6 +5,7 @@ import {
   composerDrift,
   durationMs,
   editorHref,
+  errorKind,
   exceptionHeadline,
   feedLog,
   formatEntry,
@@ -12,6 +13,7 @@ import {
   helpName,
   herdNeeds,
   herdServices,
+  hotPort,
   isError,
   isTestCommand,
   localHotUrl,
@@ -94,6 +96,9 @@ test('small helpers', () => {
   )
   expect(parseSnapshot('PHP Warning: x\n{"connection":"redis","sizes":{"default":3},"failedTotal":0,"failed":[]}')?.sizes).toEqual({ default: 3 })
   expect(parseSnapshot('Fatal error')).toBe(undefined)
+  // An anonymous exception class's name holds a path: only a plain class name is kept
+  expect(parseSnapshot('{"connection":"redis","errorKind":"PDOException"}')?.errorKind).toBe('PDOException')
+  expect(parseSnapshot('{"connection":"redis","errorKind":"RuntimeException@anonymous\\u0000/Users/me/app/a.php:2$0"}')?.errorKind).toBe('')
 })
 
 test('artisanCommandName skips options to find the command, as artisan does', () => {
@@ -168,6 +173,27 @@ test('localHotUrl accepts only dev servers on this machine', () => {
   expect(localHotUrl('http://example.com:5173')).toBe(undefined)
   expect(localHotUrl('file:///etc/passwd')).toBe(undefined)
   expect(localHotUrl('not a url')).toBe(undefined)
+})
+
+test("hotPort reads the port, with the scheme's default", () => {
+  expect(hotPort('http://[::1]:5173')).toBe(5173)
+  expect(hotPort('https://shop.test')).toBe(443)
+  expect(hotPort('http://localhost')).toBe(80)
+})
+
+test('errorKind keeps the class and codes, never the message, host or path', () => {
+  const kinds: [string, string][] = [
+    ['Illuminate\\Database\\QueryException\n  SQLSTATE[HY000] [2002] Connection refused (Connection: mysql, Host: db.internal)', 'QueryException, SQLSTATE[HY000] [2002]'],
+    ['PDOException: could not connect', 'PDOException'],
+    ['PHP Parse error:  syntax error in /Users/me/app/config/app.php on line 3', 'PHP Parse error'],
+    ['password=hunter2 mysql://forge:s3cr3t@db.internal:3306', ''],
+    ['Error: spawn php ENOENT', ''],
+  ]
+  for (const [output, kind] of kinds) {
+    expect(errorKind(output)).toBe(kind)
+    expect(errorKind(output)).not.toContain('db.internal')
+    expect(errorKind(output)).not.toContain('/Users/')
+  }
 })
 
 test('herdServices keeps type, name, port and version, and drops entries it cannot use', () => {
@@ -278,6 +304,36 @@ const SECRETS: [string, string, string[]][] = [
   ['serialized value with a quote in it', 's:8:"password";s:7:"ab"cdef";s:2:"id";i:4;', ['ab"cdef', 'cdef']],
   // Multi-line errors
   ['multi-line', "Login failed\npassword: hunter2\n#0 /app/a.php(3): auth('hunter2')", ['hunter2']],
+  // Hosts
+  ['host in an exception', 'SQLSTATE[HY000] [2002] Connection refused (Connection: mysql, Host: db.internal, Port: 3306)', ['db.internal']],
+  ['host in a query string', 'host=db.internal port=5432', ['db.internal']],
+  ['host in JSON', '{"host":"db.internal","port":3306}', ['db.internal']],
+  ['host in escaped JSON', String.raw`{"config":"{\"host\":\"db.internal\"}"}`, ['db.internal']],
+  ['host in a PHP array', "'host' => 'db.internal',", ['db.internal']],
+  ['host list in a PHP array', "'read' => ['host' => ['10.0.0.5', '10.0.0.6']]", ['10.0.0.5', '10.0.0.6']],
+  ['env host', 'DB_HOST=db.internal', ['db.internal']],
+  ['forwarded host header', 'X-Forwarded-Host: shop.example.com', ['shop.example.com']],
+  ['host after a URL user', 'could not connect to mysql://forge:s3cr3t@db.internal:3306/app', ['forge', 's3cr3t', 'db.internal']],
+  ['host after a bare URL user', 'could not connect to mysql://forge@db.internal/app', ['forge', 'db.internal']],
+  ['IPv6 host after a URL user', 'redis://default:x@[2001:db8::1]:6379', ['2001:db8']],
+  ['host in a socket address', 'Connection refused [tcp://10.0.0.5:6379]', ['10.0.0.5']],
+  ['host in a server URL without a user', 'REDIS_URL=redis://cache.internal:6379', ['cache.internal']],
+  ['host in a DNS error', 'SQLSTATE[HY000] [2002] php_network_getaddresses: getaddrinfo for db.internal failed', ['db.internal']],
+  ['host in an older Postgres error', 'could not connect to server: Connection refused\n\tIs the server running on host "db.internal" (10.0.0.5) and accepting', ['db.internal', '10.0.0.5']],
+  ['host in a Postgres error', 'SQLSTATE[08006] [7] connection to server at "db.internal" (10.0.0.5), port 5432 failed', ['db.internal', '10.0.0.5']],
+  [
+    'host and user in a Postgres pg_hba.conf rejection',
+    'SQLSTATE[08006] [7] connection to server at "db.internal" (10.0.0.5), port 5432 failed: FATAL:  no pg_hba.conf entry for host "10.0.0.5", user "forge", database "app", SSL off',
+    ['db.internal', '10.0.0.5', 'forge'],
+  ],
+  ['role in a Postgres error', 'SQLSTATE[08006] [7] FATAL:  role "forge" does not exist', ['forge']],
+  ['host in a MySQL connect error', "SQLSTATE[HY000] [2002] Can't connect to MySQL server on 'db.internal' (111)", ['db.internal']],
+  ['unquoted host in a MySQL connect error', "Can't connect to MySQL server on db.internal", ['db.internal']],
+  ['undotted host in a MySQL connect error', "Can't connect to MySQL server on 'dbhost' (111)", ['dbhost']],
+  ['IPv6 host with a port', 'connect ECONNREFUSED 2001:db8::1:3306', ['2001:db8']],
+  ['bracketed IPv6 host with a port', 'could not reach [2001:db8::1]:3306', ['2001:db8']],
+  ['host in a refused connection', 'Connection to db.internal:3306 refused', ['db.internal']],
+  ['host with no route', 'No route to host 10.0.0.5', ['10.0.0.5']],
 ]
 
 for (const [name, input, secrets] of SECRETS) {
@@ -300,7 +356,8 @@ test('tail starts at a line near the cut, and keeps a long last line; clip never
 
 test('redact stays fast on long words, which every log line and output passes through', () => {
   const started = Date.now()
-  for (const text of ['s:9:"' + 'a'.repeat(30000) + '";', 'a'.repeat(30000), 'password'.repeat(4000), 'token ' + 'a'.repeat(30000)]) redact(text)
+  const words = ['s:9:"' + 'a'.repeat(30000) + '";', 'a'.repeat(30000), 'password'.repeat(4000), 'token ' + 'a'.repeat(30000)]
+  for (const text of [...words, 'a_'.repeat(15000) + 'host', 'host: ' + '['.repeat(30000), 'mysql://' + 'a@'.repeat(15000), 'getaddrinfo for ' + 'a'.repeat(30000), '[' + ':'.repeat(60000), 'a-'.repeat(15000)]) redact(text)
   expect(Date.now() - started).toBeLessThan(1000)
 })
 
@@ -347,6 +404,47 @@ test('redact keeps what Claude needs to debug', () => {
     'The token has expired.',
     'Token Mismatch',
     'Bearer token missing from the request',
+  ]
+  for (const line of kept) expect(redact(line)).toBe(line)
+})
+
+test('redact hides hosts, keeps this machine and the port', () => {
+  expect(redact('Connection refused (Connection: mysql, Host: db.internal, Port: 3306)')).toBe('Connection refused (Connection: mysql, Host: [host], Port: 3306)')
+  expect(redact('{"host":"db.internal","port":3306}')).toBe('{"host":[host],"port":3306}')
+  expect(redact('mysql://forge:s3cr3t@db.internal:3306/app')).toBe('mysql://[redacted]@[host]:3306/app')
+  expect(redact('Connection refused [tcp://10.0.0.5:6379]')).toBe('Connection refused [tcp://[host]:6379]')
+  expect(redact("Access denied for user 'forge'@'10.0.0.5'")).toBe("Access denied for user '?'")
+  // Connection errors with no key and no URL
+  expect(redact('SQLSTATE[08006] [7] could not translate host name "db.internal" to address')).toBe('SQLSTATE[08006] [7] could not translate host name "[host]" to address')
+  expect(redact('stream_socket_client(): Unable to connect to db.internal:6379 (Connection refused)')).toBe('stream_socket_client(): Unable to connect to [host]:6379 (Connection refused)')
+  expect(redact('failed to connect to db.internal port 3306')).toBe('failed to connect to [host] port 3306')
+  expect(redact('php_network_getaddresses: getaddrinfo failed for db.internal')).toBe('php_network_getaddresses: getaddrinfo failed for [host]')
+  expect(redact('Could not open socket to db.internal')).toBe('Could not open socket to [host]')
+  expect(redact('Connection could not be established with host "smtp.acme.com:587"')).toBe('Connection could not be established with host "[host]:587"')
+  expect(redact('connect ECONNREFUSED 10.1.2.3:5432')).toBe('connect ECONNREFUSED [host]:5432')
+  const kept = [
+    'failed to connect to localhost port 3306',
+    'Unable to connect to 127.0.0.1:6379',
+    'failed to connect to the database',
+    'laravel 12.33.0.1 released',
+    'Connection refused (Connection: mysql, Host: 127.0.0.1, Port: 3306)',
+    '{"host":"localhost","port":6379}',
+    "'host' => '127.0.0.1',",
+    'DB_HOST=::1',
+    'Host: localhost:8000',
+    'redis://[redacted]@127.0.0.1:6379',
+    'redis://[redacted]@[::1]:6379',
+    'tcp://localhost:6379',
+    'Nothing answers on localhost:6379',
+    'connection to server at "localhost" (::1), port 5432 failed',
+    'connect ECONNREFUSED 127.0.0.1:3306',
+    'connect ECONNREFUSED ::1:3306',
+    "Can't connect to MySQL server on '127.0.0.1' (111)",
+    'FATAL:  no pg_hba.conf entry for host "127.0.0.1", user "?", database "app"',
+    'Connection to the database refused',
+    'https://laravel.com/docs/12.x/queues',
+    'ghost=1',
+    'The host field is required.',
   ]
   for (const line of kept) expect(redact(line)).toBe(line)
 })

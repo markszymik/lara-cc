@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-12
+
+### Added
+
+- A read-only `health` tool for Claude: what the checks found, what they couldn't tell, what's stale and what's fine, each line marked seen, inferred or unknown with its age, and each problem with its next step and whether that runs on its own, asks you, or is your button to press. It re-runs the checks, the queue read and `migrate:status` first, and sends only counts, drivers, local ports, file names and error types.
+- The Services tab's first row says when the checks last ran, with **recheck**, and lists what they couldn't check.
+
+### Changed
+
+- The band marks what lara-cc saw with `⚠` and conclusions or things it couldn't check with `?` (`? 3 jobs waiting, no worker in this session`, `? Herd MySQL unchecked`, and new: `? Vite unchecked (public/hot)` when curl gets no clear answer). A folded band says `? N unchecked` when nothing was seen for certain, checks that stopped running show `? checks stale` with **recheck**, and a count whose re-read failed stays, dim, marked `(last read failed)`.
+- A test result from before Claude edited PHP no longer counts as current: a pass leaves the band, a failure turns yellow (`✗ 1 test failed, edited since`).
+- Claude's queue and service replies no longer state that a worker, Vite or the scheduler isn't running when only this session's process is known: "not running in this session; lara-cc can't see one run elsewhere".
+- A failed `artisan about` or `migrate:status` keeps its last result, dated and marked stale, instead of dropping it; a worker elsewhere draining the queue is judged over minute ticks, so frequent reads don't flip it back to "no worker".
+
+### Fixed
+
+- `/lara-test` without arguments no longer labels its run `test ` with a trailing space.
+
+### Security
+
+- Hosts other than this machine are redacted from everything that reaches Claude: host keys, URLs after a redacted user, server URLs, and MySQL and Postgres connection errors (including the database user in Postgres' `pg_hba.conf` rejection). The queue tool's error note used to pass a database host through.
+- Errors that reach Claude from the queue read are reduced to their type (e.g. `QueryException, SQLSTATE[HY000] [2002]`), never their message.
+
 ## [0.11.4] - 2026-10-11
 
 ### Changed
