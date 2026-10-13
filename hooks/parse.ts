@@ -862,6 +862,16 @@ export function isTestCommand(command: string): boolean {
 }
 
 /**
+ * Whether a test command's runner actually started, for a Bash run that failed without printing a summary: the
+ * command's first word is the runner (after a simple `cd x &&`), or the output shows PHPUnit's or Pest's banner. A
+ * `ls vendor/bin/pest` that exits 1 mentions the runner without running it.
+ */
+export function testRunnerStarted(command: string, output: string): boolean {
+  const first = /^\s*(?:cd\s+\S+\s*&&\s*)?(?:php\s+artisan\s+test|\.?\/?artisan\s+test|(?:php\s+)?(?:\.\/)?(?:vendor\/bin\/)?(?:pest|phpunit))(\s|$)/
+  return first.test(command) || /^\s*(PHPUnit \d+\.\d+|Pest (Testing Framework )?v?\d+\.\d+)/m.test(output)
+}
+
+/**
  * The result of a test run from its output: `artisan test` and Pest (`Tests: 2 failed, 30 passed`), or
  * PHPUnit (`OK (32 tests…)`, `Tests: 32, Assertions: 80, Failures: 2.`), with each failure's name and its
  * message. Undefined when the output has no summary (the run didn't finish, or isn't a test run).
@@ -903,6 +913,92 @@ export function parseTestRun(output: string): TestRun | undefined {
   }
   for (const f of run.failures) while (f.detail.length && !f.detail.at(-1)!.trim()) f.detail.pop()
   return run
+}
+
+// ─── Claude's edits ────────────────────────────────────────────────────────
+
+export type EditKind = 'php' | 'migration' | 'route' | 'config' | 'test' | 'view' | 'frontend' | 'composer' | 'env' | 'other'
+
+/**
+ * The category of a project-relative path from its name alone, never its contents. First match wins: `.env.example`
+ * is a template, not an env file, and a Blade file is a view before it is PHP.
+ */
+export function editKind(rel: string): EditKind {
+  const name = rel.slice(rel.lastIndexOf('/') + 1)
+  if (name.startsWith('.env') && name !== '.env.example') return 'env'
+  if (/^(composer\.(json|lock)|package(-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)$/.test(name)) return 'composer'
+  if (/^database\/migrations\/.+\.php$/.test(rel)) return 'migration'
+  if (/^routes\/.+\.php$/.test(rel)) return 'route'
+  if (/^config\/.+\.php$/.test(rel)) return 'config'
+  if (/^tests\/.+\.php$/.test(rel)) return 'test'
+  if (rel.endsWith('.blade.php') || rel.startsWith('resources/views/')) return 'view'
+  if (rel.endsWith('.php')) return 'php'
+  if (/\.(js|ts|jsx|tsx|vue|css|scss|sass|svelte)$/.test(name) || name.startsWith('vite.config.')) return 'frontend'
+  return 'other'
+}
+
+/** `path` relative to `root` with `.` and `..` resolved first; undefined when it is outside `root` (or is `root`), or either isn't absolute. */
+export function relativeTo(path: string, root: string): string | undefined {
+  const parts = (p: string) => {
+    const out: string[] = []
+    for (const part of p.split('/')) {
+      if (part === '..') out.pop()
+      else if (part && part !== '.') out.push(part)
+    }
+    return out
+  }
+  if (!path.startsWith('/') || !root.startsWith('/')) return undefined
+  const [base, full] = [parts(root), parts(path)]
+  if (full.length <= base.length || base.some((part, i) => full[i] !== part)) return undefined
+  return full.slice(base.length).join('/')
+}
+
+/** Folders at the project root that hold nothing Claude writes by hand (dependencies, caches, logs): edits there aren't tracked. */
+export function isIgnoredRel(rel: string): boolean {
+  return /^(vendor|node_modules|storage)\//.test(rel) || rel.startsWith('bootstrap/cache/')
+}
+
+/** Whether a test run's label (or command) names part of the suite, so a pass says nothing about the rest. */
+export function testScope(label: string): 'suite' | 'subset' {
+  return /--(exclude-)?(filter|group|testsuite)|--dirty|--covers|--uses|\btests\/\S|\w+Test(\.php)?\b/.test(label) ? 'subset' : 'suite'
+}
+
+export type LintResult = { verdict: 'passed' | 'failed' | 'unknown'; line?: number }
+
+/**
+ * What `php -l` said, as a verdict and the line of the error: exit 0 passed; a parse or fatal error failed (a
+ * compile-time fatal such as a redeclared class counts: the file won't load); anything else (the file wasn't
+ * found, php couldn't run) unknown. Never returns the message, which can quote the file's own text.
+ */
+export function lintResult(exitCode: number, output: string): LintResult {
+  if (exitCode === 0) return { verdict: 'passed' }
+  if (!/(Parse|Fatal) error/.test(output)) return { verdict: 'unknown' }
+  // The last one: the message ends with `in <file> on line N`, and a quoted token could hold the words before it
+  const line = Number([...output.matchAll(/on line (\d+)/g)].at(-1)?.[1])
+  return line > 0 ? { verdict: 'failed', line } : { verdict: 'failed' }
+}
+
+/** A log entry's own timestamp when it looks like one, else undefined: the stamp is whatever sat in the entry's brackets. */
+export function logStamp(time: string | undefined): string | undefined {
+  return time !== undefined && /^\d{4}-\d\d-\d\d[ T][\d:]+$/.test(time) ? time : undefined
+}
+
+/**
+ * The one item the band shows for Claude's edits after a turn: a syntax error, else tests that don't cover them.
+ * Never green; nothing when the tests passed in full, nor when they failed (the failing-tests item says so).
+ * `tests` is undefined when no Tests row applies (views, frontend, env only): nothing to say about tests then.
+ * `words`: what the item says without its mark and file count, for the toast.
+ */
+export function verifyBand(
+  files: number,
+  syntax: string | undefined,
+  tests: { verdict: string; partial?: boolean } | undefined,
+): { text: string; color: 'red' | 'yellow'; words: string } | undefined {
+  if (syntax === 'failed') return { text: '✗ syntax error', color: 'red', words: 'syntax error' }
+  if (!tests || tests.verdict === 'failed') return undefined
+  const n = `${files} file${files === 1 ? '' : 's'}`
+  const words = tests.verdict === 'passed' ? (tests.partial ? 'only some tests ran' : undefined) : tests.verdict === 'unknown' ? 'tests unclear' : 'tests not run'
+  return words ? { text: `✎ ${n}: ${words}`, color: 'yellow', words } : undefined
 }
 
 // ─── Herd debug session ────────────────────────────────────────────────────

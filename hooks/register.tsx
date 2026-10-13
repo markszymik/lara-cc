@@ -6,6 +6,7 @@ import {
   composerDrift,
   connectionsPhp,
   durationMs,
+  editKind,
   editorHref,
   errorKind,
   exceptionHeadline,
@@ -17,9 +18,13 @@ import {
   herdServices,
   hotPort,
   isError,
+  isIgnoredRel,
   isTestCommand,
+  testRunnerStarted,
   isWarning,
+  lintResult,
   localHotUrl,
+  logStamp,
   methodLabel,
   newLogState,
   npmDrift,
@@ -38,6 +43,7 @@ import {
   aboutForClaude,
   clip,
   redact,
+  relativeTo,
   parseRouteList,
   testsUseMemoryDb,
   redactData,
@@ -50,8 +56,10 @@ import {
   stripAnsi,
   tail,
   terminalEditor,
+  testScope,
+  verifyBand,
 } from './parse'
-import type { AppConnection, FailedJob, HerdService, LogEntry, QueueSnapshot, TabRoute, TestFailure, TestRun } from './parse'
+import type { AppConnection, EditKind, FailedJob, HerdService, LogEntry, QueueSnapshot, TabRoute, TestFailure, TestRun } from './parse'
 
 /**
  * lara-cc: an unofficial Claude Code mod for Laravel apps. Not affiliated with or endorsed by Laravel LLC or Anthropic.
@@ -171,7 +179,8 @@ const CHECKS_STALE = 3
 type Tab = 'services' | 'queue' | 'log' | 'tests' | 'routes' | 'commands' | 'about'
 type Run = { stream: HookStream<ProcessSpawnChunk, ProcessSpawnResult>; done: Promise<void> }
 /** `crashed`: the exit code of a run that ended on its own with an error; `seen` once the Services tab showed it. */
-type Service = { name: string; label: string; argv: string[]; run?: Run; lines: string[]; startedAt?: number; partial: string; crashed?: { code: number; seen: boolean } }
+// `startedSeq`: editCount when it started, so the report knows which of Claude's edits it has loaded
+type Service = { name: string; label: string; argv: string[]; run?: Run; lines: string[]; startedAt?: number; startedSeq?: number; partial: string; crashed?: { code: number; seen: boolean } }
 /**
  * `output`: for the Commands tab, its end (or all of it, `whole`, for output shown to the person on Claude's
  * request). `raw`: up to 200 KB of it, redacted and cut by formatRun only when it goes to Claude.
@@ -181,12 +190,13 @@ type Job = { job: string; time: string; status: 'running' | 'done' | 'failed'; m
 type Settings = {
   autoRestartQueue: boolean
   pintAfterTurn: boolean
+  lintAfterTurn: boolean
   showBand: boolean
   errorToasts: boolean
   autostart: Record<string, string[]>
 }
 
-const DEFAULT_SETTINGS: Settings = { autoRestartQueue: true, pintAfterTurn: false, showBand: true, errorToasts: true, autostart: {} }
+const DEFAULT_SETTINGS: Settings = { autoRestartQueue: true, pintAfterTurn: false, lintAfterTurn: true, showBand: true, errorToasts: true, autostart: {} }
 
 // The SERVICES keys always exist; any other name (from Claude or a setting) may not, so it reads as possibly undefined
 const services = {} as Record<keyof typeof SERVICES, Service> & Record<string, Service>
@@ -215,6 +225,8 @@ let paneOpen = false
 let logOf = 'queue'
 let lastToastAt = 0
 let restartTimer: { cancel: () => void } | undefined
+// The automatic queue restart is running (the worker is stopped, then started): not pending any more, not done yet
+let restarting = false
 let lastRun: LastRun | undefined
 let about: Record<string, Record<string, unknown>> | undefined
 let routeFilter = ''
@@ -237,8 +249,10 @@ const fixing = new Set<string>()
 // A test run started by runCommand is in progress (the Tests tab's button waits for it)
 let testsRunning = false
 // The last test run this session: /lara-test, the Tests tab, the artisan tool or Claude's Bash (see noteTestRun)
-// `editedSince`: Claude edited PHP during or after it, so it no longer covers the code
-let lastTest: (TestRun & { label: string; at: number; editedSince?: true }) | undefined
+// `editedSince`: Claude edited PHP during or after it, so it no longer covers the code. `ledger`: editCount when it
+// started, so any tracked edit since (not only PHP) shows; `scope`: whether it named part of the suite; `exitCode`: when known;
+// `crashed`: the exit code of a run that ended without a summary (counts are 0, which says nothing)
+let lastTest: (TestRun & { label: string; at: number; ledger: number; scope: 'suite' | 'subset'; exitCode?: number; crashed?: number; editedSince?: true }) | undefined
 // Herd's debug session (queries, logs, dumps, HTTP calls the app made), started from the Services tab
 type DebugState = 'off' | 'starting' | 'on' | 'stopping'
 let debugState: DebugState = 'off'
@@ -251,11 +265,75 @@ const editedPhp = new Set<string>()
 // Counts Claude's PHP edits, so a test run knows whether one landed while it ran (see noteTestRun)
 let phpEdits = 0
 
+// What Claude edited this stretch, for the "Since Claude's edits" report (paths and categories only, never contents).
+// Its times come from $.clock.now(), and what must be told apart (edit, check, restart) from editCount, never a mix of clocks.
+// editedPhp is Pint's list and is cleared each turn, phpEdits drives lastTest.editedSince: neither changes, this is separate.
+/** `seq`: editCount at the edit, so a check that started before it (a lint, a test run) is told apart from one after it. */
+type Edited = { kind: EditKind; seq: number }
+/** One file's `php -l`, at `at`: `raw` (the person's pane only, never Claude) is what it printed, cut; `gone`: the file no longer exists; `outside`: it is a link that leads outside the project, so it wasn't read. */
+type LintFile = { seq: number; at: number; verdict: 'passed' | 'failed' | 'unknown'; line?: number; raw?: string; gone?: true; outside?: true }
+/** A file of an earlier stretch with no clean check since its last edit: a known parse error (`failed`, with its line and when it was found), or just never checked. */
+type Carried = { failed: boolean; line?: number; at?: number }
+type Since = {
+  firstAt: number                       // the first edit of this stretch: opens the log window
+  lastAt: number
+  files: Map<string, Edited>            // project-relative path -> its latest edit; capped at 200 (oldest dropped, never a failed one)
+  dropped: number
+  closedAt?: number                     // the last turn.complete chain finished; the next edit starts a new stretch
+  chains: number                        // turn.complete chains queued or running for this stretch
+  linting: boolean
+  lint?: { at: number; seq: number; files: Map<string, LintFile> } // seq: editCount when the last check started
+  carried: Map<string, Carried>         // files from an earlier stretch that haven't linted clean since; dropped only when one does (or the file is gone)
+  pint?: { at: number; seq: number; files: number; ok: boolean }
+  restart?: { at: number; ok: boolean } // the automatic queue restart after PHP edits: when it finished, and whether the worker came back
+  errors: number                        // log errors that ARRIVED (by $.clock.now) from firstAt to closedAt + ERROR_WINDOW_MS
+  newestError?: LogEntry                // the pane may show its headline; Claude gets only its own log stamp
+  toasted?: string
+}
+let since: Since | undefined
+// Counts every tracked edit
+let editCount = 0
+// The turn-end chains (syntax check, Pint, closing the stretch) run one after another through lintDone
+let lintDone: Promise<void> = Promise.resolve()
+// Like checksDone: a report waits for the syntax check queued behind a turn, not for Pint after it
+let syntaxDone: Promise<void> = Promise.resolve()
+const ERROR_WINDOW_MS = 10 * 60_000
+// How long a restarted queue worker must stay up before the restart counts as done
+const RESTART_SETTLE_MS = 1000
+const LINT_MAX_FILES = 20
+const LINT_BUDGET_MS = 20_000
+const SINCE_MAX_FILES = 200
+// artisan make:* commands that ran through lara-cc: files they created aren't tracked
+let artisanMade = 0
+// route:list and view:cache runs by lara-cc, with editCount when they started: the Routes and Views rows read them
+let artisanRan: Record<string, { seq: number; ok: boolean; at: number }> = {}
+type Verdict = 'passed' | 'failed' | 'not run' | 'skipped' | 'unknown' | 'done'
+/**
+ * One line of the report. `claude`: what Claude's tools can do (artisanStep, serviceStep), resolved only for the health
+ * tool; `say`: a fixed next step; `partial`: passed, but a subset of the tests. `button`: the person's.
+ */
+type Row = {
+  check: string
+  known: 'seen' | 'inferred' | 'unknown'
+  verdict: Verdict
+  detail: string
+  partial?: true
+  claude?: { artisan: string } | { service: [string, 'restart'] }
+  say?: string
+  button?: Fix
+}
+
 // Log monitoring
 let logPath = ''
 let logState = newLogState()
 let logRun: { stream: HookStream<ProcessSpawnChunk, ProcessSpawnResult> } | undefined
 let logFilter: 'all' | 'warnings' | 'errors' = 'all'
+// When the tail first ran in this folder (0: never), and each time it stopped (until `to`, when it started again): a
+// stretch's log window counts only when no gap touches it
+let logSince = 0
+let logGaps: { from: number; to?: number }[] = []
+// When the minute tick last looked at which file is newest: a file that began since is read as history from its start
+let logLookedAt = 0
 let unseenErrors = 0
 let logReady: Promise<void> = Promise.resolve()
 
@@ -318,6 +396,8 @@ let aboutAt = 0
 let aboutFailed = ''
 // When migrate:status last worked (0: never here), the kind of its last failure (''), and a run count so only the newest writes
 let migrationsAt = 0
+// editCount when the last good migrate:status started, so the report knows which migration edits it saw
+let migrationsSeq = 0
 let migrationsFailed = ''
 let migrationRuns = 0
 
@@ -351,6 +431,22 @@ function ago(ms: number): string {
 
 function plural(n: number, word: string): string {
   return `${n} ${word}${n === 1 ? '' : 's'}`
+}
+
+/** A test run's counts for Claude and the pane: `2 failed, 10 passed, 1 skipped`, or `12 passed`. */
+function testCounts(t: { passed: number; failed: number; skipped: number; crashed?: number }): string {
+  if (t.crashed !== undefined) return `exited ${t.crashed} before printing a summary`
+  return (t.failed ? `${t.failed} failed, ${t.passed} passed` : `${t.passed} passed`) + (t.skipped ? `, ${t.skipped} skipped` : '')
+}
+
+/** What the logs tool does about sending entries to Claude, for a `next:` line. */
+function logsConsent(): string {
+  return shareAllowed ? 'the user allowed log entries this session' : 'asks the user before sending entries'
+}
+
+/** `$.clock.now()`, which is `Date.now()` here but moves with a test's clock; a session already ending (the call refused) reads the system's. */
+function nowMs($: Api): Promise<number> {
+  return $.clock.now().catch(() => Date.now())
 }
 
 function redraw($: Api) {
@@ -390,7 +486,7 @@ async function loadSettings($: Api) {
   if (saved && typeof saved === 'object') settings = { ...DEFAULT_SETTINGS, ...(saved as Partial<Settings>) }
 }
 
-async function toggle($: Api, key: 'autoRestartQueue' | 'pintAfterTurn' | 'showBand' | 'errorToasts') {
+async function toggle($: Api, key: 'autoRestartQueue' | 'pintAfterTurn' | 'lintAfterTurn' | 'showBand' | 'errorToasts') {
   settings = { ...settings, [key]: !settings[key] }
   redraw($)
   await $.store.set('settings', settings)
@@ -475,11 +571,12 @@ async function runPhp($: Api, argv: string[], init: { timeoutMs: number }) {
 
 // ─── One-shot commands ─────────────────────────────────────────────────────
 
-/** Run a command, keep its output for the Commands tab, and return it. */
-async function runCommand($: Api, label: string, argv: string[], timeoutMs = 600_000, whole = false): Promise<LastRun> {
+/** Run a command, keep its output for the Commands tab, and return it. `resolved`: the artisan command's full name, when it was typed short (`view:ca`). */
+async function runCommand($: Api, label: string, argv: string[], timeoutMs = 600_000, whole = false, resolved?: string): Promise<LastRun> {
   const isTests = isTestCommand(argv.join(' '))
   const project = projectRun
   const edits = phpEdits
+  const ledger = editCount
   lastRun = { label, isRunning: true, output: '' }
   if (isTests) testsRunning = true
   redraw($)
@@ -488,7 +585,8 @@ async function runCommand($: Api, label: string, argv: string[], timeoutMs = 600
     const r = await runPhp($, argv, { timeoutMs })
     const output = stripAnsi([r.stdout, r.stderr].filter(Boolean).join('\n')).trim()
     run = { label, isRunning: false, exitCode: r.exitCode, output: tail(output, whole ? 200_000 : 8000), raw: tail(output, 200_000), whole }
-    if (isTests && project === projectRun) noteTestRun($, label, output, edits)
+    if (isTests && project === projectRun) noteTestRun($, label, output, edits, ledger, argv.join(' '), r.exitCode)
+    if (project === projectRun) noteArtisanRan(resolved ?? (argv[1] === 'artisan' ? argv[2] : undefined), r.exitCode, ledger)
   } catch (err) {
     run = { label, isRunning: false, exitCode: -1, output: 'Could not run `' + argv.join(' ') + '`: ' + String(err) }
   }
@@ -532,14 +630,31 @@ function resultText(result: { text?: string; result?: unknown }): string {
 }
 
 /**
- * Remember a test run's result for the band and the Tests tab; output with no test summary is ignored. `edits`:
- * phpEdits when the run started, so an edit Claude made while it ran marks it as not covering the code.
+ * Remember a test run's result for the band and the Tests tab. Output with no test summary is ignored, unless the run
+ * failed (`exitCode`): it died before printing one (a dd() left in, a fatal while loading, out of memory), which is a
+ * failure, not "not run". `edits`:
+ * phpEdits when the run started, so an edit Claude made while it ran marks it as not covering the code; `ledger`:
+ * editCount then, which any tracked edit moves. `command`: all of what ran (the label may be cut), for its scope.
  */
-function noteTestRun($: Api, label: string, output: string, edits: number) {
-  const run = parseTestRun(stripAnsi(output))
-  if (!run) return
-  lastTest = { ...run, label, at: Date.now(), ...(edits !== phpEdits ? { editedSince: true as const } : {}) }
+function noteTestRun($: Api, label: string, output: string, edits: number, ledger: number, command: string, exitCode?: number) {
+  const parsed = parseTestRun(stripAnsi(output))
+  if (!parsed && !exitCode) return
+  const run = parsed ?? { passed: 0, failed: 0, skipped: 0, failures: [] }
+  lastTest = {
+    ...run,
+    label,
+    at: Date.now(),
+    ledger,
+    scope: testScope(command),
+    ...(parsed ? (exitCode === undefined ? {} : { exitCode }) : { crashed: exitCode }),
+    ...(edits !== phpEdits ? { editedSince: true as const } : {}),
+  }
   redraw($)
+}
+
+/** Remember that route:list or view:cache ran, and whether it worked: the Routes and Views rows of the report read it. */
+function noteArtisanRan(name: string | undefined, exitCode: number, ledger: number) {
+  if (name === 'route:list' || name === 'view:cache') artisanRan[name] = { seq: ledger, ok: exitCode === 0, at: Date.now() }
 }
 
 /** Send one failing test to Claude to fix: the Tests tab's button. Redacted, like everything sent. */
@@ -612,6 +727,8 @@ async function artisanStep($: Api, commands: string[]): Promise<string> {
  */
 async function artisanForConversation($: Api, args: string, resolved: string | undefined, timeoutMs = 600_000): Promise<string> {
   const argv = splitArgs(args)
+  // Generators write files lara-cc doesn't see (the report says so)
+  if (resolved && /^(make:|filament:make-)/.test(resolved)) artisanMade++
   if (resolved === 'about') {
     // Read as JSON, whatever format was asked for, so only allowed values are shown (see aboutForClaude)
     const r = await runPhp($, ['php', 'artisan', ...argv.filter(a => a !== '--json'), '--json', '--no-interaction'], { timeoutMs })
@@ -620,8 +737,10 @@ async function artisanForConversation($: Api, args: string, resolved: string | u
   }
   if (resolved === 'route:list') {
     const project = projectRun
+    const ledger = editCount
     const r = await runPhp($, ['php', 'artisan', ...argv.filter(a => a !== '--json'), '--json', '--no-interaction'], { timeoutMs })
     const routes = parseRouteList(r.stdout)
+    if (project === projectRun) artisanRan['route:list'] = { seq: ledger, ok: !!routes, at: Date.now() }
     if (!routes) return `✗ artisan ${redact(args)}\n${failureReason(r.stdout + '\n' + r.stderr)}`
     const verbose = argv.some(a => /^-v+$/.test(a))
     const lines = routes.map(route => formatRoute(route) + (route.onDomain ? '  (own domain)' : '') + (verbose && route.middleware.length ? `  [${route.middleware.join(', ')}]` : ''))
@@ -630,7 +749,7 @@ async function artisanForConversation($: Api, args: string, resolved: string | u
     redraw($)
     return `✓ artisan ${redact(args)} (${plural(routes.length, 'route')}; domains left out)\n${body}`
   }
-  const run = await runCommand($, 'artisan ' + args, ['php', 'artisan', ...argv, '--no-interaction'], timeoutMs)
+  const run = await runCommand($, 'artisan ' + args, ['php', 'artisan', ...argv, '--no-interaction'], timeoutMs, false, resolved)
   return formatRun(run)
 }
 
@@ -769,6 +888,7 @@ async function startService($: Api, name: string): Promise<string> {
   const stream = $.process.spawn({ argv })
   svc.lines.push(`$ ${argv.join(' ')}`)
   svc.startedAt = Date.now()
+  svc.startedSeq = editCount
   svc.partial = ''
 
   let finish = () => {}
@@ -1032,6 +1152,21 @@ async function newestLog($: Api): Promise<string> {
   return dir + '/laravel.log'
 }
 
+/** The tail stopped (or is being replaced): the log isn't followed until the next one starts. */
+function openLogGap(now: number) {
+  const last = logGaps.at(-1)
+  if (!logSince || (last && last.to === undefined)) return
+  logGaps.push({ from: now })
+  if (logGaps.length > 50) logGaps.shift()
+}
+
+/** A tail started: the first one marks when following began here, a later one ends the gap since the last stopped. */
+function closeLogGap(now: number) {
+  logSince ||= now
+  const last = logGaps.at(-1)
+  if (last && last.to === undefined) last.to = now
+}
+
 /** Follow the newest log file; called at start and every minute, so a new daily file is picked up. */
 async function watchLog($: Api) {
   if (!isLaravel) return
@@ -1044,10 +1179,23 @@ async function watchLog($: Api) {
     // One watch at a time, so two overlapping calls can't start two tails
     await previous
     const path = await newestLog($)
-    if (project !== projectRun || (path === logPath && logRun)) return
-    // Let go of the old tail at once, so what it still sends while the new file is read isn't taken for it
-    if (logRun) void logRun.stream.return({ code: null, signal: 'SIGTERM' }).catch(() => {})
+    if (project !== projectRun) return
+    if (path === logPath && logRun) {
+      const looked = await nowMs($)
+      if (project === projectRun) logLookedAt = looked
+      return
+    }
+    // Let go of the old tail at once (before anything is awaited), so what it still sends while the new file is read isn't taken for it
+    const old = logRun
     logRun = undefined
+    if (old) {
+      void old.stream.return({ code: null, signal: 'SIGTERM' }).catch(() => {})
+      // The new file may have begun at any time since the last look, and what it already holds is read as history,
+      // not counted: the gap starts there, so an interval that touches it isn't called quiet
+      const from = logLookedAt || (await nowMs($))
+      if (project !== projectRun) return
+      openLogGap(from)
+    }
 
     logPath = path
     const state = newLogState()
@@ -1063,16 +1211,24 @@ async function watchLog($: Api) {
     const stream = $.process.spawn({ argv: ['tail', '-n', '0', '-F', path] })
     const run = { stream }
     logRun = run
+    logLookedAt = await nowMs($)
+    closeLogGap(logLookedAt)
     void (async () => {
       try {
         for await (const chunk of stream) {
           // A tail replaced by another (a new daily file, another folder) may still deliver a chunk
-          if (chunk.stream === 'stdout' && logRun === run) onLogEntries($, feedLog(logState, chunk.text))
+          if (chunk.stream !== 'stdout' || logRun !== run) continue
+          const at = await nowMs($)
+          if (logRun === run) onLogEntries($, feedLog(logState, chunk.text), at)
         }
       } catch {
         // stream closed
       }
-      if (logRun === run) logRun = undefined
+      const ended = await nowMs($)
+      if (logRun === run) {
+        logRun = undefined
+        openLogGap(ended)
+      }
     })()
     redraw($)
   } finally {
@@ -1080,13 +1236,19 @@ async function watchLog($: Api) {
   }
 }
 
-function onLogEntries($: Api, entries: LogEntry[]) {
+/** `at`: when the chunk arrived ($.clock.now). */
+function onLogEntries($: Api, entries: LogEntry[], at: number) {
   const errors = entries.filter(isError)
   if (errors.length) {
     const viewing = paneOpen && tab === 'log'
     if (!viewing) unseenErrors += errors.length
     const last = errors[errors.length - 1]
     if (last && settings.errorToasts) toast($, `Laravel ${last.level.toLowerCase()}: ${headline(last)}`)
+    // Counted by when it arrived here (the entry's own stamp has no timezone), from the first edit to ten minutes after the turn ended
+    if (since && last && at <= (since.closedAt ?? Infinity) + ERROR_WINDOW_MS) {
+      since.errors += errors.length
+      since.newestError = last
+    }
   }
   redraw($)
 }
@@ -1334,6 +1496,7 @@ async function checkMigrations($: Api) {
   const project = projectRun
   // Only the newest run writes, so a re-check that started before the migrate fix can't bring the old count back
   const run = ++migrationRuns
+  const seq = editCount
   let failed = ''
   try {
     const r = await runPhp($, ['php', 'artisan', 'migrate:status', '--no-ansi'], { timeoutMs: 60_000 })
@@ -1343,6 +1506,7 @@ async function checkMigrations($: Api) {
       const before = pendingMigrations
       pendingMigrations = r.stdout.split('\n').filter(l => /\bPending\b/.test(l)).length
       migrationsAt = Date.now()
+      migrationsSeq = seq
       // Only when the count rose: the health tool reads it again on every call
       if (pendingMigrations > before) toast($, `${plural(pendingMigrations, 'pending migration')}. Run /lara-artisan migrate`)
     }
@@ -1889,9 +2053,480 @@ function notChecked(): { label: string; text: string; artisan?: string }[] {
   return out
 }
 
+// ─── Since Claude's edits ──────────────────────────────────────────────────
+
+/** A file's size and time of change, '' when it isn't there: told apart before and after a call, they show whether it changed the file. */
+async function fileStamp($: Api, path: string): Promise<string> {
+  try {
+    const s = await $.fs.stat(path)
+    return `${s.size}:${s.mtimeMs}`
+  } catch {
+    return ''
+  }
+}
+
+/** `14:03:10`, in local time. */
+const hms = (ms: number) => new Date(ms).toTimeString().slice(0, 8)
+
+/** A file `php -l` can read: PHP, not Blade (php -l on a template means nothing), and never an env file (`.env.php`: a parse error can quote it). */
+const lintable = (rel: string) => rel.endsWith('.php') && !rel.endsWith('.blade.php') && editKind(rel) !== 'env'
+
+/** `PHP 8.4.1` when the PHP lara-cc runs is known (see detectPhp), else ''. */
+function phpLabel(): string {
+  const version = /^PHP (\d+\.\d+(?:\.\d+)?)/.exec(phpInfo)?.[1]
+  return version ? 'PHP ' + version : ''
+}
+
+/**
+ * What a closed stretch leaves for the next: every PHP file with no clean check after its last edit (a parse error, an
+ * edit that landed while the check ran, a file it never reached), so none is forgotten. One goes only when it lints
+ * clean or is gone.
+ */
+function carryFrom(s: Since): Map<string, Carried> {
+  const carried = new Map(s.carried)
+  for (const [rel, f] of s.files) {
+    if (!lintable(rel)) continue
+    const rec = s.lint?.files.get(rel)
+    const current = !!rec && rec.seq >= f.seq
+    if (current && (rec.gone || rec.verdict === 'passed')) carried.delete(rel)
+    // Even a failure from before the latest edit: the file isn't known to be fixed
+    else if (rec?.verdict === 'failed') carried.set(rel, { failed: true, line: rec.line, at: rec.at })
+    else if (!carried.has(rel)) carried.set(rel, { failed: false })
+  }
+  return carried
+}
+
+/**
+ * Remember an edit Claude made with a tracked tool: its path inside the project (`..` resolved first, so a path that
+ * leaves the project is dropped), never its contents. The first edit after a stretch closed starts a new one,
+ * carrying forward the files that haven't linted clean (see carryFrom).
+ */
+function noteEdit(path: string, now: number) {
+  const rel = relativeTo(path, projectDir)
+  if (rel === undefined || isIgnoredRel(rel)) return
+  if (!since || since.closedAt !== undefined) {
+    since = { firstAt: now, lastAt: now, files: new Map(), dropped: 0, chains: 0, linting: false, carried: since ? carryFrom(since) : new Map(), errors: 0 }
+  }
+  since.lastAt = now
+  // Deleted first, so the map stays in order of the latest edit
+  since.files.delete(rel)
+  since.files.set(rel, { kind: editKind(rel), seq: ++editCount })
+  if (since.files.size > SINCE_MAX_FILES) {
+    const s = since
+    const failed = (rel: string) => s.lint?.files.get(rel)?.verdict === 'failed'
+    const checked = (rel: string, f: Edited) => {
+      const rec = s.lint?.files.get(rel)
+      return !!rec && rec.seq >= f.seq && (rec.gone === true || rec.verdict === 'passed')
+    }
+    // What nothing needs to check goes first. Never a parse error, and a PHP file with no clean check yet is carried (so
+    // it is still linted and counted), not forgotten
+    const all = [...s.files]
+    const oldest = all.find(([r]) => !lintable(r)) ?? all.find(([r]) => !failed(r))
+    if (oldest) {
+      const [r, f] = oldest
+      s.files.delete(r)
+      s.dropped++
+      if (lintable(r) && !checked(r, f)) {
+        // An old record would hide that it was never checked since its last edit
+        s.lint?.files.delete(r)
+        if (!s.carried.has(r)) s.carried.set(r, { failed: false })
+      }
+    }
+  }
+}
+
+/**
+ * `php -l` on the PHP files Claude edited and hasn't had checked since, then the ones carried from an earlier stretch
+ * (so a fix made elsewhere clears them): parse only (no autoloader, no app boot, no database or network, nothing
+ * written), a few ms a file. At most LINT_MAX_FILES files and LINT_BUDGET_MS in all; the rest stay unlinted and the
+ * report says so. A file edited while it ran stays unchecked (see `seq`).
+ */
+async function lintEdited($: Api, s: Since, project: number) {
+  if (project !== projectRun) return
+  const todo = [
+    ...[...s.files].filter(([rel, f]) => lintable(rel) && (s.lint?.files.get(rel)?.seq ?? -1) < f.seq).map(([rel]) => rel),
+    ...[...s.carried.keys()].filter(rel => !s.files.has(rel) && !s.lint?.files.has(rel)),
+  ]
+  if (!todo.length) return
+  const lint = (s.lint ??= { at: 0, seq: 0, files: new Map() })
+  lint.seq = editCount
+  s.linting = true
+  const started = await nowMs($)
+  // Where the project really is: a file whose real path leaves it (a symlink) isn't read
+  const root = await $.fs.stat(projectDir, { resolve: true }).then(st => st.realPath, () => undefined)
+  try {
+    for (const rel of todo.slice(0, LINT_MAX_FILES)) {
+      if ((await nowMs($)) - started > LINT_BUDGET_MS) break
+      // The session moved to another folder while the last file was checked (or the clock was asked)
+      if (project !== projectRun) return
+      const seq = editCount
+      let rec: Omit<LintFile, 'at'> = { seq, verdict: 'unknown' }
+      try {
+        // stat rejects for a missing file, and for one it couldn't read: exists() tells which
+        const real = await $.fs.stat(projectDir + '/' + rel, { resolve: true }).then(
+          st => st.realPath ?? '',
+          async () => ((await $.fs.exists(rel)) ? '' : undefined),
+        )
+        if (real === undefined) rec = { seq, verdict: 'unknown', gone: true }
+        else if (!real || !root) rec = { seq, verdict: 'unknown' }
+        else if (!real.startsWith(root.replace(/\/$/, '') + '/')) rec = { seq, verdict: 'unknown', outside: true }
+        else {
+          const r = await runPhp($, ['php', '-l', projectDir + '/' + rel], { timeoutMs: 10_000 })
+          const output = stripAnsi(r.stdout + '\n' + r.stderr)
+          const result = lintResult(r.exitCode, output)
+          rec = { seq, ...result, ...(result.verdict === 'failed' ? { raw: tail(output.trim(), 600) } : {}) }
+        }
+      } catch {
+        // php couldn't run: unknown, never passed
+      }
+      // The session moved to another folder while it ran
+      if (project !== projectRun) return
+      lint.at = await nowMs($)
+      lint.files.set(rel, { ...rec, at: lint.at })
+      if (rec.verdict === 'passed' || rec.gone) s.carried.delete(rel)
+      else if (rec.verdict === 'failed' && s.carried.has(rel)) s.carried.set(rel, { failed: true, line: rec.line, at: lint.at })
+    }
+  } finally {
+    s.linting = false
+  }
+}
+
+/**
+ * What follows a main agent's turn, in two steps that run one after another (see turn.complete): the syntax check, then
+ * Pint and the close of the stretch.
+ */
+async function syntaxCheck($: Api, s: Since | undefined, project: number) {
+  try {
+    if (s && settings.lintAfterTurn) await lintEdited($, s, project)
+  } catch (err) {
+    $.ui.log('lara-cc: syntax check failed: ' + String(err))
+  }
+}
+
+/**
+ * Pint, then the stretch closes (the last of the chains queued for it closes it). Chains run one after another
+ * (lintDone), so turns ending close together don't run Pint twice on the same files. `files`: the PHP files edited, and
+ * `seq`: editCount, both taken when the turn ended, so an edit that lands while the syntax check runs doesn't read as formatted.
+ */
+async function afterTurn($: Api, s: Since | undefined, files: string[], seq: number, project: number) {
+  // Queued behind another chain while the session moved to another folder: nothing of this one is run there
+  if (project !== projectRun) return
+  try {
+    if (project === projectRun && settings.pintAfterTurn && hasPint && files.length) {
+      let ok = false
+      try {
+        const r = await runPhp($, ['vendor/bin/pint', ...files], { timeoutMs: 120_000 })
+        ok = r.exitCode === 0
+        $.ui.log(ok ? `lara-cc: Pint formatted ${plural(files.length, 'file')}` : `lara-cc: Pint failed: ${stripAnsi(r.stdout + r.stderr).trim().slice(0, 300)}`)
+      } catch (err) {
+        $.ui.log('lara-cc: Pint failed: ' + String(err))
+      }
+      if (s && project === projectRun) s.pint = { at: await nowMs($), seq, files: files.length, ok }
+    }
+  } finally {
+    // Whatever went wrong above, so a stretch is never left open
+    const now = await nowMs($)
+    if (s && --s.chains === 0) s.closedAt = now
+    if (project === projectRun) {
+      toastSince($, s, now)
+      redraw($)
+    }
+  }
+}
+
+/** The band's item for Claude's edits (see verifyBand), only once a turn has ended: the Syntax and Tests rows' verdicts. */
+function bandVerify($: Api, now: number, v = verifyRows($, now)): { text: string; color: 'red' | 'yellow'; message: string } | undefined {
+  if (!v || since?.closedAt === undefined) return undefined
+  const [syntax, tests] = [v.rows.find(r => r.check === 'Syntax'), v.rows.find(r => r.check === 'Tests')]
+  const item = verifyBand(v.files, syntax?.verdict, tests && { verdict: tests.verdict, partial: tests.partial })
+  if (!item) return undefined
+  const failed = v.failed[0]
+  // The band's own words for the tests (`tests not run`), so the toast can't say otherwise
+  const message = syntax?.verdict === 'failed' && failed
+    ? `Claude's edits: syntax error in ${failed.file}${failed.line ? ':' + failed.line : ''}`
+    : `Claude's edits: ${syntax ? `syntax ${syntax.verdict}, ` : ''}${item.words}`
+  return { text: item.text, color: item.color, message }
+}
+
+/**
+ * Once, when the syntax check and Pint have finished: a toast if the edits have a syntax error or the tests don't cover
+ * them (the band says it either way).
+ */
+function toastSince($: Api, s: Since | undefined, now: number) {
+  if (!s || s !== since || s.closedAt === undefined || !settings.errorToasts) return
+  const item = bandVerify($, now)
+  if (!item || s.toasted === item.message) return
+  s.toasted = item.message
+  toast($, item.message)
+}
+
+/**
+ * The report on Claude's edits, built from state so Claude's health tool and the pane can't disagree, and so a test run
+ * or restart after the edits shows at once. Each row is a check that applies to what was edited; none says passed
+ * because nothing went wrong. Undefined when no edit was seen. `$`: only for the person's buttons; `now`: $.clock.now().
+ */
+function verifyRows($: Api, now: number): { header: string; rows: Row[]; observed: string; noCheck: string; files: number; failed: { file: string; line?: number }[] } | undefined {
+  const s = since
+  if (!s) return undefined
+  const all = [...s.files]
+  const kinds = new Map<EditKind, number>()
+  for (const [, f] of all) kinds.set(f.kind, (kinds.get(f.kind) ?? 0) + 1)
+  const has = (...k: EditKind[]) => k.some(x => kinds.has(x))
+  const latest = (k: EditKind[], only: (rel: string) => boolean = () => true) =>
+    Math.max(0, ...all.filter(([rel, f]) => k.includes(f.kind) && only(rel)).map(([, f]) => f.seq))
+  const rows: Row[] = []
+  // `unknown` is lara-cc not being able to tell, whatever else the caller says
+  const add = (r: Omit<Row, 'known'> & { known?: Row['known'] }) => rows.push({ ...r, known: r.verdict === 'unknown' ? 'unknown' : (r.known ?? 'seen') })
+  const php = phpLabel()
+
+  // Syntax: one row. Passed only when every PHP file was linted after its last edit
+  const lintFiles = all.filter(([rel]) => lintable(rel))
+  // A known parse error: `old` when it's from an earlier stretch and nothing has checked the file since
+  const failed = new Map<string, { line?: number; at?: number; old?: true; recheck?: true }>()
+  const tally = { passed: 0, unknown: 0, outside: 0, stale: 0, unlinted: 0 }
+  // Parse errors from before the file's latest edit: not known to be fixed, so they stay in the row
+  const before: string[] = []
+  // With the check off a carried file is never looked at again, so its old parse error isn't a current finding
+  const failedBefore: string[] = []
+  const where = (file: string, line?: number) => (line ? `${file} line ${line}` : file)
+  for (const [rel, f] of lintFiles) {
+    const rec = s.lint?.files.get(rel)
+    const carried = s.carried.get(rel)
+    // No record: edited after the last check began, or the check never reached it (the cap, the time budget)
+    if (!rec ? !!s.lint && f.seq > s.lint.seq : rec.seq < f.seq) tally.stale++
+    else if (!rec) tally.unlinted++
+    else if (rec.verdict === 'failed') failed.set(rel, { line: rec.line })
+    else if (rec.verdict === 'passed') tally.passed++
+    else if (rec.outside) tally.outside++
+    else tally.unknown++
+    // Not known to be fixed: edited since, or the check that followed couldn't run
+    if (carried?.failed && (!rec || rec.seq < f.seq || (rec.verdict === 'unknown' && !rec.gone))) before.push(where(rel, carried.line))
+  }
+  // Carried files Claude hasn't edited again: what the check found this stretch, else what it found before
+  const carriedOnly = [...s.carried].filter(([rel]) => !s.files.has(rel))
+  for (const [rel, c] of carriedOnly) {
+    const rec = s.lint?.files.get(rel)
+    if (rec?.verdict === 'failed') failed.set(rel, { line: rec.line })
+    else if (!rec && c.failed && !settings.lintAfterTurn) {
+      failedBefore.push(where(rel, c.line))
+      tally.unlinted++
+    }
+    // A re-check that couldn't run doesn't show the file was fixed: the old parse error stands
+    else if (c.failed && (!rec || (rec.verdict === 'unknown' && !rec.gone))) failed.set(rel, { line: c.line, at: c.at, old: true, ...(rec ? { recheck: true as const } : {}) })
+    else if (rec?.outside) tally.outside++
+    else if (rec) tally.unknown++
+    else tally.unlinted++
+  }
+  if (lintFiles.length || carriedOnly.length) {
+    // Which PHP, since the app's may be newer than the one lara-cc runs (a file valid on one can fail on the other)
+    const at = (s.lint ? ` at ${hms(s.lint.at)}` : '') + (php ? `, ${php}` : '')
+    const unlinted = tally.unknown + tally.outside + tally.stale + tally.unlinted
+    const earlier =
+      (before.length ? `; failed before its latest edit: ${before.slice(0, 5).join(', ')}` : '') +
+      (failedBefore.length ? `; failed before: ${failedBefore.slice(0, 5).join(', ')}` : '')
+    if (failed.size) {
+      const list = [...failed].slice(0, 5).map(([file, f]) => where(file, f.line) + (f.old && f.at ? ` (found ${hms(f.at)}${f.recheck ? '; the re-check could not run' : ''})` : '')).join(', ') + (failed.size > 5 ? ` and ${failed.size - 5} more` : '')
+      const old = [...failed.values()].every(f => f.old)
+      const rest = unlinted ? `; ${plural(unlinted, 'other file')} not linted` : ''
+      add({
+        check: 'Syntax',
+        verdict: 'failed',
+        detail:
+          // An old one's time is its own, not when other files were last linted
+          `${old ? 'still failing from before: ' : ''}${list} (php -l${old ? (php ? `, ${php}` : '') : at}; did not parse on this PHP)${rest}` +
+          (old && !settings.lintAfterTurn ? ' (not re-checked: "syntax check after each turn" is off)' : ''),
+        say: "Edit that file, then call health again (the user's pane shows the parse error text; no tool of yours reads it)",
+      })
+    } else if (s.linting) {
+      add({ check: 'Syntax', verdict: 'unknown', detail: 'the syntax check is still running; call health again' })
+    } else if (!settings.lintAfterTurn && (!s.lint || tally.unlinted + tally.stale > 0)) {
+      add({ check: 'Syntax', verdict: 'skipped', detail: `"syntax check after each turn" is off${earlier}` })
+    } else if (!s.lint) {
+      add({ check: 'Syntax', verdict: 'not run', known: 'inferred', detail: (s.closedAt === undefined ? "runs when Claude's turn ends" : 'did not run on these edits') + earlier })
+    } else if (!unlinted) {
+      add({ check: 'Syntax', verdict: 'passed', detail: `php -l on ${plural(tally.passed, 'file')}${at}` })
+    } else {
+      const why = [
+        tally.unknown && `${tally.unknown} not found or could not run`,
+        tally.outside && `${tally.outside} link${tally.outside === 1 ? '' : 's'} to outside the project, not read`,
+        tally.stale && `${tally.stale} edited after the check`,
+        tally.unlinted && (s.closedAt === undefined ? `${tally.unlinted} not checked yet` : `${tally.unlinted} over the ${LINT_MAX_FILES}-file cap or the time budget`),
+      ].filter(Boolean)
+      add({
+        check: 'Syntax',
+        verdict: tally.unknown || tally.outside ? 'unknown' : 'not run',
+        detail: `php -l passed on ${tally.passed} of ${plural(lintFiles.length + carriedOnly.length, 'file')}${at}; ${plural(unlinted, 'file')} not linted (${why.join(', ')})${earlier}`,
+      })
+    }
+  }
+
+  // Tests: from the last run at the time of the call, so a later run by the person or Claude's Bash shows
+  if (has('php', 'migration', 'route', 'config', 'test')) {
+    const t = lastTest
+    const test: Pick<Row, 'claude' | 'button'> = {
+      claude: { artisan: 'test' },
+      button: { label: 'run tests', run: async () => void (await runCommand($, 'test', ['php', 'artisan', 'test'])) },
+    }
+    // A test file Claude changed is the likeliest thing to be wrong, so say it has not run
+    const changedTests = has('test') ? '; a changed test file with no later run' : ''
+    if (!t) add({ check: 'Tests', verdict: 'not run', known: 'inferred', detail: `none run this session${changedTests}`, ...test })
+    else {
+      const counts = testCounts(t)
+      const what = `${redact(t.label)}, ${hms(t.at)}`
+      if (t.editedSince || t.ledger !== editCount) add({ check: 'Tests', verdict: 'not run', detail: `the last run (${counts}, ${ago(t.at)} ago, ${redact(t.label)}) was before these edits${changedTests}`, ...test })
+      else if (t.crashed !== undefined) {
+        add({ check: 'Tests', verdict: 'failed', detail: `${counts} (${what})`, say: "its output is in the Commands tab for a run made there, and in your own Bash result for yours", ...test })
+      } else if (t.failed) {
+        add({ check: 'Tests', verdict: 'failed', detail: `${counts} (${what})`, say: 'the Tests tab lists them; test names reach you only through the tests the user sends', ...test })
+      } else if (t.exitCode) add({ check: 'Tests', verdict: 'unknown', detail: `exited ${t.exitCode} after printing a summary (${counts}; ${what})`, ...test })
+      else if (!t.passed) add({ check: 'Tests', verdict: 'unknown', detail: t.skipped ? `all ${t.skipped} skipped, none ran (${what})` : `ran, no tests found (${what})`, ...test })
+      else {
+        const subset = t.scope === 'subset'
+        const scope = subset ? "a subset, so the rest hasn't run on these edits" : 'the suite'
+        add({ check: 'Tests', verdict: 'passed', ...(subset ? { partial: true as const } : {}), detail: `${counts} (${scope}; ${what}, after the last edit at ${hms(s.lastAt)})` })
+      }
+    }
+  }
+
+  // Pint: opt-in, so a skipped row says the setting is off
+  if (hasPint && lintFiles.some(([, f]) => f.kind !== 'view')) {
+    if (!settings.pintAfterTurn) add({ check: 'Pint', verdict: 'skipped', detail: '"Pint after each turn" is off' })
+    else if (s.pint && s.pint.seq >= latest(['php', 'migration', 'route', 'config', 'test'])) {
+      add({ check: 'Pint', verdict: s.pint.ok ? 'passed' : 'failed', detail: `${plural(s.pint.files, 'file')} at ${hms(s.pint.at)}`, ...(s.pint.ok ? {} : { say: "the user's pane and lara-cc's log show why; no tool of yours reads it" }) })
+    } else add({ check: 'Pint', verdict: 'not run', known: 'inferred', detail: s.pint ? 'ran before the latest edit' : s.closedAt === undefined ? "runs when Claude's turn ends" : 'did not run on these edits' })
+  }
+
+  // Migrations: never "passed", since lara-cc runs none
+  if (has('migration')) {
+    const read = `migrate:status, ${ago(migrationsAt)} ago`
+    if (!migrationsAt || migrationsSeq < latest(['migration'])) {
+      add({ check: 'Migrations', verdict: 'unknown', detail: `migrate:status has not been read since the edit${migrationsFailed ? ` (the last attempt failed: ${migrationsFailed})` : ''}` })
+    } else if (migrationsFailed) {
+      // Read after the edit, then a re-check failed: the count is as of the read
+      add({ check: 'Migrations', verdict: 'unknown', detail: `migrate:status has failed since (${migrationsFailed}); ${plural(pendingMigrations, 'pending migration')} as of ${ago(migrationsAt)} ago`, ...(pendingMigrations ? { claude: { artisan: 'migrate' }, button: { label: 'migrate', run: migrateFix($) } } : {}) })
+    } else if (pendingMigrations) {
+      add({ check: 'Migrations', verdict: 'not run', detail: `${plural(pendingMigrations, 'pending migration')} (${read})`, claude: { artisan: 'migrate' }, button: { label: 'migrate', run: migrateFix($) } })
+    } else add({ check: 'Migrations', verdict: 'unknown', detail: `no pending migrations (${read}); that doesn't show the edited migration ran or works` })
+  }
+
+  // Routes and views: lara-cc ran the check itself, after the last edit of that kind, or didn't
+  for (const [check, kind, command, why] of [
+    ['Routes', 'route', 'route:list', 'route:list not run, so new routes and names are unverified'],
+    ['Views', 'view', 'view:cache', 'Blade not compiled; a template error shows only when the page renders'],
+  ] as const) {
+    if (!has(kind)) continue
+    const ran = artisanRan[command]
+    if (ran && ran.seq >= latest([kind])) {
+      add(ran.ok ? { check, verdict: 'passed', detail: `${command} ran at ${hms(ran.at)}, after the last ${kind} edit` } : { check, verdict: 'failed', detail: `${command} failed at ${hms(ran.at)}`, say: 'the Commands tab shows why, only to the user', claude: { artisan: command } })
+    } else add({ check, verdict: 'not run', known: 'inferred', detail: why, claude: { artisan: command } })
+  }
+
+  // The queue worker reads code, config and env at boot; lara-cc can restart only the one it started
+  if (has('php', 'migration', 'route', 'config', 'env') && snapshot?.connection !== 'sync') {
+    const svc = services.queue
+    const workerKinds: EditKind[] = ['php', 'migration', 'route', 'config', 'env']
+    const needSeq = latest(workerKinds)
+    const reads = [has('php', 'migration', 'route') && 'code', has('config') && 'config', has('env') && 'env values'].filter(Boolean).join(', ')
+    const restart = { claude: { service: ['queue', 'restart'] as [string, 'restart'] }, button: { label: 'restart queue', run: () => restartService($, 'queue') } }
+    // A cached config is what a worker reads, whenever it starts: a restart alone doesn't load an edit to config or env
+    const configCached = has('config', 'env') && checks.some(c => /\bconfig\b.*cached/.test(c.band))
+    const restarted = svc.startedAt !== undefined && (svc.startedSeq ?? 0) >= needSeq
+    if (svc.run && configCached) {
+      add({
+        check: svc.label,
+        verdict: 'not run',
+        known: 'inferred',
+        detail: `config is cached, so the worker still reads the old config and env values${restarted ? ` even after its restart at ${hms(svc.startedAt!)}` : ''}; clear the config cache, then restart (see Problems)`,
+        say: 'clear the config cache first, then restart the queue worker',
+        claude: { artisan: 'config:clear' },
+        button: restart.button,
+      })
+    } else if (svc.run && restarted) {
+      add({ check: svc.label, verdict: 'done', detail: `managed worker (re)started ${hms(svc.startedAt!)}, after the last edit it reads` })
+    } else if (restartTimer || restarting) {
+      add({ check: svc.label, verdict: 'not run', known: 'inferred', detail: restarting ? 'restarting now' : 'restart pending (2 s debounce)' })
+    } else if (svc.run) {
+      const phpEdited = latest(workerKinds, rel => rel.endsWith('.php')) > 0
+      const why = !settings.autoRestartQueue ? ' ("restart queue on PHP edits" is off)' : !phpEdited ? ' (the automatic restart only follows PHP edits)' : ''
+      add({
+        check: svc.label,
+        verdict: 'not run',
+        known: 'inferred',
+        detail: `still running the ${reads} from before the edits${why}`,
+        ...restart,
+      })
+    } else if (svc.crashed || (s.restart && !s.restart.ok)) {
+      const why = svc.crashed ? `it exited with code ${svc.crashed.code}` : `the automatic restart at ${hms(s.restart!.at)} did not bring it back`
+      add({ check: svc.label, verdict: 'failed', detail: `the managed worker isn't running: ${why}`, ...restart })
+    } else {
+      add({
+        check: svc.label,
+        verdict: 'unknown',
+        detail: "no worker from this session; one elsewhere (Supervisor, another terminal) keeps the old code, config and env values, and lara-cc can't see it",
+        claude: { artisan: 'queue:restart' },
+      })
+    }
+  }
+
+  const noCheck: [EditKind, string][] = [['frontend', 'frontend file'], ['composer', 'dependency file'], ['env', 'env file'], ['other', 'other file']]
+  const unchecked = noCheck.filter(([k]) => kinds.has(k)).map(([k, word]) => plural(kinds.get(k)!, word))
+  const noCheckText = unchecked.length
+    ? `No check exists for: ${unchecked.join(', ')}.` +
+      (kinds.has('env') ? ' An env file was edited (lara-cc never reads it); cached config, workers and Vite keep old values until restarted.' : '') +
+      (services.vite.run ? " Vite runs here but lara-cc doesn't read its errors." : '')
+    : ''
+
+  const label = (k: EditKind) => (k === 'composer' ? 'dependency' : k)
+  const files = all.length + s.dropped
+  const header =
+    `${hms(s.firstAt)}${s.lastAt === s.firstAt ? '' : ' to ' + hms(s.lastAt)}, ${plural(files, 'file')}: ${[...kinds].map(([k, n]) => `${n} ${label(k)}`).join(', ')}` +
+    (s.dropped ? ` (${s.dropped} earlier not listed)` : '')
+
+  // The log window: counted by arrival, so it says only what showed up, and only when the tail ran the whole time
+  const endsAt = s.closedAt === undefined ? undefined : s.closedAt + ERROR_WINDOW_MS
+  const open = endsAt === undefined || now < endsAt
+  const to = Math.min(now, endsAt ?? now)
+  const whole = logSince !== 0 && logSince <= s.firstAt && !logGaps.some(g => g.from <= to && (g.to ?? Infinity) >= s.firstAt)
+  const stamp = logStamp(s.newestError?.time)
+  const doesNotShow = "This doesn't show the edits work: only code that ran in that time could have written one."
+  let observed: string
+  if (s.errors) {
+    const extra = [open && endsAt && `window open until ${hms(endsAt)}`, stamp && `newest entry stamped ${stamp}`].filter(Boolean).join('; ')
+    const span = open ? `${s.errors === 1 ? 'has' : 'have'} arrived since ${hms(s.firstAt)} so far` : `arrived between ${hms(s.firstAt)} and ${hms(endsAt!)}`
+    const read = `read them with the logs tool (${logsConsent()})`
+    observed =
+      `Log: ${plural(s.errors, 'error')} ${span}${extra ? ` (${extra})` : ''}. The log alone doesn't show these came from Claude's edits (requests, jobs and other processes write to it); ${read}.` +
+      (whole ? '' : " The log wasn't followed the whole time, so there may be more.")
+  } else if (!whole) observed = `Log: not followed for the whole interval since ${hms(s.firstAt)} (unknown).`
+  else if (open) observed = `Log: no errors have arrived since ${hms(s.firstAt)} so far (${endsAt ? `window open until ${hms(endsAt)}` : 'the stretch is still open'}). ${doesNotShow}`
+  else observed = `Log: no errors arrived ${hms(s.firstAt)}-${hms(endsAt!)}. ${doesNotShow}`
+
+  return { header, rows, observed, noCheck: noCheckText, files, failed: [...failed].map(([file, f]) => ({ file, ...(f.line ? { line: f.line } : {}) })) }
+}
+
+/** `passed`, or `passed (subset only)`. */
+const verdictText = (r: Row) => (r.partial ? 'passed (subset only)' : r.verdict)
+
+/** Claude's lines for the report: each row with its next steps (what its tools can do and whether that asks), the log, and what has no check. */
+async function verifyLines($: Api, v: NonNullable<ReturnType<typeof verifyRows>>): Promise<string[]> {
+  const made = artisanMade ? `; ${plural(artisanMade, 'artisan make command')} ran through lara-cc, and the files they created aren't tracked` : ''
+  const out = [`Since Claude's edits (${v.header}; lara-cc saw only edits made with Claude's Edit, Write and NotebookEdit tools${made}):`]
+  for (const r of v.rows) {
+    out.push(`- [${r.known}] ${r.check}: ${verdictText(r)}, ${r.detail}`)
+    if (['passed', 'done', 'skipped'].includes(r.verdict)) continue
+    const tool = !r.claude ? undefined : 'artisan' in r.claude ? await artisanStep($, [r.claude.artisan]) : serviceStep(r.claude.service[0], r.claude.service[1])
+    const steps = [r.say, tool].filter(Boolean).join(' · ')
+    if (steps || r.button) out.push(nextSteps(steps || undefined, r.button?.label))
+  }
+  out.push(`Observed: ${v.observed}`)
+  if (v.noCheck) out.push(v.noCheck)
+  out.push('A pass means only that check passed. Never say "verified" or "all good" from this list alone; say which checks passed, failed, were not run or skipped.')
+  return out
+}
+
 /** What Claude's health tool never looks at, so nothing left out reads as fine. */
 const NEVER_CHECKED =
-  "Never checked: servers not on this machine (lara-cc doesn't name them); local servers on ports no Herd service has (Docker, DBngin); a public/hot that names another machine; workers, Vite or schedulers started outside this session; PHP edited outside Claude's Edit and Write tools; whether pages actually render."
+  "Never checked: servers not on this machine (lara-cc doesn't name them); local servers on ports no Herd service has (Docker, DBngin); a public/hot that names another machine; workers, Vite or schedulers started outside this session; files edited outside Claude's Edit, Write and NotebookEdit tools (Bash, git, artisan, an editor); whether edited code is correct beyond syntax and the tests that ran; whether pages actually render."
 
 /**
  * Claude's health tool: problems, what lara-cc couldn't tell, what's stale and what's fine, each marked [seen],
@@ -1907,6 +2542,16 @@ async function healthText($: Api, slow: boolean): Promise<string> {
   const session: string[] = []
   const line = (known: string, text: string) => `- [${known}] ${text}`
   const old = checksStale()
+  // The report on Claude's edits is the one source for what it covers: the lines below drop their own for the same facts
+  await Promise.race([syntaxDone, $.clock.sleep(5000)])
+  const v = verifyRows($, await nowMs($))
+  const verify = v
+    ? await verifyLines($, v)
+    : [
+        "Since Claude's edits: none seen. No edit through Claude's Edit, Write or NotebookEdit tools this session, and changes made by Bash, git, artisan or an editor aren't tracked, so nothing here says a change was checked." +
+          (artisanMade ? ` ${plural(artisanMade, 'artisan make command')} ran through lara-cc; the files they created aren't tracked.` : ''),
+      ]
+  const [testsInReport, migrationsInReport] = [!!v?.rows.some(r => r.check === 'Tests'), !!v?.rows.some(r => r.check === 'Migrations')]
 
   const why = checksFailed ? `the checks' last run failed (${checksFailed})` : !checkedAt ? "the checks haven't finished yet" : `the checks haven't finished for ${CHECKS_STALE}+ minutes`
   const sentence = `${checkedAt ? `The checks finished ${ago(checkedAt)} ago` : "The checks haven't finished yet"}; they also run every minute and after each of your turns.`
@@ -1940,7 +2585,7 @@ async function healthText($: Api, slow: boolean): Promise<string> {
   }
 
   // A count kept from before a failed re-check is stale, never zero
-  if (migrationsAt) {
+  if (migrationsAt && !migrationsInReport) {
     const read = `migrate:status, ${ago(migrationsAt)} ago`
     const failedSince = migrationsFailed ? `; stale: migrate:status has failed since (${migrationsFailed})` : ''
     if (pendingMigrations) {
@@ -1953,13 +2598,15 @@ async function healthText($: Api, slow: boolean): Promise<string> {
   // A run from before Claude's PHP edits is stale, passed or failed
   const t = lastTest
   let passing = ''
-  if (!t) unknown.push(line('unknown', 'Tests: none run this session'))
-  else {
-    const run = t.failed ? `${t.failed} failed, ${t.passed} passed${t.skipped ? `, ${t.skipped} skipped` : ''}` : `${t.passed} passed`
-    const text = line('seen', `Tests: ${run} in the last run (${redact(t.label)}, ${ago(t.at)} ago)${t.editedSince ? '; stale: Claude edited PHP files since' : ''}`)
-    const next = t.failed || t.editedSince ? '\n' + nextSteps(await artisanStep($, ['test']), undefined) : ''
+  // With a Tests row in the report only the stale run stays here, pointing at it
+  if (!t) {
+    if (!testsInReport) unknown.push(line('unknown', 'Tests: none run this session'))
+  } else if (!testsInReport || t.editedSince) {
+    const run = testCounts(t)
+    const text = line('seen', `Tests: ${run} in the last run (${redact(t.label)}, ${ago(t.at)} ago)${t.editedSince ? `; stale: Claude edited PHP files since${testsInReport ? " (see the Since Claude's edits section)" : ''}` : ''}`)
+    const next = t.failed || t.crashed !== undefined || t.editedSince ? '\n' + nextSteps(await artisanStep($, ['test']), undefined) : ''
     if (t.editedSince) stale.push(text + next)
-    else if (t.failed) problems.push(text + next)
+    else if (t.failed || t.crashed !== undefined) problems.push(text + next)
     else passing = text
   }
 
@@ -1973,8 +2620,8 @@ async function healthText($: Api, slow: boolean): Promise<string> {
   // Counts and the log's own timestamp only: entries go through the logs tool, which asks
   const newestError = [...logState.entries].reverse().find(isError)
   if (unseenErrors) {
-    const when = newestError ? `, newest at ${newestError.time}` : ''
-    const logsNext = `logs tool (${shareAllowed ? 'the user allowed log entries this session' : 'asks the user before sending entries'})`
+    const when = logStamp(newestError?.time) ? `, newest at ${newestError!.time}` : ''
+    const logsNext = `logs tool (${logsConsent()})`
     problems.push(line('seen', `${plural(unseenErrors, 'new error')} in ${logPath} since the user last looked at the log (Log tab or /lara-logs)${when}`) + '\n' + nextSteps(logsNext, undefined))
   }
 
@@ -2005,6 +2652,11 @@ async function healthText($: Api, slow: boolean): Promise<string> {
     `lara-cc health (read-only: it changed nothing). ${sentence}`,
     "[seen]: lara-cc saw it. [inferred]: a conclusion from indirect evidence. [unknown]: lara-cc couldn't tell; treat it as neither fine nor broken. Stale: true when last seen, not confirmed since. Not listed means not checked, not fine.",
     "next: (runs without asking) you may do; (asks the user first) shows them a question, and a no means don't retry; the user's button is theirs to press: suggest it.",
+    ...(v
+      ? ["Since Claude's edits: passed/failed = ran after the last edit; not run = nothing ran after it (an older run says nothing about it); skipped = a setting says not to; unknown = lara-cc can't tell; done = an action was taken (the managed worker restarted). No error appearing is not a pass."]
+      : []),
+    '',
+    ...verify,
     '',
     ...sections.filter(([, lines]) => lines.length).flatMap(([name, lines]) => [name + ':', ...lines]),
     NEVER_CHECKED,
@@ -2028,6 +2680,9 @@ function leaveProject() {
   hasPint = false
   if (logRun) void logRun.stream.return({ code: null, signal: 'SIGTERM' }).catch(() => {})
   logRun = undefined
+  logSince = 0
+  logGaps = []
+  logLookedAt = 0
   logPath = ''
   logState = newLogState()
   unseenErrors = 0
@@ -2042,12 +2697,17 @@ function leaveProject() {
   snapshotLoad = undefined
   pendingMigrations = 0
   migrationsAt = 0
+  migrationsSeq = 0
   migrationsFailed = ''
   lastRun = undefined
   testsRunning = false
   restartTimer?.cancel()
   restartTimer = undefined
   editedPhp.clear()
+  since = undefined
+  lintDone = syntaxDone = Promise.resolve()
+  artisanMade = 0
+  artisanRan = {}
   debugCapture = undefined
 }
 
@@ -2068,6 +2728,10 @@ async function detectProject($: Api) {
   connections = undefined
   shareAllowed = false
   lastTest = undefined
+  since = undefined
+  lintDone = syntaxDone = Promise.resolve()
+  artisanMade = 0
+  artisanRan = {}
   waitingBefore = undefined
   waitingAtTick = undefined
   hasBoost = false
@@ -2214,7 +2878,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'health',
       description:
-        "What lara-cc knows about this Laravel app's local health, and how: problems, what it couldn't tell, what is stale and what is fine, each marked [seen], [inferred] or [unknown] with its age, and each problem with its next step and whether that runs without asking, asks the user first, or is the user's to do. Read-only: it re-runs the checks, the queue read and migrate:status first. Counts, drivers, local ports and file names only: read log entries and exceptions with the logs and queue tools. Call it before telling the user something is broken or working, and after a fix to confirm it took.",
+        "What lara-cc knows about this Laravel app's local health, and how: problems, what it couldn't tell, what is stale and what is fine, each marked [seen], [inferred] or [unknown] with its age, and each problem with its next step and whether that runs without asking, asks the user first, or is the user's to do. Read-only: it re-runs the checks, the queue read and migrate:status first. Counts, drivers, local ports and file names only: read log entries and exceptions with the logs and queue tools. Call it before telling the user something is broken or working, and after a fix to confirm it took. After editing files, call it: it lists which checks ran on your edits and which passed, failed, were skipped or not run, with timestamps.",
       inputSchema: { type: 'object', properties: {} },
       isDeferred: false,
     })
@@ -2410,10 +3074,19 @@ export const register: Register = on => {
   // No .catch that calls next again: the command has already run, and must not run twice
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const edits = phpEdits
+    const ledger = editCount
     const result = await next(e)
     try {
       const command = String((e as unknown as { command?: string }).command ?? '')
-      if (isLaravel && isTestCommand(command) && !('deny' in result && result.deny)) noteTestRun($, 'Claude ran ' + command.slice(0, 60), resultText(result), edits)
+      if (isLaravel && isTestCommand(command) && !('deny' in result && result.deny)) {
+        const text = resultText(result)
+        // Core marks a command that exited non-zero (`Exit code 255` first in its text): a summary printed before a crash isn't a pass
+        const failed = 'isError' in result && result.isError ? Number(/^Exit code (\d+)/.exec(text)?.[1]) || 1 : undefined
+        // A failure with no summary is a crashed run only when the runner started: `ls vendor/bin/pest` exiting 1 isn't one
+        const clean = stripAnsi(text)
+        const exitCode = failed !== undefined && !parseTestRun(clean) && !testRunnerStarted(command, clean) ? undefined : failed
+        noteTestRun($, 'Claude ran ' + command.slice(0, 60), text, edits, ledger, command, exitCode)
+      }
     } catch (err) {
       $.ui.log('lara-cc: could not read the test run: ' + String(err))
     }
@@ -2446,12 +3119,22 @@ export const register: Register = on => {
 
   // ── When Claude edits PHP: restart the queue worker, and remember the file for Pint ──
 
-  // As with Bash: the edit has already been made, so nothing here may make it run again
-  on('tool.call', { tool: ['Edit', 'Write'] }, async ($, e, next) => {
+  // As with Bash: the edit has already been made, so nothing here may make it run again. A failed edit changed nothing, and
+  // neither did one refused before it ran; but a deny can also come after it ran (a plugin withholding the result), which
+  // undoes nothing: the file tells which
+  on('tool.call', { tool: ['Edit', 'Write', 'NotebookEdit'] }, async ($, e, next) => {
+    const input = e as unknown as { file_path?: string; notebook_path?: string }
+    const path = String(input.file_path ?? input.notebook_path ?? '')
+    // Nothing outside the project is stat'd: a path it doesn't track can't be told apart after a deny, so a deny stands
+    const rel = relativeTo(path, projectDir)
+    const tracked = isLaravel && rel !== undefined && !isIgnoredRel(rel)
+    const before = tracked ? await fileStamp($, path) : ''
     const result = await next(e)
     try {
-      const path = String((e as unknown as { file_path?: string }).file_path ?? '')
-      if (!path.endsWith('.php') || ('isError' in result && result.isError)) return result
+      if ('isError' in result && result.isError) return result
+      if ('deny' in result && result.deny && (!tracked || (await fileStamp($, path)) === before)) return result
+      if (tracked) noteEdit(path, await nowMs($))
+      if (!path.endsWith('.php')) return result
       editedPhp.add(path)
       phpEdits++
       // The last test run no longer covers the code
@@ -2459,8 +3142,23 @@ export const register: Register = on => {
       if (settings.autoRestartQueue && services.queue.run) {
         restartTimer?.cancel()
         restartTimer = $.clock.after(2000, async () => {
-          await restartService($, 'queue')
-          $.ui.toast(`${services.queue.label} restarted after PHP edits`)
+          // No longer pending, whatever follows
+          restartTimer = undefined
+          restarting = true
+          try {
+            await restartService($, 'queue')
+            // A worker that dies as it boots (a parse error in the edit) goes in this wait, so it isn't told as restarted
+            const run = services.queue.run
+            if (run) await Promise.race([run.done, $.clock.sleep(RESTART_SETTLE_MS)])
+          } catch (err) {
+            $.ui.log('lara-cc: queue restart after PHP edits failed: ' + String(err))
+          } finally {
+            restarting = false
+          }
+          const ok = !!services.queue.run
+          if (since) since.restart = { at: await nowMs($), ok }
+          $.ui.toast(ok ? `${services.queue.label} restarted after PHP edits` : `${services.queue.label} did not restart after PHP edits`)
+          redraw($)
         })
       }
     } catch (err) {
@@ -2472,18 +3170,25 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     // Claude may have cached config, installed packages or stopped Vite
     if (e.agentId === undefined) void checkHealth($)
-    if (e.agentId === undefined && editedPhp.size) {
-      const files = [...editedPhp].filter(f => !f.includes('/vendor/'))
+    // A subagent's turn ending says nothing about the main one's edits
+    if (e.agentId === undefined) {
+      // Only what the stretch tracks: inside the project (`..` resolved), not vendor or a cache, never an env file (`.env.php`: Pint would rewrite it)
+      const files = [...editedPhp].flatMap(f => {
+        const rel = relativeTo(f, projectDir)
+        return rel === undefined || isIgnoredRel(rel) || editKind(rel) === 'env' ? [] : [projectDir + '/' + rel]
+      })
+      const seq = editCount
+      // The folder this turn ended in, not the one the chain finds when its turn comes (see afterTurn)
+      const project = projectRun
       editedPhp.clear()
-      if (settings.pintAfterTurn && hasPint && files.length) {
-        void (async () => {
-          try {
-            const r = await runPhp($, ['vendor/bin/pint', ...files], { timeoutMs: 120_000 })
-            $.ui.log(r.exitCode === 0 ? `lara-cc: Pint formatted ${plural(files.length, 'file')}` : `lara-cc: Pint failed: ${stripAnsi(r.stdout + r.stderr).trim().slice(0, 300)}`)
-          } catch (err) {
-            $.ui.log('lara-cc: Pint failed: ' + String(err))
-          }
-        })()
+      // A stretch that already closed has nothing new to check
+      const s = since?.closedAt === undefined ? since : undefined
+      if (s) s.chains++
+      if (s || files.length) {
+        // A report waits for the syntax check, not for Pint after it
+        const lint = lintDone.then(() => syntaxCheck($, s, project))
+        syntaxDone = lint
+        lintDone = lint.then(() => afterTurn($, s, files, seq, project)).catch(() => {})
       }
     }
     return next(e)
@@ -2527,8 +3232,15 @@ export const register: Register = on => {
     const failedUnknown = !!snapshot && !!snapshotError && !failedStored
     const crashed = Object.values(services).filter(s => s.crashed && !s.crashed.seen)
     const failingTests = lastTest?.failed ?? 0
+    // A run that ended without printing a summary: no count, but not a pass either
+    const crashedTests = lastTest?.crashed !== undefined
     const stale = checksStale()
-    if (!running.length && !crashed.length && !unseenErrors && !failedStored && !failedUnknown && !pendingMigrations && !failingTests && !checks.length && !stale) return next(e)
+    // Claude's edits, once a turn has ended: a syntax error, or tests that don't cover them
+    const now = since ? await nowMs($) : 0
+    const report = verifyRows($, now)
+    const verify = bandVerify($, now, report)
+    const testsRow = report?.rows.find(r => r.check === 'Tests')
+    if (!running.length && !crashed.length && !unseenErrors && !failedStored && !failedUnknown && !pendingMigrations && !failingTests && !crashedTests && !checks.length && !stale && !verify) return next(e)
 
     const { Box, Text, Button } = $.ui.resolve(e)
     const theirs = await next(e)
@@ -2539,8 +3251,12 @@ export const register: Register = on => {
       const extra = s.name === 'queue' && (stats.done || stats.failed) ? ` ${stats.done}✓${stats.failed ? ` ${stats.failed}✗` : ''}` : ''
       items.push({ text: '●', color: 'green' }, { text: s.name + extra })
     }
-    // A passing run from before Claude's PHP edits isn't drawn: it no longer covers the code
-    if (lastTest && !failingTests && !lastTest.editedSince) items.push({ text: `✓ ${plural(lastTest.passed, 'test')}`, color: 'green' })
+    // A passing run isn't drawn when the report says it no longer covers Claude's edits (before a PHP edit or any other
+    // tracked one, or an unclear or partial run): a green count beside "tests not run" would contradict itself
+    const covers = !testsRow || (testsRow.verdict === 'passed' && !testsRow.partial)
+    if (lastTest && !failingTests && !crashedTests && !lastTest.editedSince && covers) items.push({ text: `✓ ${plural(lastTest.passed, 'test')}`, color: 'green' })
+    // Never green. Tests that failed already have their own item below, so only a syntax error joins them
+    if (verify && (verify.color === 'red' || !failingTests)) items.push({ text: verify.text, color: verify.color })
     for (const s of crashed) {
       items.push({ text: `✗ ${s.name} exited (${s.crashed!.code})`, color: 'red', fix: { label: `restart ${s.name}`, run: () => restartService($, s.name) } })
     }
@@ -2551,6 +3267,7 @@ export const register: Register = on => {
           : { text: `✗ ${plural(failingTests, 'test')} failing`, color: 'red' },
       )
     }
+    if (crashedTests) items.push({ text: `✗ tests exited (${lastTest!.crashed})`, color: lastTest!.editedSince ? 'yellow' : 'red' })
     if (unseenErrors) items.push({ text: `▲ ${plural(unseenErrors, 'new error')}`, color: 'red' })
     if (failedStored) {
       items.push({ text: plural(failedStored, 'failed job') + (snapshotError ? ' (last read failed)' : ''), color: 'yellow', dim: !!snapshotError })
@@ -2589,7 +3306,7 @@ export const register: Register = on => {
     })
 
     // The Services tab explains crashes and checks
-    const target: Tab = crashed.length ? 'services' : failingTests ? 'tests' : unseenErrors ? 'log' : failedStored ? 'queue' : 'services'
+    const target: Tab = crashed.length ? 'services' : failingTests || crashedTests || verify?.color === 'red' ? 'tests' : unseenErrors ? 'log' : failedStored ? 'queue' : verify ? 'tests' : 'services'
     const band = (
       <Box flexDirection="row">
         <Text dimColor>{'lara-cc  '}</Text>
@@ -2627,13 +3344,15 @@ export const register: Register = on => {
       <Button key={'tab-' + id} label={label} hotkey={hotkey} plain dimColor={tab !== id} onPress={() => void openPane($, id)} />
     )
 
+    // Claude's edits, on the Tests tab (the rows) and the Services tab (one line)
+    const verify = verifyRows($, since ? await nowMs($) : 0)
     const errorBadge = unseenErrors ? ` (${unseenErrors})` : ''
     const failedBadge = snapshot?.failedTotal ? ` (${snapshot.failedTotal})` : ''
     const tabs: [Tab, string, string][] = [
       ['services', 'Services', 's'],
       ['queue', 'Queue' + failedBadge, 'q'],
       ['log', 'Log' + errorBadge, 'l'],
-      ['tests', 'Tests' + (lastTest?.failed ? ` (${lastTest.failed})` : ''), 't'],
+      ['tests', 'Tests' + (lastTest?.failed ? ` (${lastTest.failed})` : lastTest?.crashed !== undefined ? ' (!)' : ''), 't'],
       ['routes', 'Routes', 'r'],
       ['commands', 'Commands', 'c'],
       ['about', 'About', 'a'],
@@ -2646,7 +3365,7 @@ export const register: Register = on => {
     // Rows the header wraps to: each tab is drawn `s: Services`, two columns apart
     const headerRows = Math.ceil(tabs.reduce((n, [, label]) => n + label.length + 5, -2) / width)
 
-    const toggleButton = (key: 'autoRestartQueue' | 'pintAfterTurn' | 'showBand' | 'errorToasts', label: string) => (
+    const toggleButton = (key: 'autoRestartQueue' | 'pintAfterTurn' | 'lintAfterTurn' | 'showBand' | 'errorToasts', label: string) => (
       <Button key={'set-' + key} label={`${settings[key] ? '[x]' : '[ ]'} ${label}`} plain dimColor={!settings[key]} onPress={() => void toggle($, key)} />
     )
 
@@ -2708,6 +3427,14 @@ export const register: Register = on => {
             {notCheckedText && <Text dimColor>{notCheckedText}</Text>}
             <Button key="checks-recheck" label={checking ? 'checking…' : 'recheck'} plain dimColor onPress={() => void recheck($)} />
           </Box>
+          {verify && (
+            <Box flexDirection="row" columnGap={1} flexWrap="wrap">
+              <Text dimColor>
+                {[`Claude's edits: ${plural(verify.files, 'file')}`, ...(['Syntax', 'Tests'] as const).flatMap(check => verify.rows.filter(r => r.check === check).map(r => `${check.toLowerCase()} ${verdictText(r)}`))].join(' · ')}
+              </Text>
+              <Button key="since-details" label="details" plain dimColor onPress={() => void openPane($, 'tests')} />
+            </Box>
+          )}
           {checks.map(c => (
             <Box flexDirection="row" columnGap={1}>
               <Text color={c.color}>{`${mark(c)} ${c.detail}`}</Text>
@@ -2758,13 +3485,14 @@ export const register: Register = on => {
           ))}
           <Box flexDirection="row" columnGap={2} flexWrap="wrap">
             {toggleButton('autoRestartQueue', 'restart queue on PHP edits')}
+            {toggleButton('lintAfterTurn', 'syntax check after each turn')}
             {hasPint && toggleButton('pintAfterTurn', 'Pint after each turn')}
             {toggleButton('errorToasts', 'error toasts')}
             {toggleButton('showBand', 'status band')}
           </Box>
           <Text> </Text>
           <Text bold>{shown?.label ?? ''} output</Text>
-          {(shown?.lines.length ? shown.lines.slice(-Math.max(3, rows - Object.keys(services).length - 4 - (phpInfo ? 1 : 0) - herdRows - (herdList.length ? 1 : 0) - checks.length * 2 - checksRows)) : ['(no output yet)']).map(l => line(l, true))}
+          {(shown?.lines.length ? shown.lines.slice(-Math.max(3, rows - Object.keys(services).length - 4 - (phpInfo ? 1 : 0) - herdRows - (herdList.length ? 1 : 0) - checks.length * 2 - checksRows - (verify ? 1 : 0))) : ['(no output yet)']).map(l => line(l, true))}
         </Box>
       )
     } else if (tab === 'queue') {
@@ -2893,7 +3621,20 @@ export const register: Register = on => {
       // One command at a time: a run would replace what the Commands tab shows of another
       const busy = !!lastRun?.isRunning
       const perFailure = 3
-      const room = Math.max(1, Math.floor((rows - 5) / perFailure))
+      // Claude's edits: a block above the last run, from the same rows Claude's health tool lists. A parse error's own
+      // text is the person's only: it can quote the code, so it's drawn here and never goes to Claude
+      const shownVerdict: Record<Verdict, [string, string | undefined, boolean]> = {
+        passed: ['✓ passed', 'green', false],
+        failed: ['✗ failed', 'red', false],
+        'not run': ['○ not run', 'yellow', false],
+        skipped: ['− skipped', undefined, true],
+        unknown: ['? unknown', 'yellow', true],
+        done: ['↻ done', undefined, true],
+      }
+      const parseErrors = [...(since?.lint?.files ?? [])].filter(([rel, rec]) => rec.verdict === 'failed' && rec.raw && rec.seq >= (since!.files.get(rel)?.seq ?? 0)).slice(0, 3)
+      const parseLines = parseErrors.flatMap(([rel, rec]) => [`${rel}${rec.line ? ':' + rec.line : ''}`, ...rec.raw!.split('\n').filter(l => l.trim()).slice(-6).map(l => '  ' + l)])
+      const room = Math.max(1, Math.floor((rows - 5 - (verify ? verify.rows.length + parseLines.length + 4 + (verify.noCheck ? 1 : 0) : 0)) / perFailure))
+      const newestError = since?.newestError
       body = (
         <Box flexDirection="column">
           <Box flexDirection="row" columnGap={2} flexWrap="wrap">
@@ -2907,15 +3648,49 @@ export const register: Register = on => {
             />
             {t && t.failures.length > 1 && <Button key="tests-ask-all" label="ask Claude to fix all" plain onPress={() => askAboutTests($, t.failures)} />}
           </Box>
+          {verify && (
+            <Box flexDirection="column">
+              <Text bold>Since Claude's edits</Text>
+              <Text dimColor>{verify.header}</Text>
+              {verify.rows.map(r => {
+                const [glyph, color, dim] = shownVerdict[r.verdict]
+                return (
+                  <Box flexDirection="row" columnGap={1} flexWrap="wrap">
+                    <Text color={color} dimColor={dim}>{r.partial ? '✓ passed (subset only)' : glyph}</Text>
+                    <Text bold>{r.check}</Text>
+                    <Text dimColor>{r.detail}</Text>
+                    {/* The Tests row's button is the one at the top; Claude's `next:` line names each of these */}
+                    {r.button && r.check !== 'Tests' && (
+                      <Button
+                        key={'verify-' + r.button.label}
+                        label={fixing.has(r.button.label) ? 'running…' : r.button.label}
+                        dimColor={fixing.has(r.button.label)}
+                        onPress={() => void runFix($, r.button!)}
+                      />
+                    )}
+                  </Box>
+                )
+              })}
+              {parseLines.map(l => line(l, true))}
+              <Box flexDirection="row" columnGap={1} flexWrap="wrap">
+                <Text dimColor>{verify.observed}</Text>
+                <Button key="verify-open-log" label="open Log" plain dimColor onPress={() => void openPane($, 'log')} />
+              </Box>
+              {since && since.errors > 0 && newestError && line('newest: ' + headline(newestError), true, 'red')}
+              {verify.noCheck && <Text dimColor>{verify.noCheck}</Text>}
+              <Text> </Text>
+            </Box>
+          )}
           {!t && <Text dimColor>No test run yet this session. Run them here, with /lara-test, or let Claude run them: the result shows here and in the band.</Text>}
           {t && (
-            <Text bold color={t.failed ? 'red' : 'green'}>
-              {(t.failed ? `✗ ${t.failed} failed, ` : '✓ ') + `${t.passed} passed` + (t.skipped ? `, ${t.skipped} skipped` : '')}
+            <Text bold color={t.failed || t.crashed !== undefined ? 'red' : 'green'}>
+              {t.crashed !== undefined ? `✗ ${testCounts(t)}` : (t.failed ? `✗ ${t.failed} failed, ` : '✓ ') + `${t.passed} passed` + (t.skipped ? `, ${t.skipped} skipped` : '')}
             </Text>
           )}
           {t && <Text dimColor>{`${t.label} · ${ago(t.at)} ago`}</Text>}
           {t?.editedSince && <Text dimColor>Claude edited PHP files since this run; not re-run</Text>}
           {t && t.failed > 0 && !t.failures.length && <Text dimColor>The output didn't include the failures. Run the tests here to see them.</Text>}
+          {t?.crashed !== undefined && <Text dimColor>The run died before a summary: the Commands tab shows what it printed, when it ran here.</Text>}
           {t?.failures.slice(0, room).map((f, i) => (
             <Box flexDirection="column">
               <Box flexDirection="row" columnGap={1}>

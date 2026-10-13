@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-13
+
+### Added
+
+- **Since Claude's edits**: lara-cc notes which files Claude edits (paths and kinds, never contents) and lists which checks ran on them: Syntax, Tests, Pint, Migrations, Routes, Views and the queue worker, each `passed`, `failed`, `not run`, `skipped`, `unknown` or `done`. A check passes only if it ran after the last edit. The list sits on top of the Tests tab with a button per step and on the Services tab, and opens Claude's `health` tool, which tells Claude to say which checks passed rather than "verified".
+- `php -l` on the PHP files Claude edited when its turn ends: parse-only, at most 20 files, never an env-named file or a link leading outside the project, and on by default (**syntax check after each turn** on the Services tab). A file that fails or isn't reached is checked again at the next turn's end, until it parses.
+- Errors in the log since the first edit are counted per window (`so far` for ten minutes after the turn), and only when the log was followed the whole time, never read as a pass.
+- Once a turn ends, the band shows `✗ syntax error` or `✎ N files: tests not run`, never green, and a toast says the same once.
+
+### Changed
+
+- Pint after a turn runs after the syntax check, so it may start a few seconds later.
+- A failed automatic queue restart is said as failed, not assumed done; a worker reading cached config is not counted as reloaded by a restart.
+- A test run Claude starts through Bash that dies before printing a summary counts as failed; a command that only names the runner (`ls vendor/bin/pest`) doesn't count as a run.
+
 ## [0.12.0] - 2026-10-12
 
 ### Added
